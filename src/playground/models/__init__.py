@@ -13,3 +13,16 @@ contract these models must implement. The public surface is:
 Owners: Team A. Other teams import from here and must not redefine
 these types locally.
 """
+
+from playground.models.base import ApiVersion, Metadata, ResourceEnvelope, StrictModel
+from playground.models.diagnostic import Diagnostic, Severity, SourceLocation
+
+__all__ = [
+    "ApiVersion",
+    "Diagnostic",
+    "Metadata",
+    "ResourceEnvelope",
+    "Severity",
+    "SourceLocation",
+    "StrictModel",
+]
