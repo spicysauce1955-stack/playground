@@ -50,8 +50,9 @@ Invariants:
 
 - `severity = error` blocks `apply`, `plan` may proceed if any consumer
   opts to "show errors anyway" but exit code remains non-zero.
-- `id` namespaces are owned per area: `config.*`, `doctor.*`,
-  `backend.*`, `state.*`.
+- `id` namespaces are reserved per area; the registry lives in
+  `ai/architecture/diagnostic_ids.md`. New IDs are added there
+  rather than invented at use sites.
 
 Consumers: CLI/TUI (rendering), planner (early bail), runs (attach to
 `OperationRun.diagnostics`).

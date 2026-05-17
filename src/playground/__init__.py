@@ -21,5 +21,11 @@ Team C owns ``playground.cli``, ``playground.tui``, ``playground.output``,
 ``playground.commands``.
 """
 
-__version__ = "0.0.0"
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("playground")
+except PackageNotFoundError:
+    __version__ = "0.0.0+uninstalled"
+
 __all__ = ["__version__"]
