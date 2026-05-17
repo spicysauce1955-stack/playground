@@ -240,8 +240,12 @@ Fields:
 - `timestamp` — ISO 8601 UTC with millisecond precision.
 - `level` — `debug` | `info` | `warn` | `error`.
 - `event_type` — see enum below.
-- `producer` — `core` | `backend.tofu` | `backend.ansible` |
-  `backend.docker` | `doctor` | `cli`.
+- `producer` — string. Reserved prefixes: `core`, `cli`, `doctor`,
+  and `backend.<adapter-name>` (e.g. `backend.tofu`,
+  `backend.ansible`, `backend.docker`). New backend adapters MAY
+  publish under their own `backend.<name>` without a contract bump;
+  unknown top-level producers MUST be tolerated by consumers (logged
+  but not crashed on).
 - `backend` — optional backend name (`local-libvirt`, etc).
 - `resource_ref` — optional `{kind, name}` the event is about.
 - `phase` — optional free-form phase tag (`init`, `apply`,
@@ -407,19 +411,38 @@ Concurrency:
   own errors and emit a `diagnostic.emitted` event of severity
   `warning` instead.
 
-## 9. StateStore
+## 9. StateStore And RunStore
 
-Team A's filesystem-backed state API. All consumers go through this —
-no direct `.playground/` writes from other teams.
+Team A's filesystem-backed state APIs are split along read/write
+seams so that consumers depend only on what they need (ISP). All
+consumers go through one of these — no direct `.playground/` writes
+from other teams.
+
+### 9.1 StateStore
+
+Lab-level state: project bootstrap, active-lab pointer, observed
+resource status. Low-churn key/value-shaped data.
 
 Logical operations:
 
-- `init()` — create `.playground/` skeleton, write `.gitignore` entry,
-  idempotent.
+- `init()` — create `.playground/` skeleton, ensure `.gitignore`
+  entry, idempotent.
 - `get_active_lab() -> str | None`.
 - `set_active_lab(name)`.
 - `read_status_snapshot(lab) -> list[ResourceStatus]`.
 - `write_status_snapshot(lab, statuses)`.
+
+Consumers:
+
+- Team C: `get_active_lab`, `read_status_snapshot` for CLI/TUI views.
+- Team B: `write_status_snapshot` from adapter `status()` / post-apply.
+
+### 9.2 RunStore
+
+Operation run lifecycle and event log persistence.
+
+Logical operations:
+
 - `create_run(operation, lab) -> OperationRun` — allocates `run_id`,
   writes initial `run.json`, returns the in-flight handle.
 - `finalize_run(run, status, exit_code)` — writes terminal `run.json`.
@@ -427,6 +450,16 @@ Logical operations:
 - `get_run(run_id) -> OperationRun`.
 - `iter_run_events(run_id) -> Iterable[OperationEvent]`.
 - `apply_retention(policy, dry_run=False) -> RetentionReport`.
+
+Consumers:
+
+- Team B: `create_run` / `finalize_run` around adapter operations.
+- Team C: `list_runs`, `get_run`, `iter_run_events` for `runs list` /
+  `runs show` / TUI run-viewer.
+
+The two stores share an internal filesystem helper (Team A
+implementation detail); the split is at the public-interface level so
+neither team has to depend on operations they don't use.
 
 `RetentionPolicy`:
 
