@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "playground"
+version = "0.0.0"
+description = "Lab-operating-system for local KVM/libvirt infrastructure experiments."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "playground contributors" }]
+keywords = ["libvirt", "kvm", "ansible", "opentofu", "lab"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.7",
+  "pydantic>=2.7",
+  "ruamel.yaml>=0.18",
+  "jsonschema>=4.22",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=0.62"]
+dev = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+playground = "playground.cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/spicysauce1955-stack/playground"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playground"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
