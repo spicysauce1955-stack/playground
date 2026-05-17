@@ -271,19 +271,23 @@ Fields:
 
 ### VM
 
-Fields:
+Fields (resolved form; see
+`ai/architecture/shared_contracts.md §3` for the authoritative shape):
 
 - name
 - role
 - image
-- cpu
-- memory
-- disk
+- vcpu
+- memory_mb
+- disk_gb
 - networks
 - ssh
 - provisioners
 - tags
 - provider_overrides
+
+User-authored YAML nests cpu/memory/disk under `resources:` for
+ergonomics; the resolver flattens them onto `ResolvedVm`.
 
 ### Network
 

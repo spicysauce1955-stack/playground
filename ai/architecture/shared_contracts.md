@@ -89,6 +89,11 @@ Top-level fields:
   `ssh.public_key_path`, `provisioners` (list of `{ansible_role: ...}`
   for now), `tags`, `provider_overrides`.
 
+The user-authored YAML nests these under `resources: {vcpu, memory_mb,
+disk_gb}`; the resolver flattens them onto `ResolvedVm`. Field names
+are authoritative here; `ai/architecture/system_design.md §4` is a
+shorter summary and defers to this section.
+
 `ResolvedNetwork`:
 
 - `name`, `intent` (`nat` | `isolated` | `routed`), `cidr`,
@@ -104,9 +109,16 @@ Top-level fields:
 
 `ResolvedCommand`:
 
-- `name`, `description`, `target` (selector — `role`, `vm`, `tag`, or
-  `any`), `command.shell`, `working_directory`, `environment`,
+- `name`, `description`, `target` (`TargetSelector`),
+  `command.shell`, `working_directory`, `environment`,
   `timeout_seconds`, `escalation.become`.
+
+`TargetSelector` — exactly one of the following keys is set:
+
+- `role: <role-name>` — every VM with this role.
+- `vm: <vm-name>` — a single VM by name.
+- `tag: <tag>` — every VM carrying this tag.
+- `any: true` — every VM in the lab.
 
 Invariants:
 
@@ -116,6 +128,57 @@ Invariants:
 - `runtime_overrides` are applied on top of the YAML-derived fields and
   re-flagged in `source_map` so plan/status can show them as
   temporary.
+- `source_map` keys use dotted-path notation with indexed arrays:
+  `spec.vms[0]`, `spec.networks[lab-private]` (string key when the
+  list element has a stable `name`). Diagnostics produced after
+  resolution must round-trip through this format.
+
+### 3.1 Auxiliary shapes referenced above
+
+`Budget`:
+
+- `mode` — `strict` | `permissive`. `strict` blocks plan if limits are
+  exceeded; `permissive` emits warnings.
+- `max_vcpu`, `max_memory_mb`, `max_disk_gb`, `max_vms`,
+  `max_containers` — integer limits.
+
+`ResolvedDefaults`:
+
+- `backend` — string.
+- `offline` — bool.
+- `vm` — `{image, resources: {vcpu, memory_mb, disk_gb}, ssh: {user,
+  public_key_path}}`.
+- `network` — `{profile}`.
+- `retention` — `RetentionPolicy`.
+
+`ResolvedArtifacts`:
+
+- `vm_images` — map of artifact name → `{type, version, source,
+  local_path, available_locally: bool, available_remote: bool}`.
+- `tofu_providers` — map of name → `{version, source, local_path?}`.
+- `ansible_collections` — map of name → `{version, source,
+  local_path?}`.
+- `docker_images` — map of name → `{image, registry, local_archive?,
+  available_locally: bool, available_remote: bool}`.
+
+A resolved artifact is the union of the source declared in
+`config/artifacts/sources.yaml` and the observed cache state from
+`.playground/cache/`. Backend adapters consume the resolved form and
+do not re-read `sources.yaml`.
+
+`RuntimeOverride`:
+
+- `id` — short opaque string, unique per active lab.
+- `target` — JSON-pointer-like key path into `ResolvedLab` (e.g.
+  `vms[docker1].memory_mb`).
+- `value` — new value.
+- `reason` — optional human note.
+- `created_at` — ISO 8601 UTC.
+
+Runtime overrides live in `.playground/state/overrides/<lab>.json`
+and are applied each time the resolver runs. Promoting an override to
+permanent YAML is out of scope for v1 but the file format leaves room
+for a `promoted_to: <yaml-path>` field later.
 
 Consumers: planner (Team B), CLI plan view (Team C), state snapshot.
 
@@ -262,12 +325,46 @@ Required operations (logical, language-agnostic):
 
 - `lab` — lab name.
 - `backend` — backend name.
-- `actions` — list of `{kind, name, action, before?, after?,
-  reason?}` where action is `create|update|delete|noop|unknown`.
+- `actions` — list of `PlanAction`.
 - `rendered_inputs` — list of `{path, content_ref}` pointing into
   `.playground/state/rendered/`.
-- `warnings` — list of `Diagnostic` (severity `warning` only).
-- `budget_check` — `{passes, details}`.
+- `warnings` — list of `Diagnostic` (severity `warning` or `info`
+  only; `error` should have aborted plan).
+- `budget_check` — `{passes: bool, details: list[Diagnostic]}`.
+- `created_at` — ISO 8601 UTC.
+
+`PlanAction`:
+
+- `kind` — one of `vm` | `network` | `workload` | `route` |
+  `inventory` | `rendered-file`.
+- `name` — string, unique within `(plan, kind)`.
+- `action` — `create` | `update` | `delete` | `noop` | `unknown`.
+- `before` — optional current state snippet (small JSON object) for
+  display.
+- `after` — optional desired state snippet.
+- `reason` — short human string explaining why this action is needed.
+
+`ApplyResult`:
+
+- `plan` — the `Plan` that was applied (or its `created_at`+hash for
+  identity).
+- `started_at`, `finished_at` — ISO 8601 UTC.
+- `succeeded` — bool; `true` only if every action reached its target
+  state.
+- `statuses` — list of `ResourceStatus` observed after apply.
+- `action_outcomes` — list of `{name, action, outcome: "ok" | "failed"
+  | "skipped" | "unknown", error_message?}` aligned 1:1 with
+  `plan.actions`.
+- `diagnostics` — list of `Diagnostic` accumulated during apply.
+
+`DestroyResult`:
+
+- `started_at`, `finished_at` — ISO 8601 UTC.
+- `succeeded` — bool.
+- `removed` — list of `{kind, name}` resources confirmed removed.
+- `remaining` — list of `{kind, name, reason}` resources still
+  present (should be empty on success).
+- `diagnostics` — list of `Diagnostic`.
 
 Invariants:
 
@@ -277,6 +374,8 @@ Invariants:
   named in `rendered_inputs`.
 - Adapters never read user YAML directly; they only see
   `ResolvedLab`.
+- Inspection methods (`status`, `doctor`) MUST NOT mutate any
+  resource and MUST NOT write outside `.playground/`.
 
 ## 8. EventBus
 
@@ -328,6 +427,24 @@ Logical operations:
 - `get_run(run_id) -> OperationRun`.
 - `iter_run_events(run_id) -> Iterable[OperationEvent]`.
 - `apply_retention(policy, dry_run=False) -> RetentionReport`.
+
+`RetentionPolicy`:
+
+- `runs.keep_last` — integer, minimum number of recent runs to keep.
+- `runs.max_age_days` — integer, drop runs whose `end_time` is older
+  than this many days, subject to `keep_last`.
+- `logs.keep_per_run` — bool; when `false`, prune per-run logs after
+  the summary has been written.
+- `logs.compress_after_days` — integer; gzip per-run JSONL/raw logs
+  older than this.
+
+`RetentionReport`:
+
+- `policy` — the `RetentionPolicy` applied.
+- `dry_run` — bool.
+- `actions` — list of `{path, action: "delete" | "compress" | "keep",
+  reason}`.
+- `freed_bytes` — integer, estimated when `dry_run=true`.
 
 Filesystem layout:
 
