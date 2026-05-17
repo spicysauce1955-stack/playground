@@ -36,6 +36,16 @@ from playground.models.kinds import (
     VmRoleSpec,
     parse_resource,
 )
+from playground.models.resolved import (
+    ResolvedArtifactImage,
+    ResolvedArtifacts,
+    ResolvedCommand,
+    ResolvedDefaults,
+    ResolvedLab,
+    ResolvedNetwork,
+    ResolvedVm,
+    ResolvedWorkload,
+)
 
 __all__ = [
     "ApiVersion",
@@ -52,6 +62,14 @@ __all__ = [
     "Metadata",
     "NetworkProfile",
     "ProviderConfig",
+    "ResolvedArtifactImage",
+    "ResolvedArtifacts",
+    "ResolvedCommand",
+    "ResolvedDefaults",
+    "ResolvedLab",
+    "ResolvedNetwork",
+    "ResolvedVm",
+    "ResolvedWorkload",
     "ResourceEnvelope",
     "Resources",
     "RetentionPolicy",
