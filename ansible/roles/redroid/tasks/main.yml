@@ -1,0 +1,37 @@
+---
+- name: Ensure required kernel modules exist
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - binder_linux
+    - ashmem_linux
+  ignore_errors: true
+
+- name: Create binderfs directory
+  file:
+    path: /dev/binderfs
+    state: directory
+    mode: '0755'
+
+- name: Mount binderfs
+  mount:
+    path: /dev/binderfs
+    src: binder
+    fstype: binder
+    state: mounted
+
+- name: Pull redroid image
+  community.docker.docker_image:
+    name: redroid/redroid:11.0.0-latest
+    source: pull
+
+- name: Run redroid container
+  community.docker.docker_container:
+    name: redroid_1
+    image: redroid/redroid:11.0.0-latest
+    privileged: yes
+    volumes:
+      - /dev/binderfs:/dev/binderfs
+    ports:
+      - "5555:5555"

@@ -1,0 +1,7 @@
+---
+- name: Configure Playground Guests
+  hosts: playground
+  become: yes
+  roles:
+    - docker
+    - redroid
