@@ -519,7 +519,80 @@ JSON output contract:
 - Tool/raw output goes to stderr or to `.playground/runs/<id>/logs/`,
   never into the JSON payload.
 
-## 11. Open Items
+## 11. Coexistence, Legacy, And Air-Gap Invariants
+
+These invariants protect PRD §5 (air-gap readiness) and the existing
+hand-authored `tofu/` / `ansible/` modules from silent collisions with
+the new platform.
+
+### 11.1 Libvirt resource naming
+
+All libvirt resources created by an adapter MUST be named with the
+prefix `playground-<lab>-` so they cannot collide with operator-
+authored resources or with the legacy `playground_net` defined in
+`tofu/main.tf`. Examples:
+
+- network → `playground-<lab>-<network-name>` (e.g.
+  `playground-generic-infra-edge`).
+- volume → `playground-<lab>-<vm-name>.qcow2`.
+- domain → `playground-<lab>-<vm-name>`.
+
+This makes the new CIDRs in lab YAML (e.g. `10.20.10.0/24` in
+`config/labs/generic-infra.yaml`) safe to coexist with the legacy
+`10.0.10.0/24` `playground_net` from PRD Phase 1 — they are distinct
+libvirt networks.
+
+### 11.2 Legacy ansible/site.yml
+
+The repo-root `ansible/site.yml` is the **pre-platform reference run
+script**. Once the Ansible adapter (Team B) lands, the platform
+generates its own site.yml under
+`.playground/state/rendered/ansible/<lab>/site.yml` driven by each
+VM's `provisioners:` list. The legacy file remains in the repo as a
+documented baseline; it is **not** invoked by `playground apply` —
+operators may still run it directly.
+
+Validators MUST NOT fail when the legacy site.yml mentions roles
+absent from a lab's `provisioners:` (e.g. `redroid`); the two run
+paths are independent.
+
+### 11.3 Unresolved ansible role references
+
+`generic-infra.yaml` uses `role: router`, and `config/roles/router.yaml`
+declares `provisioners: [{ansible_role: router}]`. The ansible role
+itself lives under Team B Milestone 10 (`ai/engineering/task_breakdown.md`).
+Until that role lands:
+
+- The validator emits a `warning`-severity `Diagnostic` with id
+  `config.reference.ansible_role_missing`, not an `error`.
+- Plan proceeds and the `inventory` PlanAction surfaces the same
+  warning in `plan.warnings`.
+- Apply for that VM is blocked only at the Ansible adapter layer
+  (Team B chooses whether to fail-fast or skip the role).
+
+This keeps the sample lab usable for plan/validate while the role is
+in flight on `team/local-backend-runtime`.
+
+### 11.4 Air-gap (offline) mode
+
+When `spec.offline: true` on a Lab (or `defaults.offline: true`):
+
+- Every artifact reference MUST resolve from a local source
+  (`local_path` for VM images and tofu providers, `local_archive` for
+  docker images, an installed `ansible_collections` path, etc.).
+- The artifact resolver MUST NOT issue outbound network requests; any
+  attempt is a blocking `error` Diagnostic
+  (`artifact.offline_violation`).
+- Doctor in offline mode MUST verify each declared artifact has its
+  local file present and readable.
+- Apply MUST refuse to start if any artifact is unresolved in offline
+  mode (validation gate).
+
+When `offline: false` (the default), `local_path` is consulted first
+and falls back to `default_source`; this lets a cached environment
+work without network even when offline mode isn't asserted.
+
+## 12. Open Items
 
 - Whether `ResolvedLab` is exported as JSON Schema or as a typed model
   with derivable schema.
