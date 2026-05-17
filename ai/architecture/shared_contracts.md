@@ -183,6 +183,190 @@ for a `promoted_to: <yaml-path>` field later.
 
 Consumers: planner (Team B), CLI plan view (Team C), state snapshot.
 
+### 3.2 On-disk YAML kinds
+
+The YAML files under `config/` carry one of the following
+`kind:` values. Each kind specifies the **user-authored** shape; the
+resolver lowers it into the runtime form documented above. All kinds
+share the envelope:
+
+```yaml
+apiVersion: playground/v1
+kind: <Kind>
+metadata:
+  name: <string>
+  description: <string, optional>
+  tags: [<string>, ...]
+spec: { ... }
+```
+
+`metadata.name` is unique within `(apiVersion, kind)`. Extra keys at
+the envelope level are an `error` Diagnostic
+(`config.schema.unknown_field`).
+
+#### `Defaults`
+
+Lives at `config/defaults.yaml` (singleton).
+
+`spec`:
+
+- `backend` — default backend name.
+- `offline` — bool.
+- `budget` — `Budget`.
+- `vm` — `{image, resources: {vcpu, memory_mb, disk_gb}, ssh: {user,
+  public_key_path}}`.
+- `network` — `{profile}`.
+- `retention` — `RetentionPolicy`.
+
+Resolver behavior: `Defaults.spec` is the first layer of the merge;
+each Lab's own `spec` overrides matching keys.
+
+#### `ProviderConfig`
+
+Lives at `config/providers/<name>.yaml`. `metadata.name` matches the
+backend identifier (e.g. `local-libvirt`).
+
+`spec` is backend-specific but every `ProviderConfig` MUST declare:
+
+- `driver` — string, equals `metadata.name`.
+
+For `local-libvirt` specifically (the only v1 backend), additional
+fields are documented but not enumerated as a closed schema — the
+adapter validates its own configuration. The fields actually used
+today by the adapter are:
+
+- `uri`, `pool`, `network.default_mode`, `network.bridge_prefix`,
+  `vm.cpu_mode`, `vm.machine`, `vm.firmware`, `vm.cloud_init`,
+  `tofu.state_path`, `tofu.provider`, `capabilities.*`.
+
+Unknown keys produce `warning`-severity diagnostics
+(`config.schema.unknown_field`), not errors, because backend adapters
+may version their config independently of the platform.
+
+#### `ArtifactSources`
+
+Lives at `config/artifacts/sources.yaml` (singleton).
+
+`spec`:
+
+- `defaults` — `{offline: bool}`.
+- `vm_images` — map of name → `{type, version, default_source,
+  local_path?, checksum?}`.
+- `tofu_providers` — map of name → `{version, default_source,
+  local_path?}`.
+- `ansible_collections` — map of name → `{version, default_source,
+  local_path?}`.
+- `docker_images` — map of name → `{image, registry?,
+  default_source?, local_archive?, checksum?}`.
+
+Resolver lowers this into `ResolvedArtifacts` (§3.1) after consulting
+`.playground/cache/` for `available_locally`.
+
+#### `NetworkProfile`
+
+Lives at `config/networks/<name>.yaml`.
+
+`spec`:
+
+- `intent` — `nat` | `isolated` | `routed`.
+- `internet_access` — `true` | `false` | `configurable`.
+- `dns` — `{enabled: bool}`.
+
+A Lab's `spec.networks[].profile` references the `metadata.name` of
+one of these.
+
+#### `VmRole`
+
+Lives at `config/roles/<name>.yaml`. The richest of the on-disk kinds.
+
+`spec`:
+
+- `extends` — optional `metadata.name` of another `VmRole` to inherit
+  from. Inheritance is **single-chain** (no diamonds) and **deep-merge
+  semantics**:
+  - Scalar/leaf values in the child replace the parent.
+  - Map values merge key-by-key recursively.
+  - List values **replace** the parent list (no element-wise merge);
+    if a role wants to extend a list, it must re-declare the full
+    list. The resolver MUST detect cycles and emit
+    `config.role.inheritance_cycle` (error).
+- `image` — artifact name (from `ArtifactSources.vm_images`).
+- `resources` — `{vcpu, memory_mb, disk_gb}`.
+- `ssh` — `{user, public_key_path?}`.
+- `provisioners` — list of `{ansible_role: <name>}`. Currently the
+  only shape; future provisioner kinds (e.g. cloud-init snippets) get
+  added to this discriminated union.
+- `capabilities` — open-keyed map of `<capability-name>: <bool|value>`
+  (e.g. `docker: true`, `compose: true`, `routing: true`). Backend
+  adapters consult capabilities to decide what to install; the
+  platform itself treats this as opaque metadata. The well-known
+  keys today are `docker`, `compose`, `swarm`, `routing`.
+- `routing` — optional block, only meaningful when
+  `capabilities.routing: true`. Shape: `{mode: "automatic" | "manual",
+  allow_overrides: bool}`. Adapters consult it; the platform does
+  not.
+
+Resolver behavior for `extends`:
+
+1. Build the inheritance chain rooted at the leaf role.
+2. Merge from root → leaf using the rules above.
+3. The result is a single flattened `VmRole.spec` with no `extends`.
+
+A VM declared in a Lab references a role by `metadata.name`. The VM
+may override `resources` and `provider_overrides`; other role fields
+are inherited as-is.
+
+#### `CommandPreset`
+
+Lives at `config/commands/<name>.yaml`.
+
+`spec`:
+
+- `target` — `TargetSelector` (§3 above): exactly one of `role`, `vm`,
+  `tag`, or `any: true`.
+- `command.shell` — multi-line shell snippet.
+- `working_directory` — string path; the resolver MAY substitute
+  `${ssh.user}` once interpolation lands (not in v1).
+- `environment` — map of string → string.
+- `timeout_seconds` — int.
+- `escalation.become` — bool. When `true`, the adapter runs the
+  command with `sudo`/become; when `false`, as the SSH user.
+
+#### `Lab`
+
+Lives at `config/labs/<name>.yaml`.
+
+`spec`:
+
+- `backend` — provider name; MUST match an existing `ProviderConfig`.
+- `offline` — bool, defaults to `Defaults.spec.offline`.
+- `budget` — optional override of `Defaults.spec.budget`.
+- `networks` — list of `{name, profile, cidr, ...overrides}`.
+- `vms` — list of `{name, role, networks: [<name>...], resources?,
+  tags?, provider_overrides?}`.
+- `workloads` — list of `{name, type, source, placement, networks,
+  ports?, volumes?, environment?, resources?, tags?}`.
+- `commands.enabled` — list of `CommandPreset.metadata.name` strings.
+  The resolver expands this list into `ResolvedLab.commands` by
+  looking up each preset by name. Disabled or absent presets are not
+  in the resolved list.
+- `providers` — map of provider name → optional per-lab overrides
+  layered on top of `ProviderConfig.spec`.
+
+Resolver behavior — Lab → `ResolvedLab`:
+
+1. Apply `Defaults.spec` as the base.
+2. Layer the Lab's `spec` (deep-merge per the same rules as
+   `VmRole.extends`).
+3. For each VM: look up its role, run the role-extension chain,
+   merge role spec under the VM's own override fields.
+4. Expand `commands.enabled` names → full `ResolvedCommand` bodies.
+5. Resolve `ArtifactSources` for the lab's declared images.
+6. Apply runtime overrides from
+   `.playground/state/overrides/<lab>.json` if present.
+7. Populate `source_map` with file/key origins gathered during
+   loading.
+
 ## 4. OperationRun
 
 A single invocation of a mutating or inspecting operation (validate,
