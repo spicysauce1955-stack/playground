@@ -1,0 +1,20 @@
+apiVersion: playground/v1
+kind: CommandPreset
+metadata:
+  name: check-docker
+  description: Verify the Docker daemon is reachable and report version/info from each docker-host VM.
+  tags: [docker, readiness]
+
+spec:
+  target:
+    role: docker-host
+  command:
+    shell: |
+      set -eu
+      docker version --format '{{.Server.Version}}'
+      docker info --format '{{json .}}'
+  working_directory: /home/ubuntu
+  environment: {}
+  timeout_seconds: 30
+  escalation:
+    become: false

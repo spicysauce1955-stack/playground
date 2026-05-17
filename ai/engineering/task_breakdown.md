@@ -20,24 +20,26 @@ Tasks:
 
 ## Milestone 2: Config Skeleton
 
+Status: drafted (Team A, branch `team/core-config-state`)
+
 Tasks:
 
-- [ ] Create `config/` directory.
-- [ ] Add `config/defaults.yaml`.
-- [ ] Add provider config for `local-libvirt`.
-- [ ] Add artifact sources config.
-- [ ] Add role presets:
-  - [ ] `generic-node`
-  - [ ] `docker-host`
-  - [ ] `router`
-- [ ] Add network profiles:
-  - [ ] `nat`
-  - [ ] `isolated`
-  - [ ] `routed`
-- [ ] Add command presets:
-  - [ ] `check-docker`
-  - [ ] `ping-network`
-- [ ] Add sample lab `generic-infra`.
+- [x] Create `config/` directory.
+- [x] Add `config/defaults.yaml`.
+- [x] Add provider config for `local-libvirt`.
+- [x] Add artifact sources config.
+- [x] Add role presets:
+  - [x] `generic-node`
+  - [x] `docker-host`
+  - [x] `router`
+- [x] Add network profiles:
+  - [x] `nat`
+  - [x] `isolated`
+  - [x] `routed`
+- [x] Add command presets:
+  - [x] `check-docker`
+  - [x] `ping-network`
+- [x] Add sample lab `generic-infra`.
 
 Definition of done:
 

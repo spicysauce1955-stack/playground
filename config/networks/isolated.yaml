@@ -1,0 +1,11 @@
+apiVersion: playground/v1
+kind: NetworkProfile
+metadata:
+  name: isolated
+  description: Fully isolated lab network with no upstream/internet access.
+
+spec:
+  intent: isolated
+  internet_access: false
+  dns:
+    enabled: true

@@ -1,0 +1,62 @@
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: generic-infra
+  description: Generic VM, Docker, and network playground.
+  tags: [infra, local]
+
+spec:
+  backend: local-libvirt
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 12
+    max_memory_mb: 24576
+    max_disk_gb: 250
+    max_vms: 8
+    max_containers: 30
+
+  networks:
+    - name: edge
+      profile: nat
+      cidr: 10.20.10.0/24
+    - name: lab-private
+      profile: isolated
+      cidr: 10.20.20.0/24
+    - name: routed-a
+      profile: routed
+      cidr: 10.20.30.0/24
+
+  vms:
+    - name: node1
+      role: generic-node
+      networks: [lab-private]
+    - name: docker1
+      role: docker-host
+      networks: [edge, lab-private]
+      resources:
+        vcpu: 2
+        memory_mb: 4096
+        disk_gb: 40
+    - name: router1
+      role: router
+      networks: [edge, lab-private, routed-a]
+
+  workloads:
+    - name: demo-compose
+      type: compose
+      source: ./compose/demo.yaml
+      placement:
+        target_role: docker-host
+      networks: [lab-private]
+
+  commands:
+    enabled:
+      - check-docker
+      - ping-network
+
+  providers:
+    local-libvirt:
+      uri: qemu:///system
+      pool: default
