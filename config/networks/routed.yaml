@@ -1,0 +1,11 @@
+apiVersion: playground/v1
+kind: NetworkProfile
+metadata:
+  name: routed
+  description: Routed segment intended to be reached through a router VM; upstream access is configurable.
+
+spec:
+  intent: routed
+  internet_access: configurable
+  dns:
+    enabled: true

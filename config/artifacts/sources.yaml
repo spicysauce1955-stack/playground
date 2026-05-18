@@ -1,0 +1,32 @@
+apiVersion: playground/v1
+kind: ArtifactSources
+metadata:
+  name: sources
+  description: Authoritative list of upstream artifacts and their local cache paths.
+
+spec:
+  defaults:
+    offline: false
+
+  vm_images:
+    ubuntu-noble:
+      type: qcow2
+      version: "24.04"
+      default_source: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+      local_path: .playground/cache/artifacts/vm-images/ubuntu-noble/24.04/noble.qcow2
+
+  tofu_providers:
+    dmacvicar-libvirt:
+      version: "~> 0.7.1"
+      default_source: registry.opentofu.org/dmacvicar/libvirt
+
+  ansible_collections:
+    community-docker:
+      version: "*"
+      default_source: galaxy.ansible.com/community/docker
+
+  docker_images:
+    nginx:
+      image: nginx:latest
+      registry: docker.io
+      local_archive: .playground/cache/artifacts/docker/nginx/latest/image.tar

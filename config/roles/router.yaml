@@ -1,0 +1,15 @@
+apiVersion: playground/v1
+kind: VmRole
+metadata:
+  name: router
+  description: Generic node configured as an L3 router between attached networks.
+
+spec:
+  extends: generic-node
+  capabilities:
+    routing: true
+  provisioners:
+    - ansible_role: router
+  routing:
+    mode: automatic
+    allow_overrides: true

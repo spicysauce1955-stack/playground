@@ -1,0 +1,30 @@
+apiVersion: playground/v1
+kind: ProviderConfig
+metadata:
+  name: local-libvirt
+  description: Local KVM/libvirt provider driven by OpenTofu (dmacvicar/libvirt).
+
+spec:
+  driver: local-libvirt
+  uri: qemu:///system
+  pool: default
+
+  network:
+    default_mode: nat
+    bridge_prefix: pgbr
+    dns:
+      enabled: true
+
+  vm:
+    cpu_mode: host-passthrough
+    machine: q35
+    firmware: bios
+    cloud_init: true
+
+  tofu:
+    state_path: .playground/state/tofu
+    provider: dmacvicar-libvirt
+
+  capabilities:
+    nested_virtualization: true
+    privileged_containers: true

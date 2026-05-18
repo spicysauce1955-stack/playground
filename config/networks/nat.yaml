@@ -1,0 +1,11 @@
+apiVersion: playground/v1
+kind: NetworkProfile
+metadata:
+  name: nat
+  description: NAT-attached network with outbound internet access and DNS.
+
+spec:
+  intent: nat
+  internet_access: true
+  dns:
+    enabled: true
