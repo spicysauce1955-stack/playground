@@ -43,9 +43,9 @@ resource "libvirt_volume" "vm_disk" {
 
 # Generate Cloud-Init ISO for user data
 resource "libvirt_cloudinit_disk" "commoninit" {
-  count     = var.vm_count
-  name      = "commoninit-${count.index + 1}.iso"
-  pool      = "default"
+  count = var.vm_count
+  name  = "commoninit-${count.index + 1}.iso"
+  pool  = "default"
   user_data = templatefile("${path.module}/cloud_init.cfg", {
     ssh_public_key = file(var.ssh_public_key_path)
   })
