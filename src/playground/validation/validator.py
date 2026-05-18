@@ -6,7 +6,7 @@ command presets — that's the resolver's job. The validator's
 contract is "given a typed load, does every name in every reference
 point at something that exists?".
 
-Diagnostic IDs (registered in ``ai/architecture/diagnostic_ids.md``):
+Diagnostic IDs:
 
 - ``config.reference.unknown_role``
 - ``config.reference.unknown_network``
@@ -56,7 +56,7 @@ def validate(loaded: LoadedConfig, ansible_roles_dir: Path | None = None) -> lis
     """Run every cross-reference check and return collected diagnostics.
 
     ``ansible_roles_dir`` enables the ``config.reference.ansible_role_missing``
-    warning per ``shared_contracts.md §11.3``. When ``None``, the check is
+    warning. When ``None``, the check is
     skipped — this lets unit tests run without a real ansible/ tree.
     """
     diagnostics: list[Diagnostic] = []

@@ -1,9 +1,4 @@
-"""Resolved (backend-neutral) lab model — the **input contract** to provider adapters.
-
-Field shapes track ``ai/architecture/shared_contracts.md §3``. The
-resolver in :mod:`playground.config.resolver` is the only legitimate
-producer of these objects.
-"""
+"""Resolved backend-neutral lab model produced by the config resolver."""
 
 from __future__ import annotations
 
@@ -98,10 +93,8 @@ class ResolvedArtifacts(StrictModel):
 class ResolvedLab(StrictModel):
     """The fully resolved, backend-neutral lab.
 
-    See ``ai/architecture/shared_contracts.md §3`` for the field-level
-    contract. Pydantic config relaxes ``frozen`` so the resolver can
-    populate the model incrementally; once handed to a backend adapter
-    it should be treated as immutable.
+    Pydantic config keeps the model frozen; once handed to a backend adapter it
+    should be treated as immutable.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)

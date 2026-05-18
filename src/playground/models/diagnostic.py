@@ -1,4 +1,4 @@
-"""Diagnostic model — see ``ai/architecture/shared_contracts.md §2``."""
+"""Diagnostic model for validation and runtime reporting."""
 
 from __future__ import annotations
 

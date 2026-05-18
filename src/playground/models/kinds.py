@@ -1,13 +1,11 @@
 """Pydantic models for each on-disk YAML kind.
 
-Field shapes track ``ai/architecture/shared_contracts.md §3.2`` line
-by line. Spec models use ``StrictModel`` so any YAML typo surfaces
-as a ``ValidationError`` that the loader can translate into a
-``Diagnostic``.
+Spec models use ``StrictModel`` so any YAML typo surfaces as a
+``ValidationError`` that the loader can translate into a ``Diagnostic``.
 
 Lab specs intentionally tolerate unknown keys under ``provider`` /
-``provider_overrides`` blocks because backend adapters version
-their own config; see ``shared_contracts.md §3.2`` ProviderConfig.
+``provider_overrides`` blocks because backend adapters version their own
+config.
 """
 
 from __future__ import annotations
@@ -229,8 +227,7 @@ class VmRoleSpec(BaseModel):
     """Spec for a VmRole.
 
     ``extends`` is single-chain inheritance; the resolver flattens it
-    into a single VmRoleSpec before the model leaves the validation
-    layer (see ``shared_contracts.md §3.2`` resolver behavior).
+    into a single VmRoleSpec before the model leaves the validation layer.
 
     ``capabilities`` is an open map (``extra="allow"`` is not used —
     instead it's a typed dict of known capability names to bool/value).

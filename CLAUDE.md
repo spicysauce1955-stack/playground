@@ -19,25 +19,37 @@ Teardown: `cd tofu && tofu destroy -auto-approve`.
 
 ## Architecture notes that aren't obvious from a single file
 
-- **There are two `main.tf` files.** `/main.tf` at the repo root is a stub left over from early scaffolding and only declares the network. The real, complete OpenTofu config is in `tofu/main.tf` (volumes, cloud-init disks, VM domains, host-passthrough CPU). Always edit under `tofu/` unless you're intentionally retiring the stub.
+- **The real OpenTofu root is `tofu/`.** Edit `tofu/main.tf` for infrastructure resources. Do not recreate the retired repo-root `main.tf` stub.
 - **Nested virtualization is load-bearing.** `cpu { mode = "host-passthrough" }` in `tofu/main.tf` is required so Redroid containers inside the guest can access the binder/ashmem kernel features. Do not change it to a generic CPU mode.
 - **Cloud-init wires SSH access.** `tofu/cloud_init.cfg` is a `templatefile` that injects `var.ssh_public_key_path` (default `~/.ssh/id_rsa.pub`) for the `ubuntu` user. SSH password auth is disabled — losing the key means recreating the VM.
-- **Redroid role mounts binderfs.** `ansible/roles/redroid/tasks/main.yml` modprobes `binder_linux`/`ashmem_linux` (ignored on failure since modern kernels may bake them in), mounts `/dev/binderfs`, then runs the `redroid/redroid:11.0.0-latest` container `--privileged` with port 5555 exposed. Privileged + binderfs are both required; removing either breaks Android boot inside the container.
-- **Docker role is order-sensitive.** It removes distro `docker.io`/`containerd` before installing `docker-ce` from Docker's apt repo, and adds the `ubuntu` user to the `docker` group. Re-running is safe (idempotent) but reordering will break a fresh box.
+- **Redroid role mounts binderfs.** `ansible/roles/redroid/tasks/main.yml` best-effort `modprobe`s `binder_linux`/`ashmem_linux`, mounts `/dev/binderfs`, and runs the redroid container `--privileged` with port 5555 exposed. Privileged + binderfs are both required.
+- **Docker role is order-sensitive.** Remove distro `docker.io`/`containerd` before installing `docker-ce` from Docker's apt repo, then add the SSH user to the `docker` group. Re-running is idempotent; reordering breaks a fresh box.
 
 ## Variables worth knowing (`tofu/variables.tf`)
 
 `vm_count` (default 1), `vm_memory` MB (4096), `vm_vcpu` (2), `ssh_public_key_path`, `ubuntu_image_url` (Noble cloud image). Override via `-var` or `terraform.tfvars`; never hardcode secrets in `.tf` files.
 
-## Repo context: multi-agent workflow
+## Repo context: sequential workflow
 
-`setup.md`, `.antigravity/`, `.cursor/`, `.opencode.json`, and the `ai/` directory tree describe a multi-tool routing scheme (OpenCode for architecture, Antigravity for implementation, Cursor for review, Codex for alternative patches). Per `setup.md`, **Claude Code's role here is the local repo-debugging specialist** — invoked for difficult repo-local fixes, test failures, deep multi-file refactors, and independent implementation review, not as the default driver. The `ai/` subdirectories (`global_context.md`, `architecture/`, `engineering/`, `handoffs/`, etc.) are placeholders for that workflow and are currently empty.
+Work happens sequentially on `main`. The old parallel-branch planning files
+have been removed. Use normal Git history, `README.md`, `PRD.md`, `CODEX.md`,
+`AGENTS.md`, `docs/workflow.md`, `docs/platform.md`, `docs/roadmap.md`, and this
+file as the repo guidance.
+
+Claude Code is useful for repo-local debugging, test failures, deep multi-file
+refactors, and independent implementation review. Codex is documented in
+`CODEX.md`. Do not recreate the old planning tree unless the repo explicitly
+adopts that workflow again.
 
 ### Project-local Claude subagents (`.claude/agents/`)
 
+- `planner` — Turns a request into a scoped work item with acceptance criteria and verification.
+- `architect` — Checks module boundaries, coupling, data flow, and maintainability before coding.
+- `iac-implementer` — Makes focused repo changes after scope and design are clear.
 - `code-reviewer` — PRD-conformance + idempotency + secrets review on diffs under `tofu/` and `ansible/`. Use after edits, before commit.
 - `debugger` — Localizes failures across the tofu → cloud-init → ansible → redroid → ADB pipeline. Use when a stage breaks.
 - `qa-engineer` — Static + live + idempotency test matrix. Use before cutting a PR / release.
+- `integrator` — Final status check, generated-artifact cleanup, and merge-readiness summary.
 
 ## Commands cheat sheet
 

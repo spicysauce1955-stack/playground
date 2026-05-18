@@ -1,7 +1,6 @@
 """Lower a :class:`LoadedConfig` into a :class:`ResolvedLab`.
 
-Implements the seven-step lab resolution pipeline in
-``ai/architecture/shared_contracts.md §3.2``:
+Resolution pipeline:
 
 1. Apply Defaults.spec as the base.
 2. Layer the Lab's spec.
@@ -220,7 +219,7 @@ def _flatten_role(role_name: str, loaded: LoadedConfig) -> VmRoleSpec:
 
 
 def _deep_merge_spec(into: dict[str, Any], spec: VmRoleSpec) -> None:
-    """Deep-merge per shared_contracts.md §3.2 rules: maps recurse, lists replace."""
+    """Deep-merge role specs: maps recurse, lists replace."""
     incoming = spec.model_dump()
     for key, value in incoming.items():
         if value is None:
@@ -273,7 +272,7 @@ def _resolve_artifacts(loaded: LoadedConfig) -> ResolvedArtifacts:
 
 
 def _build_source_map(lab: Lab) -> dict[str, str]:
-    """Build the source_map per shared_contracts.md §3 invariants.
+    """Build a coarse source map for the resolved lab.
 
     v1 emits a coarse path — full per-key origins arrive when the
     loader threads :class:`DiscoveredFile` through to the resolver.

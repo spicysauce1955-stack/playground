@@ -1,9 +1,4 @@
-"""YAML config tree discovery, loading, and merge.
-
-Owners: Team A. Contract: produces an unresolved intermediate model
-that :mod:`playground.validation` then validates and
-:mod:`playground.models` resolves.
-"""
+"""YAML config tree discovery, loading, and merge."""
 
 from playground.config.discovery import DiscoveredFile, discover_config_files
 from playground.config.loader import LoadedConfig, load_config

@@ -35,10 +35,8 @@ dev = [
   "mypy>=1.10",
 ]
 
-# [project.scripts] entry is intentionally absent. The CLI surface
-# is owned by Team C (src/playground/cli/) and will be added when
-# that package lands. See ai/architecture/shared_contracts.md §10
-# for the contracted command names.
+# [project.scripts] entry is intentionally absent. Add the CLI entrypoint
+# when src/playground/cli/ lands.
 
 [project.urls]
 Homepage = "https://github.com/spicysauce1955-stack/playground"

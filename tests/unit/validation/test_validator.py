@@ -35,8 +35,7 @@ def test_committed_config_validates_with_no_errors(committed_load: LoadedConfig)
 def test_committed_config_warns_about_missing_router_ansible_role(
     committed_load: LoadedConfig,
 ) -> None:
-    # Per shared_contracts.md §11.3, the missing router ansible role
-    # surfaces as a warning, not an error.
+    # The missing router ansible role surfaces as a warning, not an error.
     diagnostics = validate(committed_load, ansible_roles_dir=ANSIBLE_ROLES_DIR)
     warnings = [d for d in diagnostics if d.id == "config.reference.ansible_role_missing"]
     assert any("router" in d.message for d in warnings)

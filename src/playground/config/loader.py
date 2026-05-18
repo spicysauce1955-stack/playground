@@ -5,8 +5,7 @@ The loader produces a :class:`LoadedConfig` collection plus a list of
 the validator's job) and does NOT resolve presets into a ``ResolvedLab``
 (that's the resolver's job).
 
-Diagnostic IDs emitted here are registered in
-``ai/architecture/diagnostic_ids.md``:
+Diagnostic IDs emitted here:
 
 - ``config.yaml.parse_failed``
 - ``config.schema.kind_missing``

@@ -1,8 +1,4 @@
-"""Base envelope shared by every on-disk YAML kind.
-
-See ``ai/architecture/shared_contracts.md §3.2`` for the user-facing
-contract.
-"""
+"""Base envelope shared by every on-disk YAML kind."""
 
 from __future__ import annotations
 

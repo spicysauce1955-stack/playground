@@ -9,7 +9,7 @@ def test_top_level_package_imports() -> None:
     assert isinstance(pkg.__version__, str)
 
 
-def test_team_a_subpackages_import() -> None:
+def test_core_subpackages_import() -> None:
     for name in (
         "playground.config",
         "playground.models",

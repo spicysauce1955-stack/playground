@@ -1,10 +1,8 @@
 """Walk a config tree and yield file paths grouped by directory.
 
-The platform's config tree shape is defined in
-``ai/architecture/config_design.md §3``. Discovery is intentionally
-simple: directory layout drives kind expectations but does not strictly
-enforce them — a CommandPreset under ``labs/`` is still parsed and a
-Diagnostic surfaces the mismatch downstream.
+Directory layout drives kind expectations but does not strictly enforce them:
+a CommandPreset under ``labs/`` is still parsed and a Diagnostic surfaces the
+mismatch downstream.
 """
 
 from __future__ import annotations
