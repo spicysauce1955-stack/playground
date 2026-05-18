@@ -14,6 +14,8 @@ Source documents:
 
 ## 1. Baseline Cleanup
 
+Status: done.
+
 Goal: make the repository ready for the next implementation slice.
 
 Acceptance:
@@ -26,6 +28,8 @@ Acceptance:
 - product intent has been rehomed under `docs/product/`
 
 ## 2. Read-Only CLI
+
+Status: done.
 
 Goal: prove the Python config layer without touching real infrastructure.
 
@@ -46,6 +50,8 @@ Acceptance:
 
 ## 3. Validation Hardening
 
+Status: next.
+
 Goal: make `ResolvedLab` safe as a future backend input.
 
 Acceptance:
@@ -57,6 +63,8 @@ Acceptance:
 - source paths in diagnostics are accurate enough for CLI use
 
 ## 4. OpenTofu / Ansible Bridge
+
+Status: queued.
 
 Goal: reduce manual handoff without changing runtime behavior.
 

@@ -26,6 +26,9 @@ dependencies = [
   "jsonschema>=4.22",
 ]
 
+[project.scripts]
+playground = "playground.cli.main:app"
+
 [project.optional-dependencies]
 tui = ["textual>=0.62"]
 dev = [
@@ -34,9 +37,6 @@ dev = [
   "ruff>=0.5",
   "mypy>=1.10",
 ]
-
-# [project.scripts] entry is intentionally absent. Add the CLI entrypoint
-# when src/playground/cli/ lands.
 
 [project.urls]
 Homepage = "https://github.com/spicysauce1955-stack/playground"

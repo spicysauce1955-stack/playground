@@ -12,6 +12,7 @@ def test_top_level_package_imports() -> None:
 def test_core_subpackages_import() -> None:
     for name in (
         "playground.config",
+        "playground.cli",
         "playground.models",
         "playground.validation",
         "playground.state",
