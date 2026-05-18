@@ -1,0 +1,38 @@
+apiVersion: playground/v1
+kind: Defaults
+metadata:
+  name: defaults
+  description: Conservative platform defaults applied before lab-specific values.
+
+spec:
+  backend: local-libvirt
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 12
+    max_memory_mb: 24576
+    max_disk_gb: 250
+    max_vms: 8
+    max_containers: 30
+
+  vm:
+    image: ubuntu-noble
+    resources:
+      vcpu: 1
+      memory_mb: 2048
+      disk_gb: 20
+    ssh:
+      user: ubuntu
+      public_key_path: ~/.ssh/id_rsa.pub
+
+  network:
+    profile: nat
+
+  retention:
+    runs:
+      keep_last: 50
+      max_age_days: 30
+    logs:
+      keep_per_run: true
+      compress_after_days: 7

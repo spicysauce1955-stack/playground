@@ -20,24 +20,26 @@ Tasks:
 
 ## Milestone 2: Config Skeleton
 
+Status: drafted (Team A, branch `team/core-config-state`)
+
 Tasks:
 
-- [ ] Create `config/` directory.
-- [ ] Add `config/defaults.yaml`.
-- [ ] Add provider config for `local-libvirt`.
-- [ ] Add artifact sources config.
-- [ ] Add role presets:
-  - [ ] `generic-node`
-  - [ ] `docker-host`
-  - [ ] `router`
-- [ ] Add network profiles:
-  - [ ] `nat`
-  - [ ] `isolated`
-  - [ ] `routed`
-- [ ] Add command presets:
-  - [ ] `check-docker`
-  - [ ] `ping-network`
-- [ ] Add sample lab `generic-infra`.
+- [x] Create `config/` directory.
+- [x] Add `config/defaults.yaml`.
+- [x] Add provider config for `local-libvirt`.
+- [x] Add artifact sources config.
+- [x] Add role presets:
+  - [x] `generic-node`
+  - [x] `docker-host`
+  - [x] `router`
+- [x] Add network profiles:
+  - [x] `nat`
+  - [x] `isolated`
+  - [x] `routed`
+- [x] Add command presets:
+  - [x] `check-docker`
+  - [x] `ping-network`
+- [x] Add sample lab `generic-infra`.
 
 Definition of done:
 
@@ -75,34 +77,52 @@ Definition of done:
 
 ## Milestone 4: Config Loader And Schema
 
+Status: done (Team A, branch `team/core-config-state`, commits
+`38ae25f`, `ce0a3cd`, `6b1f0d9`, `db31d42`). See
+`ai/handoffs/team-a-phase1.md`.
+
 Tasks:
 
-- [ ] Implement YAML discovery.
-- [ ] Implement typed models.
-- [ ] Implement source location tracking.
-- [ ] Implement default merge behavior.
-- [ ] Implement role/network/artifact/command reference resolution.
-- [ ] Implement validation diagnostics.
-- [ ] Add tests for valid sample config.
-- [ ] Add tests for invalid references.
-- [ ] Add tests for malformed YAML.
-- [ ] Add tests for duplicate object names.
+- [x] Implement YAML discovery. (`playground.config.discovery`)
+- [x] Implement typed models. (`playground.models.kinds`,
+      `playground.models.resolved`)
+- [x] Implement source location tracking. (Diagnostic.source carries
+      repo-relative path + key_path; per-key precision in source_map
+      is deferred to Milestone 5.5)
+- [x] Implement default merge behavior. (resolver §3.2 pipeline)
+- [x] Implement role/network/artifact/command reference resolution.
+      (`playground.validation.validator`)
+- [x] Implement validation diagnostics. (15 IDs registered; see
+      `ai/architecture/diagnostic_ids.md`)
+- [x] Add tests for valid sample config.
+- [x] Add tests for invalid references. (10 tests in
+      `tests/unit/validation/`)
+- [x] Add tests for malformed YAML. (10 tests in
+      `tests/unit/config/test_loader.py`)
+- [x] Add tests for duplicate object names. (loader-level + Lab-level
+      duplicate guards)
 
 Definition of done:
 
-- `playground validate` gives actionable diagnostics.
-- Sample config resolves into a normalized lab model.
+- `playground validate` gives actionable diagnostics. ✓ (function-level;
+  CLI wiring is Team C)
+- Sample config resolves into a normalized lab model. ✓
 
 ## Milestone 5: `.playground/` State And Runs
+
+Status: not started; Team A next slice. Contracts are frozen in
+`ai/architecture/shared_contracts.md §4–§5, §8, §9`. See §9 of
+`ai/handoffs/team-a-phase1.md` for the planned commit sequence.
 
 Tasks:
 
 - [ ] Create state directory manager.
-- [ ] Add `.gitignore` entry for `.playground/`.
+- [x] Add `.gitignore` entry for `.playground/`. (commit `280a111`)
 - [ ] Implement active lab state file.
 - [ ] Implement operation run ID generation.
 - [ ] Implement run metadata file.
-- [ ] Define operation event schema.
+- [x] Define operation event schema. (doc-only;
+      `shared_contracts.md §5`)
 - [ ] Implement in-process event bus.
 - [ ] Implement event publisher API for long-running operations.
 - [ ] Implement JSONL event subscriber.
@@ -113,8 +133,16 @@ Tasks:
 - [ ] Implement human summary writer.
 - [ ] Implement run listing.
 - [ ] Implement run detail view.
-- [ ] Implement retention config parsing.
+- [x] Implement retention config parsing. (`RetentionPolicy` /
+      `RetentionLogs` / `RetentionRuns` Pydantic models in commit
+      `38ae25f`; enforcement is still TODO)
 - [ ] Implement cleanup dry-run.
+
+### Milestone 5.5: Resolver precision (deferred from Milestone 4)
+
+- [ ] Thread `DiscoveredFile` through the loader/resolver so
+  `ResolvedLab.source_map` carries per-key origins rather than the
+  current coarse `spec → config/labs/<name>.yaml`.
 
 Definition of done:
 

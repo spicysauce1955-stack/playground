@@ -271,19 +271,23 @@ Fields:
 
 ### VM
 
-Fields:
+Fields (resolved form; see
+`ai/architecture/shared_contracts.md §3` for the authoritative shape):
 
 - name
 - role
 - image
-- cpu
-- memory
-- disk
+- vcpu
+- memory_mb
+- disk_gb
 - networks
 - ssh
 - provisioners
 - tags
 - provider_overrides
+
+User-authored YAML nests cpu/memory/disk under `resources:` for
+ergonomics; the resolver flattens them onto `ResolvedVm`.
 
 ### Network
 
@@ -344,35 +348,9 @@ Fields:
 
 ### Operation Event
 
-Fields:
-
-- event_id
-- run_id
-- lab
-- timestamp
-- level
-- event_type
-- producer
-- backend
-- resource_ref
-- phase
-- message
-- progress
-- payload
-- raw_output_ref
-
-Event type examples:
-
-- `operation.started`
-- `operation.completed`
-- `operation.failed`
-- `plan.step.created`
-- `backend.command.started`
-- `backend.command.output`
-- `backend.command.completed`
-- `resource.status.changed`
-- `diagnostic.emitted`
-- `progress.updated`
+Field list and event-type vocabulary are defined in
+`ai/architecture/shared_contracts.md §5`. This is the freeze doc;
+the names here are intentionally not duplicated to avoid drift.
 
 ## 5. State And Directory Layout
 

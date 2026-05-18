@@ -1,0 +1,15 @@
+apiVersion: playground/v1
+kind: VmRole
+metadata:
+  name: generic-node
+  description: Plain Ubuntu Noble VM with SSH access and no extra provisioning.
+
+spec:
+  image: ubuntu-noble
+  resources:
+    vcpu: 1
+    memory_mb: 2048
+    disk_gb: 20
+  ssh:
+    user: ubuntu
+  provisioners: []

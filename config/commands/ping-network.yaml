@@ -1,0 +1,25 @@
+apiVersion: playground/v1
+kind: CommandPreset
+metadata:
+  name: ping-network
+  description: Ping the default gateway on each attached network from the selected VMs.
+  tags: [network, reachability]
+
+spec:
+  target:
+    any: true
+  command:
+    shell: |
+      set -eu
+      for iface in $(ls /sys/class/net | grep -v '^lo$'); do
+        gw=$(ip -4 route show default dev "$iface" | awk '{print $3}' | head -n1)
+        if [ -n "$gw" ]; then
+          echo "[$iface] -> $gw"
+          ping -c 2 -W 2 "$gw" || true
+        fi
+      done
+  working_directory: /home/ubuntu
+  environment: {}
+  timeout_seconds: 60
+  escalation:
+    become: false
