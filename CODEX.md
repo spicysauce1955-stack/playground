@@ -21,6 +21,9 @@ Claude Code and Codex are the only agent-specific workflows kept in this repo:
 
 - Preserve the OpenTofu -> Ansible -> Redroid pipeline described in `README.md`
   and `CLAUDE.md`.
+- Treat `docs/product/requirements.md` as the highest-signal source of product
+  intent, followed by `docs/product/user_stories.md` and
+  `docs/product/mvp_scope.md`.
 - Use `docs/workflow.md`, `docs/platform.md`, and `docs/roadmap.md` for durable
   process, design, and task sequencing.
 - Re-read `PRD.md` before non-trivial infrastructure changes.

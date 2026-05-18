@@ -1,90 +1,127 @@
-# SYSTEM SPECIFICATION: Automated Local/Remote Infrastructure Playground
+# Product Requirements Document
 
-## 1. Objective & Scope
-The goal of this project is to create a fully automated, Infrastructure-as-Code (IaC) driven local playground that provisions virtual machines, configures container runtimes, handles internal software-defined networking, and orchestrates Android emulation environments. The codebase must be highly modular, allowing a seamless future transition from local hypervisors (KVM/libvirt) to public cloud providers (AWS/GCP) with minimal structural changes.
+## Product Intent
 
-## 2. Core Technical Stack
-*   **Host OS:** Ubuntu Linux
-*   **Hypervisor/Virtualization:** KVM/libvirt (Local)
-*   **Infrastructure Provisioning:** OpenTofu (Declarative IaC)
-*   **Configuration Management:** Ansible (Idempotent Playbooks)
-*   **Container Engine:** Docker CE (Inside Guest VMs)
-*   **Android Emulation:** Redroid (Remote Android in Docker containers)
-*   **Image Bootstrapping:** Cloud-Init (for initial VM user/networking setup)
+The playground is a local-first lab platform for defining, operating, and
+inspecting infrastructure experiments. The operator describes lab intent in a
+YAML config tree, validates and resolves that intent through a Python control
+layer, and eventually applies it through visible OpenTofu, Ansible, Docker, and
+provider adapters.
 
-## 3. Targeted Directory Structure
-The AI must generate and organize the project files exactly as follows:
+The most accurate source of product intent is:
 
-```
-/playground
-├── /tofu
-│   ├── main.tf          # Main entrypoint, provider setup, network layout
-│   ├── variables.tf     # Configurable variables (VM count, RAM, CPU)
-│   ├── outputs.tf       # Dynamic outputs (IP addresses, SSH targets)
-│   └── cloud_init.cfg   # Cloud-init template for guest VM bootstrapping
-├── /ansible
-│   ├── inventory.ini    # Dynamically or statically generated host tracking
-│   ├── site.yml         # Main playbook orchestrating all roles
-│   └── /roles
-│       ├── docker       # Installs Docker CE, configures daemon
-│       └── redroid      # Installs Android kernel modules and starts Redroid
-└── README.md            # Execution and teardown guide
+```text
+docs/product/requirements.md
+docs/product/user_stories.md
+docs/product/mvp_scope.md
 ```
 
-## 4. Phase-by-Phase Requirements
+This document is the concise root PRD. If details conflict, prefer
+`docs/product/requirements.md`, then current code/tests, then this summary.
 
+## Primary User
 
-### Phase 1: Infrastructure Provisioning (OpenTofu & libvirt)
-Provider Configuration: Use the dmacvicar/libvirt provider connected to qemu:///system.
+The primary user is a technical operator who is comfortable with Linux,
+virtualization, Docker, networking, Android, and security experiments. The
+product should provide guardrails, diagnostics, and visibility, while still
+trusting the operator to make advanced or risky lab choices.
 
-Network Layout: Create an isolated network bridge named playground_net using NAT mode. Address space: 10.0.10.0/24. Ensure DHCP is configured.
+## Core Goals
 
-Image Management: Define a libvirt_volume that utilizes an official Ubuntu Cloud Image (e.g., Noble Numbat 24.04 LTS minimal) as a backing store.
+- Define reproducible named labs from YAML config trees.
+- Operate one active lab at a time in the first version.
+- Manage VMs, Docker workloads, and virtual networks first.
+- Support host containers and VM-hosted containers.
+- Keep network topology first-class, including NAT, isolated/no-internet, and
+  routed networks.
+- Keep generated state, logs, runs, cache, and artifacts project-local under
+  `.playground/`.
+- Support offline operation through configurable artifact sources and local
+  caches.
+- Keep backend modules visible and editable instead of hiding OpenTofu and
+  Ansible behind opaque automation.
+- Leave room for Android/Redroid, traffic capture, and security lab presets.
 
-VM Automation: Generate a configurable number of guest VMs. Each VM must have:
+## Current Baseline
 
-CPU type set to host to explicitly support nested virtualization.
+The working infrastructure baseline is:
 
-A unique hostname (e.g., pg-node-01).
+```text
+tofu/ -> ansible/ -> Docker/Redroid -> ADB
+```
 
-Cloud-Init Integration: Use libvirt_cloudinit_config to inject a custom user data payload that:
+This baseline provisions local KVM/libvirt VMs with OpenTofu, configures them
+with Ansible, installs Docker, and runs Redroid containers for Android
+experiments.
 
-Creates a default user.
+The emerging Python control layer is:
 
-Injects the host machine’s public SSH key for passwordless login.
+```text
+config/
+src/playground/config/
+src/playground/models/
+src/playground/validation/
+```
 
-Configures non-interactive package upgrades.
+The two layers are not unified yet. The Python layer must prove read-only
+validation and inspection before it automates or replaces backend operations.
 
-### Phase 2: Configuration & Containerization (Ansible)
-Inventory Integration: Provide a template inventory.ini mapping the guest VM IPs generated by OpenTofu.
+## MVP Outcome
 
-Docker Installation Role: Write an idempotent Ansible role that:
+The operator can define a generic infra lab in YAML, validate it, inspect the
+resolved model, see a plan, apply it on a local libvirt host, inspect VMs,
+networks, Docker readiness, and destroy the lab with structured state and logs
+retained locally.
 
-Removes conflicting old packages.
+## MVP Scope
 
-Adds the official Docker GPG key and APT repository.
+Included:
 
-Installs docker-ce, docker-ce-cli, and containerd.io.
+- named lab definitions
+- one active lab
+- `local-libvirt` backend
+- VM roles: `generic-node`, `docker-host`, `router`
+- network profiles: `nat`, `isolated`, `routed`
+- config validation and actionable diagnostics
+- project-local `.playground/` state
+- operation run/log model
+- doctor/readiness checks
+- offline artifact source model
+- CLI-first operations
 
-Ensures the default cloud-init user is added to the docker group.
+Deferred:
 
-### Phase 3: Android Containerization & Simulation (Redroid)
-Kernel Module Check: Write a task verifying the host/guest kernel supports necessary Android dependencies (e.g., checking for binder or necessary modern kernel features for containerized Android execution).
+- full TUI
+- cloud providers
+- packet capture workflows
+- Android device lifecycle automation beyond the current Redroid baseline
+- full Docker Compose/Swarm execution if it expands the first slice too much
 
-Redroid Deployment Role: Write an Ansible task that uses the community.docker.docker_container module to pull and run the remote-android image (redroid/redroid).
+## Near-Term Product Direction
 
-The container must run with --privileged flags.
+The next safe implementation slice is read-only CLI support:
 
-Incorporate volume mounts for necessary IPC features (e.g., /dev/binderfs if required, or native kernel configurations).
+```text
+playground validate
+playground lab list
+playground lab show <name>
+```
 
-Expose ADB port 5555 to the playground_net interface.
+Backend automation should wait until validation and resolution cover required
+defaults, workload placement, routing intent, budget totals, offline artifacts,
+and source tracking.
 
-## 5. Non-Functional & Operational Requirements
-Air-Gap Readiness: Do not rely on external scripts or third-party curls during the OpenTofu phase; use pre-downloaded local image paths via variables where possible.
+## Non-Functional Requirements
 
-No Hardcoded Secrets: All SSH keys, usernames, and sensitive parameters must be fed via variables (variables.tf or Ansible variables).
-
-Idempotency: Re-running tofu apply or ansible-playbook on an existing stack must not cause state degradation or configuration drift.
-
-## 6. Code Generation Instructions
-Generate the complete code for main.tf, cloud_init.cfg, and the primary Ansible playbooks/roles based on these specifications. Provide brief comments explaining the nested virtualization pass-through mechanics in the OpenTofu code.
+- Extensible: add resource types, providers, roles, and presets without
+  redesigning the core model.
+- Inspectable: plans, logs, generated backend files, and state should be easy to
+  locate.
+- Recoverable: failed runs leave enough state and logs to continue or clean up.
+- Idempotent: repeated apply/configure should avoid unnecessary churn.
+- Portable: lab intent should be backend-neutral where possible.
+- Offline-capable: offline mode must not depend on uncontrolled internet access.
+- Conservative defaults: defaults should suit a local tower with limited
+  resources.
+- User-trusting: warn about risk, but do not block advanced usage unless strict
+  mode is explicitly enabled.

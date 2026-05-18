@@ -6,6 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An Infrastructure-as-Code playground that provisions KVM/libvirt VMs with OpenTofu, configures them with Ansible, and runs containerized Android (Redroid) inside the guests. The full spec lives in `PRD.md` — re-read it before any non-trivial change, as it states non-negotiable constraints (air-gap readiness, no hardcoded secrets, idempotency, nested-virt passthrough).
 
+The highest-signal product intent lives in `docs/product/requirements.md`,
+followed by `docs/product/user_stories.md` and `docs/product/mvp_scope.md`.
+
 ## Two-stage deploy pipeline
 
 The stages are coupled by a manual handoff and must be run in order:

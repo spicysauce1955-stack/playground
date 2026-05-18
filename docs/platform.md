@@ -1,7 +1,8 @@
 # Platform Design Notes
 
-This document keeps durable design constraints without restoring the old
-planning tree.
+This document summarizes active design constraints. Product intent lives in
+`docs/product/requirements.md`, `docs/product/user_stories.md`, and
+`docs/product/mvp_scope.md`.
 
 ## Source Of Truth
 
@@ -50,3 +51,8 @@ resolution cover:
 - source tracking for accurate diagnostics
 
 The next safe product slice is read-only CLI support: validate, list, and show.
+
+Detailed design:
+
+- `docs/system_design.md`
+- `docs/config_design.md`

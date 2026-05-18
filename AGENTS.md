@@ -69,6 +69,9 @@ Use built-in Codex agents when they fit better:
 
 - Preserve the OpenTofu -> Ansible -> Redroid pipeline documented in `README.md`
   and `CLAUDE.md`.
+- Treat `docs/product/requirements.md` as the highest-signal source of product
+  intent, followed by `docs/product/user_stories.md` and
+  `docs/product/mvp_scope.md`.
 - Re-read `PRD.md` before non-trivial infrastructure changes.
 - Keep generated runtime state under `.playground/`.
 - Do not hardcode secrets, SSH keys, passwords, or local-only credentials.

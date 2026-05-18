@@ -2,6 +2,10 @@
 
 This repository contains fully automated Infrastructure-as-Code (IaC) to provision a KVM/libvirt playground, configure it via Ansible, and run containerized Android (Redroid) inside the nested VMs.
 
+Product intent and future platform direction live under `docs/product/` and
+`docs/system_design.md`. The current working runtime path remains OpenTofu plus
+Ansible.
+
 ## Prerequisites
 - **Ubuntu Host** with KVM/libvirt enabled.
 - **OpenTofu** installed.

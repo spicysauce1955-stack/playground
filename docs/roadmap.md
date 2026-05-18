@@ -2,6 +2,14 @@
 
 This is the current sequential task queue.
 
+Source documents:
+
+- `docs/product/requirements.md`
+- `docs/product/user_stories.md`
+- `docs/product/mvp_scope.md`
+- `docs/system_design.md`
+- `docs/config_design.md`
+
 ## 1. Baseline Cleanup
 
 Goal: make the repository ready for the next implementation slice.
@@ -13,7 +21,7 @@ Acceptance:
 - workflow files are committed together
 - old parallel planning tree is removed
 - durable design constraints live under `docs/`
-- unrelated infra edits are either committed separately or left clearly pending
+- product intent has been rehomed under `docs/product/`
 
 ## 2. Read-Only CLI
 
