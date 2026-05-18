@@ -22,8 +22,9 @@ Teardown: `cd tofu && tofu destroy -auto-approve`.
 - **The real OpenTofu root is `tofu/`.** Edit `tofu/main.tf` for infrastructure resources. Do not recreate the retired repo-root `main.tf` stub.
 - **Nested virtualization is load-bearing.** `cpu { mode = "host-passthrough" }` in `tofu/main.tf` is required so Redroid containers inside the guest can access the binder/ashmem kernel features. Do not change it to a generic CPU mode.
 - **Cloud-init wires SSH access.** `tofu/cloud_init.cfg` is a `templatefile` that injects `var.ssh_public_key_path` (default `~/.ssh/id_rsa.pub`) for the `ubuntu` user. SSH password auth is disabled — losing the key means recreating the VM.
-- **Redroid role mounts binderfs.** `ansible/roles/redroid/tasks/main.yml` best-effort `modprobe`s `binder_linux`/`ashmem_linux`, mounts `/dev/binderfs`, and runs the redroid container `--privileged` with port 5555 exposed. Privileged + binderfs are both required.
-- **Docker role is order-sensitive.** Remove distro `docker.io`/`containerd` before installing `docker-ce` from Docker's apt repo, then add the SSH user to the `docker` group. Re-running is idempotent; reordering breaks a fresh box.
+- **Redroid role mounts binderfs.** `ansible/roles/redroid/tasks/main.yml` best-effort `modprobe`s `binder_linux`/`ashmem_linux`, asserts binderfs support, mounts `/dev/binderfs`, and runs the redroid container `--privileged` with port 5555 exposed. The image tag lives in `ansible/roles/redroid/defaults/main.yml`.
+- **Docker role is order-sensitive.** Remove distro `docker.io`/`containerd` before installing `docker-ce` from Docker's apt repo, then add the SSH user to the `docker` group. Defaults live in `ansible/roles/docker/defaults/main.yml`. Re-running is idempotent; reordering breaks a fresh box.
+- **Ansible collections are declared.** `ansible/requirements.yml` declares the external collections used by roles. Controller must run `ansible-galaxy collection install -r ansible/requirements.yml` before the first `site.yml` run.
 
 ## Variables worth knowing (`tofu/variables.tf`)
 

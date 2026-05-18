@@ -21,10 +21,11 @@ tofu apply -auto-approve
 ```
 
 ### 2. Configure Instances (Ansible)
-Once OpenTofu outputs the IP addresses of your VMs, inject them into `ansible/inventory.ini`. Then, run the configuration playbooks:
+Once OpenTofu outputs the IP addresses of your VMs, inject them into `ansible/inventory.ini`. Then install the required collections and run the configuration playbooks:
 
 ```bash
 cd ../ansible
+ansible-galaxy collection install -r requirements.yml
 ansible-playbook -i inventory.ini site.yml
 ```
 

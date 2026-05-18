@@ -1,6 +1,6 @@
 ---
-- name: Ensure required kernel modules exist
-  modprobe:
+- name: Ensure required kernel modules are loaded (best-effort; modern kernels build them in)
+  community.general.modprobe:
     name: "{{ item }}"
     state: present
   loop:
@@ -8,14 +8,20 @@
     - ashmem_linux
   ignore_errors: true
 
-- name: Create binderfs directory
-  file:
+- name: Verify binder filesystem is available in the running kernel
+  ansible.builtin.command: grep -qw binder /proc/filesystems
+  register: binder_check
+  changed_when: false
+  failed_when: binder_check.rc != 0
+
+- name: Create binderfs mountpoint
+  ansible.builtin.file:
     path: /dev/binderfs
     state: directory
     mode: '0755'
 
 - name: Mount binderfs
-  mount:
+  ansible.posix.mount:
     path: /dev/binderfs
     src: binder
     fstype: binder
@@ -23,14 +29,15 @@
 
 - name: Pull redroid image
   community.docker.docker_image:
-    name: redroid/redroid:11.0.0-latest
+    name: "{{ redroid_image }}"
     source: pull
 
 - name: Run redroid container
   community.docker.docker_container:
-    name: redroid_1
-    image: redroid/redroid:11.0.0-latest
+    name: "redroid_{{ inventory_hostname | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
+    image: "{{ redroid_image }}"
     privileged: yes
+    restart_policy: unless-stopped
     volumes:
       - /dev/binderfs:/dev/binderfs
     ports:

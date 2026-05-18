@@ -23,7 +23,7 @@ variable "ssh_public_key_path" {
 }
 
 variable "ubuntu_image_url" {
-  description = "URL for the Ubuntu Cloud Image"
+  description = "Source for the Ubuntu Cloud Image. Accepts an https:// URL or an absolute local file path (file:///...). PRD section 5 prefers a pre-downloaded local path for air-gap readiness; override the default in terraform.tfvars when running offline."
   type        = string
   default     = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 }

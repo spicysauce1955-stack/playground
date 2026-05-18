@@ -1,0 +1,3 @@
+---
+docker_admin_user: "{{ ansible_user | default('ubuntu') }}"
+docker_apt_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"

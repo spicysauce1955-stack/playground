@@ -1,6 +1,6 @@
 ---
-- name: Remove old docker packages
-  apt:
+- name: Remove conflicting distro docker packages
+  ansible.builtin.apt:
     name:
       - docker.io
       - docker-doc
@@ -12,25 +12,34 @@
     state: absent
 
 - name: Install prerequisite packages
-  apt:
+  ansible.builtin.apt:
     name:
       - ca-certificates
       - curl
     state: present
     update_cache: yes
 
-- name: Add Docker GPG apt Key
-  apt_key:
-    url: https://download.docker.com/linux/ubuntu/gpg
-    state: present
+- name: Ensure apt keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
 
-- name: Add Docker Repository
-  apt_repository:
-    repo: deb https://download.docker.com/linux/ubuntu noble stable
+- name: Add Docker GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: '0644'
+
+- name: Add Docker apt repository (signed-by, modern apt layout)
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ docker_apt_arch }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
     state: present
+    filename: docker
+    update_cache: yes
 
 - name: Install Docker CE
-  apt:
+  ansible.builtin.apt:
     name:
       - docker-ce
       - docker-ce-cli
@@ -39,8 +48,8 @@
     state: present
     update_cache: yes
 
-- name: Add ubuntu user to docker group
-  user:
-    name: ubuntu
+- name: Add primary user to docker group
+  ansible.builtin.user:
+    name: "{{ docker_admin_user }}"
     groups: docker
     append: yes
