@@ -74,12 +74,23 @@ and suggested fix where useful.
 
 Near-term validation gaps:
 
-- missing `Defaults`
-- workload placement target references
-- budget totals
-- offline artifact availability
-- routing intent preservation
-- accurate source tracking when filenames differ from metadata names
+- missing `Defaults` — closed; emits `config.required.defaults_missing`
+- workload placement target references — closed; emits
+  `config.reference.unknown_workload_target` and matches `target_role` against
+  the full `spec.extends` chain
+- budget totals — closed; emits `config.budget.exceeded` (strict→error,
+  permissive→warning)
+- offline artifact availability — partially closed; emits
+  `config.artifact.offline_missing` for `ArtifactSources.spec.vm_images`. Other
+  artifact kinds listed in `requirements.md` §5.13 (Tofu providers, Ansible
+  collections, Docker images, package repositories, mirrors, archives) are
+  tracked for a later slice — workload-level Docker image references and Tofu
+  provider references don't have lab-side intent to validate against yet.
+- routing intent preservation — closed; `ResolvedVm.routing` carries the
+  resolved value
+- accurate source tracking when filenames differ from metadata names — closed;
+  `LoadedConfig.sources[(kind, name)]` is populated from
+  `DiscoveredFile.repo_relative_path`
 
 ## Provider Separation
 

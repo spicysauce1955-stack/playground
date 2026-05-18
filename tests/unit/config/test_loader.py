@@ -25,6 +25,14 @@ def test_load_committed_config_is_clean() -> None:
     assert set(loaded.labs) == {"generic-infra"}
 
 
+def test_load_tracks_resource_source_paths() -> None:
+    loaded, diagnostics = load_config(CONFIG_DIR)
+
+    assert diagnostics == []
+    assert loaded.sources[("Lab", "generic-infra")].path == "config/labs/generic-infra.yaml"
+    assert loaded.sources[("VmRole", "router")].path == "config/roles/router.yaml"
+
+
 def _write(tmp: Path, rel: str, content: str) -> None:
     target = tmp / rel
     target.parent.mkdir(parents=True, exist_ok=True)

@@ -52,6 +52,7 @@ def test_resolves_vms_with_role_inheritance(resolved_generic_infra) -> None:
     assert node.ssh.user == "ubuntu"
     assert node.provisioners == []
     assert node.capabilities == {}
+    assert node.routing is None  # role doesn't declare routing
 
     # docker1: explicit per-VM resources override role resources.
     # capabilities inherited from docker-host.
@@ -71,6 +72,9 @@ def test_resolves_vms_with_role_inheritance(resolved_generic_infra) -> None:
     assert router.memory_mb == 2048
     assert router.capabilities == {"routing": True}
     assert router.provisioners == [{"ansible_role": "router"}]
+    assert router.routing is not None
+    assert router.routing.mode == "automatic"
+    assert router.routing.allow_overrides is True
 
 
 def test_resolves_workloads(resolved_generic_infra) -> None:

@@ -50,21 +50,33 @@ Acceptance:
 
 ## 3. Validation Hardening
 
-Status: next.
+Status: done.
 
 Goal: make `ResolvedLab` safe as a future backend input.
 
 Acceptance:
 
 - missing defaults are diagnostics, not late resolver exceptions
-- workload placement targets are validated
-- routing intent survives resolution
-- budget checks exist for VM totals
+  (`config.required.defaults_missing`)
+- workload placement targets are validated against the full
+  `spec.extends` chain (`config.reference.unknown_workload_target`)
+- routing intent survives resolution (`ResolvedVm.routing`)
+- budget checks exist for VM totals (`config.budget.exceeded`,
+  strict→error / permissive→warning, falls back to `Defaults.spec.budget`)
 - source paths in diagnostics are accurate enough for CLI use
+  (`LoadedConfig.sources[(kind, name)]` from the loader)
+- offline labs flag missing VM-image artifacts before apply
+  (`config.artifact.offline_missing`). Other artifact classes from
+  `requirements.md` §5.13 are tracked separately; see
+  `docs/config_design.md` "Validation Rules".
+
+Note: `playground validate` now exits with code 1 when `Defaults` is
+absent — previously the resolver crashed later with a less actionable
+error.
 
 ## 4. OpenTofu / Ansible Bridge
 
-Status: queued.
+Status: next.
 
 Goal: reduce manual handoff without changing runtime behavior.
 

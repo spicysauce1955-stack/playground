@@ -13,6 +13,7 @@ from playground.models.kinds import (
     RetentionPolicy,
     SshConfig,
     TargetSelector,
+    VmRouting,
     WorkloadPlacement,
 )
 
@@ -39,6 +40,7 @@ class ResolvedVm(StrictModel):
     ssh: SshConfig
     provisioners: list[dict[str, str]] = Field(default_factory=list)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    routing: VmRouting | None = None
     tags: list[str] = Field(default_factory=list)
     provider_overrides: dict[str, Any] = Field(default_factory=dict)
 

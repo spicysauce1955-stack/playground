@@ -61,7 +61,7 @@ def resolve_lab(
     workloads = [_resolve_workload(wl) for wl in lab.spec.workloads]
     commands = [_resolve_command(name, loaded) for name in lab.spec.commands.enabled]
     artifacts = _resolve_artifacts(loaded)
-    source_map = _build_source_map(lab)
+    source_map = _build_source_map(lab, loaded)
 
     network_profiles = {
         net.profile: loaded.networks[net.profile].spec for net in lab.spec.networks
@@ -184,6 +184,7 @@ def _resolve_vm(
         ssh=ssh,
         provisioners=[{"ansible_role": p.ansible_role} for p in flattened_role.provisioners],
         capabilities=dict(flattened_role.capabilities),
+        routing=flattened_role.routing,
         tags=list(vm.tags),
         provider_overrides=dict(vm.provider_overrides),
     )
@@ -271,14 +272,16 @@ def _resolve_artifacts(loaded: LoadedConfig) -> ResolvedArtifacts:
     )
 
 
-def _build_source_map(lab: Lab) -> dict[str, str]:
+def _build_source_map(lab: Lab, loaded: LoadedConfig) -> dict[str, str]:
     """Build a coarse source map for the resolved lab.
 
-    v1 emits a coarse path — full per-key origins arrive when the
-    loader threads :class:`DiscoveredFile` through to the resolver.
+    v1 emits a coarse path at the resource level. Full per-key origins
+    can be added later without changing the resolved model shape.
     """
+    source = loaded.sources.get(("Lab", lab.metadata.name))
+    path = source.path if source is not None else f"config/labs/{lab.metadata.name}.yaml"
     return {
-        "spec": f"config/labs/{lab.metadata.name}.yaml",
+        "spec": path,
     }
 
 

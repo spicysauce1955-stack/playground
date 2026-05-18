@@ -57,6 +57,7 @@ class LoadedConfig:
     roles: dict[str, VmRole] = field(default_factory=dict)
     commands: dict[str, CommandPreset] = field(default_factory=dict)
     labs: dict[str, Lab] = field(default_factory=dict)
+    sources: dict[tuple[str, str], SourceLocation] = field(default_factory=dict)
 
 
 def load_config(config_dir: Path) -> tuple[LoadedConfig, list[Diagnostic]]:
@@ -204,6 +205,7 @@ def _file_into_collection(
     diagnostics: list[Diagnostic],
 ) -> None:
     name = resource.metadata.name
+    source = SourceLocation(path=discovered.repo_relative_path)
 
     def _check_duplicate(collection: dict[str, Any]) -> bool:
         if name in collection:
@@ -234,6 +236,7 @@ def _file_into_collection(
             )
             return
         loaded.defaults = resource
+        loaded.sources[("Defaults", name)] = source
     elif isinstance(resource, ArtifactSources):
         if loaded.artifacts is not None:
             diagnostics.append(
@@ -246,21 +249,27 @@ def _file_into_collection(
             )
             return
         loaded.artifacts = resource
+        loaded.sources[("ArtifactSources", name)] = source
     elif isinstance(resource, ProviderConfig):
         if not _check_duplicate(loaded.providers):
             loaded.providers[name] = resource
+            loaded.sources[("ProviderConfig", name)] = source
     elif isinstance(resource, NetworkProfile):
         if not _check_duplicate(loaded.networks):
             loaded.networks[name] = resource
+            loaded.sources[("NetworkProfile", name)] = source
     elif isinstance(resource, VmRole):
         if not _check_duplicate(loaded.roles):
             loaded.roles[name] = resource
+            loaded.sources[("VmRole", name)] = source
     elif isinstance(resource, CommandPreset):
         if not _check_duplicate(loaded.commands):
             loaded.commands[name] = resource
+            loaded.sources[("CommandPreset", name)] = source
     elif isinstance(resource, Lab):
         if not _check_duplicate(loaded.labs):
             loaded.labs[name] = resource
+            loaded.sources[("Lab", name)] = source
 
 
 def _dir_for_kind(kind: str) -> str:
