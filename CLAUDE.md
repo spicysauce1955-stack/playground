@@ -37,8 +37,9 @@ Teardown: `cd tofu && tofu destroy -auto-approve`.
 
 Work happens sequentially on `main`. The old parallel-branch planning files
 have been removed. Use normal Git history, `README.md`, `PRD.md`, `CODEX.md`,
-`AGENTS.md`, `docs/workflow.md`, `docs/platform.md`, `docs/roadmap.md`, and this
-file as the repo guidance.
+`AGENTS.md`, `docs/workflow.md`, `docs/platform.md`,
+`docs/engineering_principles.md`, `docs/architecture_decisions.md`,
+`docs/roadmap.md`, and this file as the repo guidance.
 
 Claude Code is useful for repo-local debugging, test failures, deep multi-file
 refactors, and independent implementation review. Codex is documented in

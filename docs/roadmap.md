@@ -9,6 +9,8 @@ Source documents:
 - `docs/product/mvp_scope.md`
 - `docs/system_design.md`
 - `docs/config_design.md`
+- `docs/engineering_principles.md`
+- `docs/architecture_decisions.md`
 
 ## 1. Baseline Cleanup
 

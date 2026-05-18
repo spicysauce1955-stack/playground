@@ -15,9 +15,11 @@ Product intent:
 Supporting design:
 
 1. `docs/config_design.md`
-2. `docs/platform.md`
-3. `docs/roadmap.md`
-4. `PRD.md`
+2. `docs/engineering_principles.md`
+3. `docs/architecture_decisions.md`
+4. `docs/platform.md`
+5. `docs/roadmap.md`
+6. `PRD.md`
 
 If there is a conflict, prefer the product requirements, then current code and
 tests, then supporting docs.

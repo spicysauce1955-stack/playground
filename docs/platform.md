@@ -56,3 +56,5 @@ Detailed design:
 
 - `docs/system_design.md`
 - `docs/config_design.md`
+- `docs/engineering_principles.md`
+- `docs/architecture_decisions.md`

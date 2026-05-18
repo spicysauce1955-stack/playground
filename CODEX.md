@@ -24,8 +24,9 @@ Claude Code and Codex are the only agent-specific workflows kept in this repo:
 - Treat `docs/product/requirements.md` as the highest-signal source of product
   intent, followed by `docs/product/user_stories.md` and
   `docs/product/mvp_scope.md`.
-- Use `docs/workflow.md`, `docs/platform.md`, and `docs/roadmap.md` for durable
-  process, design, and task sequencing.
+- Use `docs/workflow.md`, `docs/platform.md`,
+  `docs/engineering_principles.md`, `docs/architecture_decisions.md`, and
+  `docs/roadmap.md` for durable process, design, decisions, and sequencing.
 - Re-read `PRD.md` before non-trivial infrastructure changes.
 - Keep generated runtime state under `.playground/`.
 - Do not hardcode secrets, SSH keys, passwords, or local-only credentials.

@@ -33,6 +33,8 @@ Planning state lives in:
 
 - `docs/workflow.md` for process
 - `docs/platform.md` for durable design constraints
+- `docs/engineering_principles.md` for implementation principles
+- `docs/architecture_decisions.md` for durable architecture decisions
 - `docs/roadmap.md` for the current sequential task queue
 
 ## Codex Subagents
