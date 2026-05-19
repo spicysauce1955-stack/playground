@@ -76,7 +76,7 @@ error.
 
 ## 4. OpenTofu / Ansible Bridge
 
-Status: in progress (slices 4a, 4b, 4d done; 4c queued).
+Status: done.
 
 Goal: reduce manual handoff without changing runtime behavior.
 
@@ -115,15 +115,21 @@ Slice 4d (done):
 - `_resolve_lab_or_exit` helper extracted from the three CLI commands
   that resolve a lab (`lab show`, `inventory render`, `tofu render`).
 
-Known limitations to close in follow-up slices:
+Slice 4c (done):
 
-- Slice 4c: only a single `[playground]` group is emitted today.
-  `[docker_host]` / `[router]` groups can be added when a playbook
-  needs them.
+- Inventory now emits one `[role_group]` per distinct VM role in
+  addition to `[playground]`. Group names normalize kebab→snake
+  (`docker-host` → `docker_host`) so they're valid Ansible
+  identifiers. Future playbooks can target `hosts: docker_host` etc.
+  without scanning host vars.
+
+Carried forward to future work:
+
 - Per-VM `resources` from the lab still don't reach tofu. Today's
   `tofu/main.tf` applies global `var.vm_memory` / `var.vm_vcpu`
-  uniformly; the warning above documents the gap. Future slice can
-  enrich tofu to accept per-VM resources as a list of objects.
+  uniformly; the `config.backend.per_vm_resources_unsupported`
+  warning documents the gap. Future slice can enrich tofu to accept
+  per-VM resources as a list of objects.
 - CLI imports the concrete `playground.backend.local_libvirt` adapter
   directly. Introduce a small adapter protocol / registry only when a
   second backend appears.

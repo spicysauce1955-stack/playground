@@ -55,6 +55,57 @@ def test_render_inventory_emits_one_host_per_vm(
     assert "pg_lab=generic-infra" in body
 
 
+def test_render_inventory_emits_per_role_groups(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    body, _ = render_inventory(resolved_generic_infra, lab_ips)
+
+    # generic-infra: node1=generic-node, docker1=docker-host, router1=router
+    # dashes normalized to underscores so group names are valid Ansible.
+    assert "[docker_host]\ndocker1" in body
+    assert "[generic_node]\nnode1" in body
+    assert "[router]\nrouter1" in body
+
+
+def test_render_inventory_groups_multiple_vms_per_role(resolved_generic_infra) -> None:
+    # Add a second generic-node VM to the lab — both should land in the
+    # [generic_node] group.
+    extra_vm = resolved_generic_infra.vms[0].model_copy(update={"name": "node2"})
+    two_nodes = resolved_generic_infra.model_copy(
+        update={"vms": [*resolved_generic_infra.vms, extra_vm]}
+    )
+    ips = {
+        "node1": "10.0.10.42",
+        "node2": "10.0.10.45",
+        "docker1": "10.0.10.43",
+        "router1": "10.0.10.44",
+    }
+
+    body, _ = render_inventory(two_nodes, ips)
+
+    # Both node1 and node2 listed under [generic_node].
+    generic_node_section = body.split("[generic_node]", 1)[1].split("\n[", 1)[0]
+    assert "node1" in generic_node_section
+    assert "node2" in generic_node_section
+    # And they're still in the [playground] group with full host vars.
+    assert "node2 ansible_host=10.0.10.45" in body
+
+
+def test_render_inventory_omits_role_group_when_vm_has_no_ip(
+    resolved_generic_infra,
+) -> None:
+    # Only docker1 has an IP; the [docker_host] group should still appear
+    # but [generic_node] and [router] should not.
+    body, diagnostics = render_inventory(
+        resolved_generic_infra, {"docker1": "10.0.10.43"}
+    )
+
+    assert any(d.id == "config.inventory.vm_ip_not_found" for d in diagnostics)
+    assert "[docker_host]" in body
+    assert "[generic_node]" not in body
+    assert "[router]" not in body
+
+
 def test_render_inventory_preserves_networks(
     resolved_generic_infra, lab_ips: dict[str, str]
 ) -> None:
