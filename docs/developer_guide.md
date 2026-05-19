@@ -551,16 +551,15 @@ above settings via `runtime.doctor.ansible_cfg_missing` /
 
 ## Ansible roles (`ansible/`)
 
-`ansible/site.yml` runs several plays in order; the highlights:
-
-1. `Apply lab-declared extra_hosts entries` (legacy workaround,
-   still useful for non-lab hostnames).
-2. `Baseline configuration` → `common` role (UTC timezone via
-   `community.general.timezone`; minimal `jq curl ca-certificates`
-   install). Idempotent on re-apply.
-3. `Configure Playground Guests` → `docker` then `redroid`.
-4. Per-host-class plays for cross-VM labs (`docker_tunneler`,
-   `ssh_keypair_*`, `barak_deploy_staging`, `barak_deploy_agent`).
+`ansible/site.yml` is provisioner-driven: most plays target a
+`needs_<ansible_role>` inventory group rather than `hosts:
+playground`. The inventory renderer adds every VM to a
+`[needs_<role>]` group for each entry in its VmRole's
+`spec.provisioners` list — so the role YAML is the single source
+of truth for what runs where. Three plays stay on `hosts:
+playground` because they're truly universal (`extra_hosts`,
+`common`, `workload_*`). Per-role plays dispatch via groups like
+`needs_docker`, `needs_redroid`, `needs_docker_tunneler`, etc.
 
 ### `docker`
 

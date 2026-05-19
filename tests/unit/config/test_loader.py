@@ -23,6 +23,7 @@ def test_load_committed_config_is_clean() -> None:
     assert set(loaded.roles) == {
         "generic-node", "docker-host", "router",
         "deployment-source", "deployment-target",
+        "redroid-host",
     }
     assert set(loaded.commands) == {"check-docker", "ping-network"}
     assert set(loaded.labs) == {"generic-infra", "barak-deploy-cross-vm"}

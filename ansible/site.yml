@@ -1,12 +1,27 @@
 ---
+# site.yml dispatches by per-VM provisioner, not by VmRole name. The
+# inventory renderer (src/playground/backend/local_libvirt/inventory.py)
+# emits a `[needs_<ansible_role>]` group containing every VM whose
+# VmRole.provisioners includes that role. Every play below targets one
+# of those groups, so the role system is the single source of truth:
+# `redroid` only runs on VMs whose VmRole opts in, not on every host.
+#
+# Three plays are intentionally platform-level (hosts: playground) —
+# they apply uniformly regardless of role:
+#   - `extra_hosts` (cross-VM /etc/hosts entries)
+#   - `common` (timezone + baseline packages)
+#   - workload_* (per-workload deployment driven by pg_workloads hostvar)
+#
+# Everything else dispatches via `hosts: needs_<role>`.
+
 - name: Bootstrap deployment sources (SSH keypair generation)
-  hosts: deployment_source
+  hosts: needs_ssh_keypair_generator
   become: yes
   roles:
     # Runs before the receiver play so `ship_pubkey` host fact is
     # available when `ssh_keypair_receiver` reads it later. Labs
-    # without a `deployment_source` inventory group skip this play
-    # (Ansible warns then continues).
+    # without a needs_ssh_keypair_generator inventory group skip
+    # this play (Ansible warns then continues).
     - ssh_keypair_generator
 
 - name: Apply lab-declared extra_hosts entries
@@ -27,23 +42,34 @@
     # roles can rely on these being present.
     - common
 
-- name: Configure Playground Guests
-  hosts: playground
+- name: Install Docker engine
+  hosts: needs_docker
   become: yes
   gather_facts: no
   roles:
     - docker
+
+- name: Install Redroid (Android container)
+  hosts: needs_redroid
+  become: yes
+  gather_facts: no
+  roles:
+    # Opt-in. Only VMs whose VmRole lists `redroid` in provisioners
+    # land in `needs_redroid` and run this play. Redroid requires a
+    # kernel with binder_linux/ashmem_linux — the role fails early
+    # with a clear message naming the VmRole opt-out if the host
+    # lacks support.
     - redroid
 
 - name: Install docker-tunneler on deployment hosts
-  hosts: deployment_source:deployment_target
+  hosts: needs_docker_tunneler
   become: yes
   gather_facts: no
   roles:
     - docker_tunneler
 
 - name: Wire SSH key distribution to deployment targets
-  hosts: deployment_target
+  hosts: needs_ssh_keypair_receiver
   become: yes
   gather_facts: no
   roles:
@@ -52,14 +78,14 @@
     - ssh_keypair_receiver
 
 - name: Stage barak-deploy demo artifacts on sources
-  hosts: deployment_source
+  hosts: needs_barak_deploy_staging
   become: yes
   gather_facts: no
   roles:
     - barak_deploy_staging
 
 - name: Install barak-deploy on targets
-  hosts: deployment_target
+  hosts: needs_barak_deploy_agent
   become: yes
   gather_facts: no
   roles:
@@ -68,7 +94,7 @@
 - name: Deploy container workloads
   hosts: playground
   become: yes
-  gather_facts: no  # facts already gathered by the first play
+  gather_facts: no  # facts already gathered by the extra_hosts play
   roles:
     # Each workload_* role ends the host early when no matching
     # workloads are scheduled, so non-applicable hosts pay only the

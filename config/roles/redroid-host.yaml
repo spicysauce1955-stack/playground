@@ -1,0 +1,30 @@
+apiVersion: playground/v1
+kind: VmRole
+metadata:
+  name: redroid-host
+  description: |
+    Docker host that also runs a Redroid (containerized Android)
+    container. Opt-in: only VMs that explicitly use this role land
+    in the inventory's `[needs_redroid]` group and trigger the
+    redroid play in site.yml. Requires an Android-capable kernel
+    with binder_linux + ashmem_linux — the redroid role aborts
+    with a clear message naming this role as the opt-out point if
+    the host kernel lacks support.
+
+spec:
+  extends: docker-host
+  resources:
+    vcpu: 4
+    memory_mb: 8192
+    disk_gb: 60
+  capabilities:
+    docker: true
+    compose: true
+    swarm: true
+    redroid: true
+  provisioners:
+    # The resolver list-replaces provisioners on `extends`, so we
+    # re-list docker explicitly. Order matters: docker first (redroid
+    # talks to dockerd), redroid second.
+    - ansible_role: docker
+    - ansible_role: redroid

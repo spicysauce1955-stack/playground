@@ -270,9 +270,9 @@ def render_inventory(
         *(host_line for _, _, host_line in placed_vms),
     ]
 
-    # Per-role groups: sorted, kebab-case role names normalized to
-    # snake_case so they're valid Ansible group identifiers. Listed by
-    # host name only — host vars are already declared in [playground].
+    # Per-VmRole groups: kebab-case role names normalized to snake_case
+    # so they're valid Ansible group identifiers. Listed by host name
+    # only — host vars are already declared in [playground].
     role_to_vms: dict[str, list[str]] = {}
     for name, role, _ in placed_vms:
         role_to_vms.setdefault(_role_group(role), []).append(name)
@@ -281,6 +281,31 @@ def render_inventory(
             "",
             f"[{role_group}]",
             *role_to_vms[role_group],
+        ]
+
+    # Provisioner-need groups: for each ansible_role any VM provisions,
+    # emit a `[needs_<role>]` group listing the VMs that need it. This
+    # is what site.yml dispatches on so the role system is the single
+    # source of truth — `redroid` only runs on VMs whose VmRole lists
+    # it, not on every host in the lab.
+    provisioner_to_vms: dict[str, list[str]] = {}
+    for vm in resolved.vms:
+        vm_name = vm.name
+        # Skip VMs that didn't land an IP — they're already absent from
+        # the host body, no point listing them in groups.
+        if not any(name == vm_name for name, _, _ in placed_vms):
+            continue
+        for provisioner in vm.provisioners:
+            ansible_role = provisioner.get("ansible_role")
+            if not ansible_role:
+                continue
+            group = _provisioner_group(ansible_role)
+            provisioner_to_vms.setdefault(group, []).append(vm_name)
+    for provisioner_group in sorted(provisioner_to_vms):
+        lines += [
+            "",
+            f"[{provisioner_group}]",
+            *provisioner_to_vms[provisioner_group],
         ]
 
     # Swarm membership groups so site.yml plays can target managers
@@ -310,6 +335,18 @@ def render_inventory(
 def _role_group(role: str) -> str:
     """Normalize a kebab-case role name into a snake_case Ansible group."""
     return role.replace("-", "_")
+
+
+def _provisioner_group(ansible_role: str) -> str:
+    """Group name for VMs whose VmRole.provisioners includes ``ansible_role``.
+
+    ``[needs_<role>]`` so site.yml plays read as "run docker on the
+    hosts that need docker", not "run docker on the hosts whose VmRole
+    is called docker". Important distinction now that deployment-source
+    and deployment-target both `needs_docker` (for docker_tunneler) but
+    aren't themselves named docker-host.
+    """
+    return f"needs_{ansible_role.replace('-', '_')}"
 
 
 __all__ = [

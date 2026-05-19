@@ -8,11 +8,40 @@
     - ashmem_linux
   ignore_errors: true
 
-- name: Verify binder filesystem is available in the running kernel
+- name: Probe binder filesystem support in the running kernel
   ansible.builtin.command: grep -qw binder /proc/filesystems
   register: binder_check
   changed_when: false
-  failed_when: binder_check.rc != 0
+  # Handle the rc explicitly below so the failure message can name
+  # the VmRole opt-out path instead of a bare grep exit-1.
+  failed_when: false
+
+- name: Gather kernel facts for the abort message
+  ansible.builtin.setup:
+    filter: ansible_kernel
+  when: binder_check.rc != 0
+
+- name: Abort cleanly when the kernel lacks binderfs (with opt-out hint)
+  ansible.builtin.fail:
+    msg: |
+      Host '{{ inventory_hostname }}' is running kernel
+      {{ ansible_kernel | default('<unknown>') }}, which does NOT
+      expose binder in /proc/filesystems. Redroid requires
+      binder_linux + ashmem_linux — without them the rest of this
+      role would create a non-functional container.
+
+      To resolve:
+        - Run on an Android-capable kernel (Anbox-modules / mainline
+          ≥ 5.10 with CONFIG_ANDROID_BINDER_IPC=y), OR
+        - Remove `redroid` from this VM's VmRole. The conventional
+          opt-out is to use `docker-host` instead of `redroid-host`
+          under config/roles/, or to drop `ansible_role: redroid`
+          from a custom VmRole's `spec.provisioners` list.
+
+      site.yml dispatches the redroid play only on the
+      `[needs_redroid]` inventory group, so removing the provisioner
+      drops this host from the play entirely on the next apply.
+  when: binder_check.rc != 0
 
 - name: Create binderfs mountpoint
   ansible.builtin.file:

@@ -696,6 +696,58 @@ each load-bearing knob removed in turn, flexible spacing) + 2
 unit tests for the env wiring (set when ansible_cfg passed,
 inherited otherwise). Total suite 310 passing, 3 skipped.
 
+## 16. Provisioner-driven dispatch in site.yml
+
+Status: done.
+
+`ansible/site.yml`'s "Configure Playground Guests" play
+hardcoded `roles: [docker, redroid]` against
+`hosts: playground` — every VM in every lab got both roles, no
+matter what its VmRole's `provisioners` list said. The bug had
+two practical consequences:
+
+1. **redroid ran on every host.** Most Linux dev-box kernels
+   don't ship binder_linux / ashmem_linux, so the redroid role's
+   `grep -qw binder /proc/filesystems` check failed and the
+   whole apply errored out. Hard blocker for any lab whose host
+   isn't on an Android-capable kernel.
+2. **docker installation was implicitly load-bearing.** The
+   cross-VM VmRoles (`deployment-source`, `deployment-target`)
+   list-replace the parent's `[docker]` provisioner with their
+   own `[docker_tunneler, ...]`. They depended on the hardcoded
+   site.yml play to get docker installed at all — bug + workaround
+   coupled, no role-YAML reflected the truth.
+
+Fix is architectural: inventory and site.yml drive off the per-VM
+provisioner list, not VmRole name.
+
+- **`render_inventory`** now emits `[needs_<ansible_role>]`
+  groups derived from every VM's `provisioners`. A VM whose
+  VmRole provisions `[docker, docker_tunneler]` lands in both
+  `[needs_docker]` and `[needs_docker_tunneler]`.
+- **`site.yml`** dispatches each platform role via its
+  `needs_<role>` group: `hosts: needs_docker` runs docker,
+  `hosts: needs_redroid` runs redroid, etc. The three platform
+  plays (`extra_hosts`, `common`, `workload_*`) stay on
+  `hosts: playground` since they're truly universal.
+- **`deployment-source` / `deployment-target` VmRoles** now
+  list `docker` explicitly in their `provisioners` — was
+  implicit through the hardcoded play, now reflected in the
+  YAML.
+- **New `redroid-host` VmRole** for explicit opt-in. Operators
+  who want Redroid set `role: redroid-host` on the relevant
+  lab VM. Generic-infra deliberately doesn't use it.
+- **Redroid role's binder check** now fails with a clear
+  message naming the VmRole opt-out path
+  (`role: docker-host` instead of `redroid-host`, or remove
+  `ansible_role: redroid` from a custom role) rather than a
+  bare `failed_when: rc != 0`.
+
+Tests: 2 new inventory tests (`needs_<role>` groups for
+generic-infra and the cross-VM lab) + updated loader test
+covering the new role. Suite now 313 passing, 3 skipped.
+Ansible syntax-check clean.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —
