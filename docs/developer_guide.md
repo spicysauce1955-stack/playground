@@ -3,6 +3,7 @@
 This is the deep-dive entry point for newcomers to the codebase. It complements
 the higher-level docs:
 
+- **Visual overview with diagrams**: [`docs/system_overview.md`](system_overview.md) — start there if you want a map before the prose
 - Product intent: `docs/product/requirements.md`, `user_stories.md`, `mvp_scope.md`
 - System architecture: `docs/system_design.md`
 - Config tree shape: `docs/config_design.md`
@@ -623,6 +624,8 @@ PYTHONPATH=src uv run --no-project --with pytest --with pydantic --with ruamel.y
 
 ## Where to read next
 
+- [`docs/system_overview.md`](system_overview.md) — diagrams of the same
+  picture you just walked through; useful as a refresher
 - `docs/system_design.md` — full intended system, including the parts not
   built yet (planner, event runner, backend adapters)
 - `docs/config_design.md` — config tree shape and validation gap list

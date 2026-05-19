@@ -95,6 +95,7 @@ docs/              Product, architecture, config, roadmap docs
 
 | You want to… | Read |
 |---|---|
+| Get a visual map of the system | [`docs/system_overview.md`](docs/system_overview.md) |
 | Dive into the code and contribute | [`docs/developer_guide.md`](docs/developer_guide.md) |
 | Understand product intent | [`docs/product/requirements.md`](docs/product/requirements.md) |
 | See what's planned and in flight | [`docs/roadmap.md`](docs/roadmap.md) |
