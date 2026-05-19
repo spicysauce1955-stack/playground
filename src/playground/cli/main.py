@@ -26,6 +26,7 @@ from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
 from playground.planner import Plan, PlanAction, render_plan
+from playground.preflight import run_all_checks as run_doctor_checks
 from playground.runs import OperationRun
 from playground.validation import validate as validate_loaded_config
 
@@ -100,6 +101,54 @@ def validate_command(
             _print_diagnostics(diagnostics, err=False)
         errors, warnings = _count_diagnostics(diagnostics)
         typer.echo(f"{errors} errors, {warnings} warnings")
+
+    if _has_errors(diagnostics):
+        raise typer.Exit(code=1)
+
+
+@app.command("doctor")
+def doctor_command(
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format."),
+    ] = OutputFormat.human,
+    ssh_key: Annotated[
+        Path | None,
+        typer.Option(
+            "--ssh-key",
+            help=(
+                "SSH public key path the apply will inject via cloud-init. "
+                "Defaults to ~/.ssh/id_rsa.pub (matching tofu's "
+                "var.ssh_public_key_path default)."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Probe the local host for playground prerequisites.
+
+    Runs a fixed set of read-only checks (PATH binaries, libvirt group,
+    storage pool, SSH key, AppArmor config, ansible collections) and
+    reports each missing prereq as a diagnostic with an actionable fix.
+    Exits 0 when no errors fire; 1 if any check returned an error.
+    Warnings never block the exit code.
+    """
+    diagnostics = run_doctor_checks(ssh_key_path=ssh_key)
+
+    if output is OutputFormat.json:
+        _print_json(
+            {
+                "ok": not _has_errors(diagnostics),
+                "diagnostics": [_diagnostic_to_dict(d) for d in diagnostics],
+            }
+        )
+    else:
+        if diagnostics:
+            _print_diagnostics(diagnostics, err=False)
+        errors, warnings = _count_diagnostics(diagnostics)
+        if errors == 0 and warnings == 0:
+            typer.echo("All checks passed.")
+        else:
+            typer.echo(f"{errors} errors, {warnings} warnings")
 
     if _has_errors(diagnostics):
         raise typer.Exit(code=1)

@@ -66,6 +66,78 @@ def _write_apply_shims(
     return bin_dir
 
 
+def test_doctor_all_passing_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    from playground.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "run_doctor_checks", lambda **_kw: [])
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "All checks passed." in result.stdout
+
+
+def test_doctor_json_output_collects_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    from playground.cli import main as cli_main
+    from playground.models.diagnostic import Diagnostic
+
+    diagnostics = [
+        Diagnostic(
+            id="runtime.doctor.iso_tool_missing",
+            severity="error",
+            message="genisoimage missing",
+        ),
+        Diagnostic(
+            id="runtime.doctor.apparmor_libvirt_unconfigured",
+            severity="warning",
+            message="apparmor warning",
+        ),
+    ]
+    monkeypatch.setattr(cli_main, "run_doctor_checks", lambda **_kw: diagnostics)
+    result = CliRunner().invoke(app, ["doctor", "--output", "json"])
+    assert result.exit_code == 1  # any error -> exit 1
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    ids = [d["id"] for d in payload["diagnostics"]]
+    assert ids == [
+        "runtime.doctor.iso_tool_missing",
+        "runtime.doctor.apparmor_libvirt_unconfigured",
+    ]
+
+
+def test_doctor_warnings_only_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    from playground.cli import main as cli_main
+    from playground.models.diagnostic import Diagnostic
+
+    monkeypatch.setattr(
+        cli_main,
+        "run_doctor_checks",
+        lambda **_kw: [
+            Diagnostic(
+                id="runtime.doctor.default_pool_no_autostart",
+                severity="warning",
+                message="autostart off",
+            )
+        ],
+    )
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "0 errors, 1 warnings" in result.stdout
+
+
+def test_doctor_passes_ssh_key_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from playground.cli import main as cli_main
+
+    captured: dict[str, Path | None] = {}
+
+    def _capture(**kwargs: object) -> list[object]:
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_main, "run_doctor_checks", _capture)
+    result = CliRunner().invoke(app, ["doctor", "--ssh-key", "/tmp/key.pub"])
+    assert result.exit_code == 0
+    assert captured["ssh_key_path"] == Path("/tmp/key.pub")
+
+
 def test_validate_committed_config_succeeds() -> None:
     result = CliRunner().invoke(app, ["validate", "--config-dir", str(CONFIG_DIR)])
 

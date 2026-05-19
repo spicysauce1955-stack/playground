@@ -324,6 +324,7 @@ Typer entry point. Subcommands:
 
 | Command | Surface | Mutates |
 |---|---|---|
+| `playground doctor` | probe host prerequisites (binaries, libvirt pool, SSH key, ansible collections) | no |
 | `playground validate` | full cross-reference check | no |
 | `playground lab list` / `lab show <lab>` | inspect lab definitions | no |
 | `playground plan <lab>` | render backend-neutral preview | no |

@@ -125,6 +125,7 @@ enforcement, runtime overrides, lab-scoped DNS, etc.).
 ## End-to-end operator workflow
 
 ```bash
+playground doctor                                # probe host prereqs (run this first)
 playground validate                              # cross-reference check
 playground plan generic-infra                    # preview what apply would do
 playground apply generic-infra                   # tofu + ansible + record run

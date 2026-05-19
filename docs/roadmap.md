@@ -504,6 +504,51 @@ Carried forward to a follow-up:
   labs are loaded. Move the check outside the per-lab loop when
   someone touches the validator next.
 
+## 12. `playground doctor` — host prerequisite probes
+
+Status: done.
+
+A read-only diagnostic command that bundles the host-side checks
+new operators forget. Same diagnostic shape as `playground
+validate`; identical `--output {human,json}` story; exits 1 on
+any error, 0 on warnings-only.
+
+Implemented checks (`runtime.doctor.*`):
+
+- `iso_tool_missing` — `genisoimage` or `mkisofs` on PATH (one
+  of them is required to build cloud-init ISOs).
+- `virsh_missing` / `virsh_unreachable` — `virsh` on PATH and
+  `qemu:///system` reachable. Gates the pool checks.
+- `libvirt_group_missing` / `libvirt_group_inactive` — current
+  user is in the `libvirt` group (and the current session has
+  picked up the membership, not just `/etc/group`).
+- `default_pool_missing` / `default_pool_inactive` /
+  `default_pool_no_autostart` — `default` storage pool defined,
+  state == running, autostart == yes. Last one is a warning.
+- `pool_path_unreadable` — every ancestor of the pool target
+  path is world-traversable so libvirt-qemu can reach the
+  disks. Warning; the common breakage is a pool inside `$HOME`.
+- `ssh_public_key_missing` — `var.ssh_public_key_path` (default
+  `~/.ssh/id_rsa.pub`) exists. Overrideable with `--ssh-key`.
+- `apparmor_libvirt_unconfigured` — when AppArmor is active,
+  either `security_driver = "none"` is set in
+  `/etc/libvirt/qemu.conf` OR the per-VM profile machinery is
+  in place (`apparmor_parser` + `/etc/apparmor.d/libvirt/`).
+  Skipped silently when AppArmor isn't loaded.
+- `ansible_missing` / `ansible_collection_missing` —
+  `ansible-playbook` on PATH plus `ansible.posix`,
+  `community.crypto`, `community.docker` collections installed.
+
+Module: `src/playground/preflight/doctor.py`. Each check is a
+pure function returning `list[Diagnostic]`. `run_all_checks` is
+the orchestrator. Pure read-only; doctor never auto-remediates
+— each diagnostic carries a one-line `suggestion` instead.
+
+Follow-up (intentionally not yet shipped): wire doctor as a
+pre-apply hook so `playground apply` runs the doctor checks
+first and refuses to proceed on errors. Keep the manual command
+either way for "what's wrong before I even try?".
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

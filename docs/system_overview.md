@@ -402,6 +402,7 @@ categories:
 | `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing` |
 | `runtime.tui.*` | CLI | `missing_dependency` |
 | `runtime.exec.*` | CLI | `ssh_binary_missing` |
+| `runtime.doctor.*` | preflight | `iso_tool_missing`, `virsh_missing`, `virsh_unreachable`, `libvirt_group_missing`, `libvirt_group_inactive`, `default_pool_missing`, `default_pool_inactive`, `default_pool_no_autostart`, `pool_path_unreadable`, `ssh_public_key_missing`, `apparmor_libvirt_unconfigured`, `ansible_missing`, `ansible_collection_missing` |
 
 Diagnostic IDs are **stable public contract** — they show up in JSON output
 that downstream tools may grep. Don't rename without a deprecation plan.
