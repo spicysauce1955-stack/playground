@@ -85,7 +85,7 @@ Use built-in Codex agents when they fit better:
 Prefer the narrowest checks that prove the change:
 
 ```bash
-PYTHONPATH=src uv run --no-project --with pytest --with pydantic --with ruamel.yaml --with jsonschema pytest tests/unit
+PYTHONPATH=src uv run --no-project --with pytest --with pytest-asyncio --with pydantic --with ruamel.yaml --with jsonschema --with typer --with textual pytest tests
 cd tofu && tofu fmt -check && tofu validate
 ansible-playbook -i ansible/inventory.ini ansible/site.yml --syntax-check
 ```

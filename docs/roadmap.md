@@ -286,6 +286,37 @@ Carried forward:
   networks is a follow-up. `workload_to_ansible_payload` deliberately
   omits the field with a comment.
 
+## 9. TUI
+
+Status: in progress (first slice done).
+
+Slice 9a (done):
+
+- Textual-based read-only TUI in `src/playground/tui/`. Two-pane
+  layout: lab list (left) + lab detail (right). Detail renders
+  resolved metadata, observed status (delegates to
+  `query_status`), planned actions (delegates to `render_plan`),
+  budget totals, and validation diagnostics — every panel reuses
+  the same primitives the CLI uses per requirements §5.8.
+- New CLI entry point `playground tui` lazily imports Textual so
+  the rest of the CLI still works without the `[tui]` extra.
+  Missing dependency surfaces as
+  `runtime.tui.missing_dependency`.
+- `textual` moved from optional dependency-only to dev-deps so the
+  test suite can import it; Textual `App.run_test()` Pilot drives
+  the two new tests.
+
+Slice 9b (queued): mutating actions
+
+- `apply` / `destroy` from inside the TUI. Will subscribe to the
+  §7 event bus to stream step progress live rather than dumping
+  log tails. Needs richer per-step events first.
+
+Slice 9c (queued): runs viewer
+
+- Browse historical runs (`playground runs list/show` in TUI form)
+  with the events.jsonl feed rendered as a timeline.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

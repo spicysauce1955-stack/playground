@@ -245,6 +245,35 @@ def render_inventory_command(
     typer.echo(f"  vms: {len(resolved.vms)}")
 
 
+@app.command("tui")
+def tui_command(
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+) -> None:
+    """Launch the read-only operator TUI (requires the ``[tui]`` extra)."""
+    try:
+        from playground.tui import run_app
+    except ImportError as exc:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="runtime.tui.missing_dependency",
+                severity="error",
+                message=f"failed to import the TUI ({exc})",
+                source=SourceLocation(path="pyproject.toml"),
+                suggestion="install with `pip install -e .[tui]`",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+    run_app(config_dir=config_dir, tofu_dir=tofu_dir)
+
+
 @app.command("plan")
 def plan_command(
     lab: Annotated[str, typer.Argument(help="Lab name to plan.")],
