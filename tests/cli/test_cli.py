@@ -152,8 +152,12 @@ def test_inventory_render_writes_inventory_and_json_payload(
         {
             "vm_ips": {
                 "sensitive": False,
-                "type": ["tuple", ["string", "string", "string"]],
-                "value": ["10.0.10.42", "10.0.10.43", "10.0.10.44"],
+                "type": ["map", "string"],
+                "value": {
+                    "node1": "10.0.10.42",
+                    "docker1": "10.0.10.43",
+                    "router1": "10.0.10.44",
+                },
             }
         }
     )

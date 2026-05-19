@@ -76,27 +76,37 @@ error.
 
 ## 4. OpenTofu / Ansible Bridge
 
-Status: in progress (first slice done; follow-ups queued).
+Status: in progress (slices 4a and 4b done; follow-ups queued).
 
 Goal: reduce manual handoff without changing runtime behavior.
 
-First slice (done):
+Slice 4a (done):
 
 - `playground inventory render <lab>` writes
   `.playground/state/inventory/<lab>.ini` from a `ResolvedLab` plus
   `tofu output -json`
 - new backend adapter layer under `src/playground/backend/local_libvirt/`
-- five `config.inventory.*` diagnostics for the failure modes
-- `tofu/`, `ansible/site.yml`, and `ansible/roles/*` are unchanged
+- `config.inventory.*` diagnostics for the failure modes
+- `ansible/site.yml` and `ansible/roles/*` unchanged
+
+Slice 4b (done):
+
+- `tofu/outputs.tf` emits `vm_ips` as a **name-keyed map**
+  (`{domain -> ip}`) instead of a positional tuple
+- new `var.vm_names` in `tofu/variables.tf` lets the operator name
+  libvirt domains after their lab VMs (`lab.spec.vms[*].name`); default
+  falls back to `pg-node-N` for backward compatibility
+- renderer matches by name; mismatches surface as
+  `config.inventory.vm_ip_not_found` with a suggestion that lists the
+  known tofu domain names
+- legacy positional `vm_ips` payloads from pre-4b state are explicitly
+  rejected so silent index drift can't return
 
 Known limitations to close in follow-up slices:
 
-- VMs are paired with `vm_ips` by **declaration order** (`lab.spec.vms[i]
-  <-> tofu vm_ips[i]`). Reordering VMs in the lab YAML silently re-routes
-  Ansible roles. Mitigation today: header warning in the generated file
-  plus `config.inventory.count_mismatch` diagnostic. Permanent fix: enrich
-  `tofu/outputs.tf` to expose a name-keyed map, then update the renderer
-  to match on names.
+- The operator still has to keep `var.vm_names` in `tofu/terraform.tfvars`
+  aligned with `lab.spec.vms[*].name` by hand. Next slice: auto-generate
+  `terraform.tfvars` from the resolved lab so the two stay in sync.
 - Only a single `[playground]` group is emitted today. `[docker_host]` /
   `[router]` groups can be added when a playbook needs them.
 - CLI imports the concrete `playground.backend.local_libvirt` adapter

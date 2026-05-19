@@ -1,9 +1,15 @@
 output "vm_ips" {
-  description = "The dynamically assigned IP addresses of the guest VMs"
-  value       = libvirt_domain.playground_node[*].network_interface[0].addresses[0]
+  description = "Map of VM domain name -> first NIC IP address. Keys match var.vm_names when set, or pg-node-N otherwise. Consumed by `playground inventory render` to pair lab VMs with tofu IPs by name."
+  value = {
+    for idx, name in local.effective_vm_names :
+    name => libvirt_domain.playground_node[idx].network_interface[0].addresses[0]
+  }
 }
 
 output "ssh_commands" {
-  description = "Commands to SSH into the VMs"
-  value       = [for ip in libvirt_domain.playground_node[*].network_interface[0].addresses[0] : "ssh ubuntu@${ip}"]
+  description = "Map of VM domain name -> ssh command to reach it."
+  value = {
+    for idx, name in local.effective_vm_names :
+    name => "ssh ubuntu@${libvirt_domain.playground_node[idx].network_interface[0].addresses[0]}"
+  }
 }

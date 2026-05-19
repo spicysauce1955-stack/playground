@@ -27,65 +27,117 @@ def resolved_generic_infra():
     return resolve_lab(loaded, "generic-infra")
 
 
+@pytest.fixture
+def lab_ips() -> dict[str, str]:
+    """IPs keyed by the committed lab's VM names."""
+    return {
+        "node1": "10.0.10.42",
+        "docker1": "10.0.10.43",
+        "router1": "10.0.10.44",
+    }
+
+
 # ---------------------------------------------------------------------------
 # render_inventory — pure function
 # ---------------------------------------------------------------------------
 
 
-def test_render_inventory_emits_one_host_per_vm(resolved_generic_infra) -> None:
-    ips = ["10.0.10.2", "10.0.10.3", "10.0.10.4"]
-
-    body, diagnostics = render_inventory(resolved_generic_infra, ips)
+def test_render_inventory_emits_one_host_per_vm(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    body, diagnostics = render_inventory(resolved_generic_infra, lab_ips)
 
     assert diagnostics == []
     assert "[playground]" in body
-    assert "node1 ansible_host=10.0.10.2 ansible_user=ubuntu pg_role=generic-node" in body
-    assert "docker1 ansible_host=10.0.10.3 ansible_user=ubuntu pg_role=docker-host" in body
-    assert "router1 ansible_host=10.0.10.4 ansible_user=ubuntu pg_role=router" in body
+    assert "node1 ansible_host=10.0.10.42 ansible_user=ubuntu pg_role=generic-node" in body
+    assert "docker1 ansible_host=10.0.10.43 ansible_user=ubuntu pg_role=docker-host" in body
+    assert "router1 ansible_host=10.0.10.44 ansible_user=ubuntu pg_role=router" in body
     assert "pg_lab=generic-infra" in body
 
 
-def test_render_inventory_preserves_networks_and_tags(resolved_generic_infra) -> None:
-    ips = ["10.0.10.2", "10.0.10.3", "10.0.10.4"]
+def test_render_inventory_preserves_networks(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    body, _ = render_inventory(resolved_generic_infra, lab_ips)
 
-    body, _ = render_inventory(resolved_generic_infra, ips)
-
-    # docker1 attaches to two networks; router1 to three
-    assert "pg_networks=edge,lab-private" in body
-    assert "pg_networks=edge,lab-private,routed-a" in body
+    assert "pg_networks=edge,lab-private" in body  # docker1
+    assert "pg_networks=edge,lab-private,routed-a" in body  # router1
 
 
 def test_render_inventory_lab_metadata_and_source_pointer(
-    resolved_generic_infra,
+    resolved_generic_infra, lab_ips: dict[str, str]
 ) -> None:
-    body, _ = render_inventory(resolved_generic_infra, ["10.0.10.2"] * 3)
+    body, _ = render_inventory(resolved_generic_infra, lab_ips)
 
     assert "# Lab: generic-infra" in body
     assert "# Source: config/labs/generic-infra.yaml" in body
+    # New pairing comment reflects name-keyed matching, not order-based.
+    assert "lab VM name -> tofu domain name" in body
 
 
-def test_render_inventory_flags_count_mismatch(resolved_generic_infra) -> None:
-    # Lab has 3 VMs; supply only 1 IP
-    body, diagnostics = render_inventory(resolved_generic_infra, ["10.0.10.2"])
+def test_render_inventory_flags_missing_vm(resolved_generic_infra) -> None:
+    # Only docker1 is in the map; node1 and router1 are missing.
+    body, diagnostics = render_inventory(resolved_generic_infra, {"docker1": "10.0.10.43"})
 
-    assert len(diagnostics) == 1
-    assert diagnostics[0].id == "config.inventory.count_mismatch"
-    assert diagnostics[0].severity == "error"
-    assert "3 VMs" in diagnostics[0].message
-    assert "1 IPs" in diagnostics[0].message
-    # Best-effort body still emitted — the prefix is rendered
-    assert "node1 ansible_host=10.0.10.2" in body
-    assert "docker1" not in body  # nothing to pair with
+    missing = [d for d in diagnostics if d.id == "config.inventory.vm_ip_not_found"]
+    assert len(missing) == 2
+    assert all(d.severity == "error" for d in missing)
+    assert {d.key_path for d in missing} == {"spec.vms[0].name", "spec.vms[2].name"}
+    # Best-effort body still includes the VM that did match.
+    assert "docker1 ansible_host=10.0.10.43" in body
+    assert "node1 ansible_host" not in body
+    assert "router1 ansible_host" not in body
 
 
-def test_render_inventory_handles_empty_vm_list(resolved_generic_infra) -> None:
-    # Lab with VMs vs no IPs — count_mismatch fires, body still well-formed
-    body, diagnostics = render_inventory(resolved_generic_infra, [])
+def test_render_inventory_suggestion_lists_known_names(
+    resolved_generic_infra,
+) -> None:
+    # When a VM is missing, the diagnostic suggestion should list what *is*
+    # available, so the operator can spot a typo without leaving the CLI.
+    _, diagnostics = render_inventory(
+        resolved_generic_infra,
+        {"docker-host-1": "10.0.10.99"},
+    )
 
-    assert any(d.id == "config.inventory.count_mismatch" for d in diagnostics)
+    for d in diagnostics:
+        assert "docker-host-1" in (d.suggestion or "")
+
+
+def test_render_inventory_handles_empty_map(resolved_generic_infra) -> None:
+    body, diagnostics = render_inventory(resolved_generic_infra, {})
+
+    assert len(diagnostics) == 3  # one per lab VM
+    assert all(d.id == "config.inventory.vm_ip_not_found" for d in diagnostics)
+    # Body still well-formed; no host lines between [playground] and [playground:vars]
+    section = body.split("[playground]", 1)[1].split("[playground:vars]", 1)[0]
+    assert section.strip() == ""
+    assert "pg_lab=generic-infra" in body
+
+
+def test_render_inventory_zero_vms_zero_ips(resolved_generic_infra) -> None:
+    empty = resolved_generic_infra.model_copy(update={"vms": []})
+
+    body, diagnostics = render_inventory(empty, {})
+
+    assert diagnostics == []
     assert "[playground]" in body
     assert "[playground:vars]" in body
-    assert "pg_lab=generic-infra" in body
+    section = body.split("[playground]", 1)[1].split("[playground:vars]", 1)[0]
+    assert section.strip() == ""
+
+
+def test_render_inventory_ignores_extra_ips_silently(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    # Tofu may know about VMs the lab doesn't reference (e.g. a former lab's
+    # leftover state). The renderer should pair what the lab declares and
+    # ignore the rest without complaining.
+    extra = {**lab_ips, "ghost-vm": "10.0.10.99"}
+
+    body, diagnostics = render_inventory(resolved_generic_infra, extra)
+
+    assert diagnostics == []
+    assert "ghost-vm" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +157,17 @@ def _write_fake_tofu(tmp_path: Path, body: str, exit_code: int = 0) -> Path:
     return bin_dir
 
 
-def test_fetch_vm_ips_parses_real_shape(tmp_path, monkeypatch) -> None:
+def test_fetch_vm_ips_parses_name_keyed_map(tmp_path, monkeypatch) -> None:
     payload = json.dumps(
         {
             "vm_ips": {
                 "sensitive": False,
-                "type": ["tuple", ["string", "string", "string"]],
-                "value": ["10.0.10.2", "10.0.10.3", "10.0.10.4"],
+                "type": ["map", "string"],
+                "value": {
+                    "node1": "10.0.10.42",
+                    "docker1": "10.0.10.43",
+                    "router1": "10.0.10.44",
+                },
             }
         }
     )
@@ -121,16 +177,41 @@ def test_fetch_vm_ips_parses_real_shape(tmp_path, monkeypatch) -> None:
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
     assert diagnostics == []
-    assert ips == ["10.0.10.2", "10.0.10.3", "10.0.10.4"]
+    assert ips == {
+        "node1": "10.0.10.42",
+        "docker1": "10.0.10.43",
+        "router1": "10.0.10.44",
+    }
+
+
+def test_fetch_vm_ips_rejects_legacy_list_shape(tmp_path, monkeypatch) -> None:
+    # Pre-§4b tofu state emitted vm_ips as a tuple. After upgrading
+    # tofu/outputs.tf the operator must re-apply; until they do, the
+    # renderer must refuse rather than silently produce wrong output.
+    payload = json.dumps(
+        {
+            "vm_ips": {
+                "value": ["10.0.10.42", "10.0.10.43"],
+            }
+        }
+    )
+    bin_dir = _write_fake_tofu(tmp_path, payload)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    ips, diagnostics = fetch_vm_ips(tmp_path)
+
+    assert ips == {}
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "config.inventory.tofu_parse_failed"
+    assert "map of string to string" in diagnostics[0].message
 
 
 def test_fetch_vm_ips_reports_missing_binary(tmp_path, monkeypatch) -> None:
-    # Empty PATH so `tofu` is not resolvable
     monkeypatch.setenv("PATH", "")
 
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
-    assert ips == []
+    assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_binary_missing"
 
@@ -141,7 +222,7 @@ def test_fetch_vm_ips_reports_no_state(tmp_path, monkeypatch) -> None:
 
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
-    assert ips == []
+    assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_no_state"
 
@@ -152,7 +233,7 @@ def test_fetch_vm_ips_reports_nonzero_exit(tmp_path, monkeypatch) -> None:
 
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
-    assert ips == []
+    assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_command_failed"
     assert "exited 2" in diagnostics[0].message
@@ -164,7 +245,19 @@ def test_fetch_vm_ips_reports_parse_failure(tmp_path, monkeypatch) -> None:
 
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
-    assert ips == []
+    assert ips == {}
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "config.inventory.tofu_parse_failed"
+
+
+def test_fetch_vm_ips_reports_wrong_value_shape(tmp_path, monkeypatch) -> None:
+    payload = json.dumps({"vm_ips": {"value": "not-a-map"}})
+    bin_dir = _write_fake_tofu(tmp_path, payload)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    ips, diagnostics = fetch_vm_ips(tmp_path)
+
+    assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_parse_failed"
 
@@ -182,13 +275,12 @@ def test_fetch_vm_ips_reports_timeout(tmp_path, monkeypatch) -> None:
 
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
-    assert ips == []
+    assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_command_failed"
 
 
 def test_fetch_vm_ips_reports_subprocess_filenotfound(tmp_path, monkeypatch) -> None:
-    # shutil.which finds the binary but subprocess.run raises (race / symlink).
     bin_dir = _write_fake_tofu(tmp_path, "{}")
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
@@ -199,34 +291,6 @@ def test_fetch_vm_ips_reports_subprocess_filenotfound(tmp_path, monkeypatch) -> 
 
     ips, diagnostics = fetch_vm_ips(tmp_path)
 
-    assert ips == []
+    assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_command_failed"
-
-
-def test_render_inventory_zero_vms_zero_ips(resolved_generic_infra) -> None:
-    # Synthesize a lab with no VMs by deep-copying with vms=[]; render must
-    # produce a well-formed body with no count_mismatch.
-    empty = resolved_generic_infra.model_copy(update={"vms": []})
-
-    body, diagnostics = render_inventory(empty, [])
-
-    assert diagnostics == []
-    assert "[playground]" in body
-    assert "[playground:vars]" in body
-    assert "pg_lab=generic-infra" in body
-    # No host lines between [playground] and [playground:vars]
-    section = body.split("[playground]", 1)[1].split("[playground:vars]", 1)[0]
-    assert section.strip() == ""
-
-
-def test_fetch_vm_ips_reports_wrong_value_shape(tmp_path, monkeypatch) -> None:
-    payload = json.dumps({"vm_ips": {"value": "not-a-list"}})
-    bin_dir = _write_fake_tofu(tmp_path, payload)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-    ips, diagnostics = fetch_vm_ips(tmp_path)
-
-    assert ips == []
-    assert len(diagnostics) == 1
-    assert diagnostics[0].id == "config.inventory.tofu_parse_failed"

@@ -1,7 +1,13 @@
 variable "vm_count" {
-  description = "Number of playground VMs to provision"
+  description = "Number of playground VMs to provision. Ignored when var.vm_names is set."
   type        = number
   default     = 1
+}
+
+variable "vm_names" {
+  description = "Optional list of VM names. When set, overrides var.vm_count and gives each libvirt_domain a name matching the corresponding entry in lab.spec.vms (so `playground inventory render` can pair lab VMs with tofu IPs by name instead of by index). When null, falls back to legacy `pg-node-N` naming."
+  type        = list(string)
+  default     = null
 }
 
 variable "vm_memory" {

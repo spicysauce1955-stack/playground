@@ -346,7 +346,7 @@ categories:
 | `config.role.*` | validator | `inheritance_cycle`, `unknown_extends` |
 | `config.budget.*` | validator | `exceeded` |
 | `config.artifact.*` | validator | `offline_missing` |
-| `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `count_mismatch` |
+| `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
 | `config.discovery.*` | CLI | `not_directory` |
 | `config.lab.*` | CLI | `unknown`, `resolve_failed` |
 
@@ -373,15 +373,17 @@ flowchart LR
 
     s1 --> s2 --> s3 --> s4a --> s4b
     s4a --> s4c
+    s4b --> s4d[§4d Auto-generate<br/>terraform.tfvars]
     s4b --> s5
     s4c --> s5
+    s4d --> s5
     s5 --> s6 --> s7 --> s8 --> s9
 
     classDef done fill:#cfc,stroke:#383
     classDef next fill:#ffd,stroke:#cc0
     classDef queued fill:#eee,stroke:#888
-    class s1,s2,s3,s4a done
-    class s4b,s4c next
+    class s1,s2,s3,s4a,s4b done
+    class s4c,s4d next
     class s5,s6,s7,s8,s9 queued
 ```
 

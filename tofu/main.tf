@@ -11,6 +11,18 @@ provider "libvirt" {
   uri = "qemu:///system"
 }
 
+# Effective VM names. When var.vm_names is set, use it verbatim — the
+# operator is opting into name-keyed pairing with a lab. Otherwise fall
+# back to the legacy `pg-node-${index+1}` scheme driven by var.vm_count
+# so existing setups keep working.
+locals {
+  effective_vm_names = (
+    var.vm_names != null
+    ? var.vm_names
+    : [for i in range(var.vm_count) : "pg-node-${i + 1}"]
+  )
+}
+
 # Define the isolated playground network
 resource "libvirt_network" "playground_net" {
   name      = "playground_net"
@@ -33,8 +45,8 @@ resource "libvirt_volume" "ubuntu_image" {
 
 # Create a volume per VM based on the base image
 resource "libvirt_volume" "vm_disk" {
-  count          = var.vm_count
-  name           = "pg-node-${count.index + 1}.qcow2"
+  count          = length(local.effective_vm_names)
+  name           = "${local.effective_vm_names[count.index]}.qcow2"
   pool           = "default"
   base_volume_id = libvirt_volume.ubuntu_image.id
   format         = "qcow2"
@@ -43,8 +55,8 @@ resource "libvirt_volume" "vm_disk" {
 
 # Generate Cloud-Init ISO for user data
 resource "libvirt_cloudinit_disk" "commoninit" {
-  count = var.vm_count
-  name  = "commoninit-${count.index + 1}.iso"
+  count = length(local.effective_vm_names)
+  name  = "commoninit-${local.effective_vm_names[count.index]}.iso"
   pool  = "default"
   user_data = templatefile("${path.module}/cloud_init.cfg", {
     ssh_public_key = file(var.ssh_public_key_path)
@@ -53,8 +65,8 @@ resource "libvirt_cloudinit_disk" "commoninit" {
 
 # Define the Guest VMs
 resource "libvirt_domain" "playground_node" {
-  count  = var.vm_count
-  name   = "pg-node-${count.index + 1}"
+  count  = length(local.effective_vm_names)
+  name   = local.effective_vm_names[count.index]
   memory = var.vm_memory
   vcpu   = var.vm_vcpu
 
