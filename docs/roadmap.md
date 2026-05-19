@@ -174,3 +174,9 @@ captured here so they aren't lost.
   and the schema has no per-lab `dns_domain`. Worth landing
   alongside the §6 apply slice so DNS shows up correctly the first
   time real VMs come up.
+- Runtime overrides + promote — Story 2.3 / §5.2 require temporary
+  CLI/TUI overrides on top of YAML, with an explicit "promote back
+  to YAML" path. Schema slot `ResolvedLab.runtime_overrides:
+  list[Any]` is reserved and unused; needs a real type, a state
+  store under `.playground/state/overrides/`, and CLI commands to
+  set / clear / promote.
