@@ -151,6 +151,7 @@ def _resolve_vm(
     defaults: Defaults,
 ) -> ResolvedVm:
     flattened_role = _flatten_role(vm.role, loaded)
+    role_chain = _role_ancestry(vm.role, loaded)
 
     # VM may override resources; otherwise inherit from role, then defaults.
     if vm.resources is not None:
@@ -176,6 +177,7 @@ def _resolve_vm(
     return ResolvedVm(
         name=vm.name,
         role=vm.role,
+        roles=role_chain,
         image=image,
         vcpu=vcpu,
         memory_mb=memory_mb,
@@ -188,6 +190,19 @@ def _resolve_vm(
         tags=list(vm.tags),
         provider_overrides=dict(vm.provider_overrides),
     )
+
+
+def _role_ancestry(role_name: str, loaded: LoadedConfig) -> list[str]:
+    """Return ``[role_name, parent, grandparent, ...]`` walking ``spec.extends``.
+
+    Pre-validation has already rejected cycles and unknown parents.
+    """
+    chain: list[str] = []
+    current: str | None = role_name
+    while current is not None:
+        chain.append(current)
+        current = loaded.roles[current].spec.extends
+    return chain
 
 
 def _flatten_role(role_name: str, loaded: LoadedConfig) -> VmRoleSpec:

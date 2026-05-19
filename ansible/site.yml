@@ -5,3 +5,12 @@
   roles:
     - docker
     - redroid
+
+- name: Deploy container workloads
+  hosts: playground
+  become: yes
+  gather_facts: no  # facts already gathered by the first play
+  roles:
+    # The role's first task ends the host when pg_workloads is empty
+    # (the default-fact is `[]`). No play-level conditional needed.
+    - workload_container

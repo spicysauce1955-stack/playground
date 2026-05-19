@@ -32,6 +32,11 @@ class ResolvedNetwork(StrictModel):
 class ResolvedVm(StrictModel):
     name: str
     role: str
+    """Leaf role name (matches ``LabVm.role``)."""
+    roles: list[str] = Field(default_factory=list)
+    """Full role ancestry, leaf -> root (e.g. ``[docker-host, generic-node]``).
+    Used by scheduling/placement so a workload targeting an ancestor role
+    matches the same set of VMs the validator accepts."""
     image: str
     vcpu: int = Field(ge=1)
     memory_mb: int = Field(ge=128)

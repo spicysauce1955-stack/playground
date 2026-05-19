@@ -1,0 +1,31 @@
+---
+# Deploy `type: container` workloads scheduled on this host by the
+# playground planner. The list is JSON-encoded into the `pg_workloads`
+# host variable by `playground inventory render`.
+#
+# Idempotent: `community.docker.docker_container` skips a no-op when
+# the desired state already matches. Re-running `playground apply`
+# converges without churn.
+
+- name: Parse pg_workloads JSON payload
+  ansible.builtin.set_fact:
+    pg_workloads_parsed: "{{ pg_workloads | from_json }}"
+  when: pg_workloads is defined
+
+- name: Skip when no workloads scheduled
+  ansible.builtin.meta: end_host
+  when: (pg_workloads_parsed | default([])) | length == 0
+
+- name: Deploy container workloads
+  community.docker.docker_container:
+    name: "{{ item.name }}"
+    image: "{{ item.source }}"
+    state: started
+    restart_policy: unless-stopped
+    published_ports: "{{ item.ports | default([]) }}"
+    volumes: "{{ item.volumes | default([]) }}"
+    env: "{{ item.environment | default({}) }}"
+  loop: "{{ pg_workloads_parsed }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.type == 'container'

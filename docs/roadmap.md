@@ -238,6 +238,54 @@ Carried forward to future work:
 - Additional event consumers (TUI views, status caches) when those
   arrive in §9.
 
+## 8. Docker Workloads
+
+Status: in progress (container done; compose + swarm queued).
+
+Slice 8a (done):
+
+- New planner module `playground.planner.scheduling`: pure-function
+  `schedule_workloads(resolved) -> ({vm: [workloads]}, diagnostics)`.
+  Resolves `target_vm` / `target_role` / `target_tag` / `auto`, with
+  role matching that walks the full `spec.extends` ancestry so the
+  scheduler agrees with the validator.
+- `ResolvedVm.roles: list[str]` carries the full role ancestry
+  (leaf → root). The scheduler matches against this; the validator
+  was already doing the same walk via `_role_ancestors`.
+- Inventory renderer adds a `pg_workloads='<json>'` host var on each
+  VM that has scheduled workloads. Embedded single quotes are
+  shell-escaped (`'\''`).
+- `playground apply` runs `schedule_workloads` as a pre-flight before
+  `start_run` / `tofu apply`, so a no-target workload fails fast
+  without provisioning anything.
+- New Ansible role `workload_container` reads the JSON payload and
+  deploys items with `type: container` via
+  `community.docker.docker_container`. Idempotent. Compose / Swarm
+  items are skipped by the `when: item.type == 'container'` guard.
+- New diagnostic ID `config.workload.no_target`.
+
+Slice 8b (queued): Docker Compose
+
+- New ansible role `workload_compose`. Stage the lab's Compose file
+  on the target VM (file-on-disk under `.playground/state/<lab>/
+  workloads/`), run `docker compose up -d`.
+- The inventory's inline `pg_workloads` JSON is fine for Compose only
+  if compose files stay short; the §8b slice is the natural moment
+  to migrate to file-on-disk staging.
+
+Slice 8c (queued): Docker Swarm
+
+- Manager/worker assignment per requirements §5.7. Scheduler shape
+  will need to grow from `dict[str, list[ResolvedWorkload]]` to
+  identify the manager role and replicate services across workers.
+
+Carried forward:
+
+- Workload `networks` field (lab-level network names) doesn't reach
+  the docker_container role yet — mapping lab networks to docker
+  networks is a follow-up. `workload_to_ansible_payload` deliberately
+  omits the field with a comment.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

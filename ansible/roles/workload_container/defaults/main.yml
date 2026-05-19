@@ -1,0 +1,6 @@
+---
+# Default values for the workload_container role.
+# pg_workloads is expected to be a JSON-encoded list of workload dicts
+# injected by `playground inventory render`. When empty, the role is a
+# no-op (the play conditional below covers that).
+pg_workloads: '[]'

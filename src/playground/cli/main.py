@@ -25,7 +25,7 @@ from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
-from playground.planner import Plan, PlanAction, render_plan
+from playground.planner import Plan, PlanAction, render_plan, schedule_workloads
 from playground.runs import OperationRun, StepResult, finish_run, start_run
 from playground.validation import validate as validate_loaded_config
 
@@ -408,6 +408,12 @@ def apply_command(
     _print_warnings(diagnostics)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+
+    # Pre-flight: scheduling is a pure-config decision that must succeed
+    # before tofu apply provisions anything. Failing here means no VMs
+    # are touched and no run record is created.
+    _, schedule_diagnostics = schedule_workloads(resolved)
+    _exit_on_errors(schedule_diagnostics, output, json_errors=False)
 
     runs_dir = state_dir / "runs"
     run, run_dir = start_run(runs_dir, "apply", lab)

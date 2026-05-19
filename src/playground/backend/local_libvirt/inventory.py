@@ -30,6 +30,7 @@ from pathlib import Path
 
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
+from playground.planner import schedule_workloads, workload_to_ansible_payload
 
 # Public diagnostic id constants. Importing modules (e.g.
 # backend/local_libvirt/status.py) special-case `TOFU_NO_STATE` as
@@ -176,6 +177,9 @@ def render_inventory(
     diagnostics: list[Diagnostic] = []
     source = SourceLocation(path=f"config/labs/{resolved.lab_name}.yaml")
 
+    schedule, schedule_diagnostics = schedule_workloads(resolved)
+    diagnostics.extend(schedule_diagnostics)
+
     placed_vms: list[tuple[str, str, str]] = []  # (name, role, host-line)
 
     for idx, vm in enumerate(resolved.vms):
@@ -210,6 +214,21 @@ def render_inventory(
             host_vars.append(f"pg_networks={','.join(vm.networks)}")
         if vm.tags:
             host_vars.append(f"pg_tags={','.join(vm.tags)}")
+        workloads = schedule.get(vm.name, [])
+        if workloads:
+            # JSON-encoded list of workload dicts. Ansible reads it via
+            # `pg_workloads | from_json` in the workload_container role.
+            # We shell-escape embedded single quotes (rare in practice
+            # but possible in env values). Inline JSON in a host var is
+            # acceptable for §8a's container-only scope; §8b/§8c will
+            # migrate to file-on-disk staging when compose files need
+            # to ride along.
+            payload = json.dumps(
+                [workload_to_ansible_payload(wl) for wl in workloads],
+                separators=(",", ":"),
+            )
+            escaped = payload.replace("'", "'\\''")
+            host_vars.append(f"pg_workloads='{escaped}'")
         host_line = f"{vm.name} {' '.join(host_vars)}"
         placed_vms.append((vm.name, vm.role, host_line))
 

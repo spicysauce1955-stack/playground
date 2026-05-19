@@ -16,5 +16,16 @@ from playground.planner.plan import (
     PlanBudget,
     render_plan,
 )
+from playground.planner.scheduling import (
+    schedule_workloads,
+    workload_to_ansible_payload,
+)
 
-__all__ = ["Plan", "PlanAction", "PlanBudget", "render_plan"]
+__all__ = [
+    "Plan",
+    "PlanAction",
+    "PlanBudget",
+    "render_plan",
+    "schedule_workloads",
+    "workload_to_ansible_payload",
+]

@@ -55,6 +55,46 @@ def test_render_inventory_emits_one_host_per_vm(
     assert "pg_lab=generic-infra" in body
 
 
+def test_render_inventory_emits_pg_workloads_for_scheduled_host(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    body, diagnostics = render_inventory(resolved_generic_infra, lab_ips)
+
+    assert diagnostics == []
+    # demo-compose is scheduled on docker1 (target_role=docker-host).
+    # docker1's host line should carry a pg_workloads JSON payload.
+    docker_line = next(
+        line for line in body.splitlines() if line.startswith("docker1 ")
+    )
+    assert "pg_workloads=" in docker_line
+    assert "demo-compose" in docker_line
+    # node1 has no scheduled workloads.
+    node_line = next(line for line in body.splitlines() if line.startswith("node1 "))
+    assert "pg_workloads=" not in node_line
+
+
+def test_render_inventory_escapes_single_quotes_in_workload_payload(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    # An env value with an embedded single quote would otherwise break
+    # the host_vars line — verify the renderer shell-escapes it.
+    original = resolved_generic_infra.workloads[0]
+    quoted = original.model_copy(
+        update={"environment": {"MSG": "it's fine"}}
+    )
+    lab = resolved_generic_infra.model_copy(update={"workloads": [quoted]})
+
+    body, diagnostics = render_inventory(lab, lab_ips)
+
+    assert diagnostics == []
+    docker_line = next(
+        line for line in body.splitlines() if line.startswith("docker1 ")
+    )
+    # `'\''` is the bash idiom for "close, escape, reopen" — what the
+    # renderer must emit to survive the inventory-INI parser.
+    assert "it'\\''s fine" in docker_line
+
+
 def test_render_inventory_emits_per_role_groups(
     resolved_generic_infra, lab_ips: dict[str, str]
 ) -> None:
@@ -166,7 +206,7 @@ def test_render_inventory_handles_empty_map(resolved_generic_infra) -> None:
 
 
 def test_render_inventory_zero_vms_zero_ips(resolved_generic_infra) -> None:
-    empty = resolved_generic_infra.model_copy(update={"vms": []})
+    empty = resolved_generic_infra.model_copy(update={"vms": [], "workloads": []})
 
     body, diagnostics = render_inventory(empty, {})
 
