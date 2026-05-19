@@ -487,6 +487,16 @@ per-lab workaround.
   and a `getent hosts <vm>.<dns_domain>` lookup as a closing
   cross-check.
 
+Slice 11b follow-up (done): added `enabled = true` to the
+dynamic `dns` block on `libvirt_network.lab`. Without it the
+dmacvicar/libvirt provider's `getDNSEnableFromResource` returns
+`"no"`, libvirtxml emits `<dns enable='no'>`, and libvirt
+disables dnsmasq DNS for the network entirely — silently
+ignoring the `<host>` records the block populates. Cloud-init's
+self-registered hostname path was still working, which masked
+the defect outside the live `getent hosts <vm>.<lab>.lab`
+assertion.
+
 Carried forward to a follow-up:
 
 - Pre-existing minor validator quirk: the `unknown_image` check

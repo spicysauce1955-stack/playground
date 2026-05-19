@@ -60,6 +60,10 @@ resource "libvirt_network" "lab" {
   dynamic "dns" {
     for_each = length(lookup(var.vm_dns_hosts, each.key, [])) > 0 ? [1] : []
     content {
+      # Without this, the provider's getDNSEnableFromResource emits
+      # <dns enable='no'> and libvirt disables dnsmasq DNS for the
+      # network entirely — silently ignoring the host records below.
+      enabled = true
       dynamic "hosts" {
         for_each = var.vm_dns_hosts[each.key]
         content {
