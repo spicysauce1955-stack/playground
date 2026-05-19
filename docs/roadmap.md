@@ -76,12 +76,29 @@ error.
 
 ## 4. OpenTofu / Ansible Bridge
 
-Status: next.
+Status: in progress (first slice done; follow-ups queued).
 
 Goal: reduce manual handoff without changing runtime behavior.
 
-Candidate first slice:
+First slice (done):
 
-- generate `ansible/inventory.ini` from `tofu output -json`
-- keep the current manual flow documented as fallback
-- do not change Redroid/Docker role behavior in the same slice
+- `playground inventory render <lab>` writes
+  `.playground/state/inventory/<lab>.ini` from a `ResolvedLab` plus
+  `tofu output -json`
+- new backend adapter layer under `src/playground/backend/local_libvirt/`
+- five `config.inventory.*` diagnostics for the failure modes
+- `tofu/`, `ansible/site.yml`, and `ansible/roles/*` are unchanged
+
+Known limitations to close in follow-up slices:
+
+- VMs are paired with `vm_ips` by **declaration order** (`lab.spec.vms[i]
+  <-> tofu vm_ips[i]`). Reordering VMs in the lab YAML silently re-routes
+  Ansible roles. Mitigation today: header warning in the generated file
+  plus `config.inventory.count_mismatch` diagnostic. Permanent fix: enrich
+  `tofu/outputs.tf` to expose a name-keyed map, then update the renderer
+  to match on names.
+- Only a single `[playground]` group is emitted today. `[docker_host]` /
+  `[router]` groups can be added when a playbook needs them.
+- CLI imports the concrete `playground.backend.local_libvirt` adapter
+  directly. Introduce a small adapter protocol / registry only when a
+  second backend appears.

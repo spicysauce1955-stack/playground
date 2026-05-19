@@ -9,6 +9,7 @@ from typing import Annotated, NoReturn
 
 import typer
 
+from playground.backend.local_libvirt import fetch_vm_ips, render_inventory
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -22,7 +23,12 @@ class OutputFormat(StrEnum):
 
 app = typer.Typer(no_args_is_help=True, help="Inspect playground lab configuration.")
 lab_app = typer.Typer(no_args_is_help=True, help="Inspect configured labs.")
+inventory_app = typer.Typer(
+    no_args_is_help=True,
+    help="Render Ansible inventory from resolved labs and tofu state.",
+)
 app.add_typer(lab_app, name="lab")
+app.add_typer(inventory_app, name="inventory")
 
 
 @app.command("validate")
@@ -175,6 +181,97 @@ def show_lab(
     typer.echo(f"  vms: {len(resolved.vms)}")
     typer.echo(f"  workloads: {len(resolved.workloads)}")
     typer.echo(f"  commands: {len(resolved.commands)}")
+
+
+@inventory_app.command("render")
+def render_inventory_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to render inventory for.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option(
+            "--tofu-dir",
+            help="OpenTofu working directory to read `tofu output -json` from.",
+        ),
+    ] = Path("tofu"),
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help=(
+                "Write inventory to this path. Defaults to "
+                "`.playground/state/inventory/<lab>.ini`."
+            ),
+        ),
+    ] = None,
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Render an Ansible inventory for ``lab`` from tofu state."""
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    if lab not in loaded.labs:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.lab.unknown",
+                severity="error",
+                message=f"unknown lab {lab!r}",
+                source=SourceLocation(path=str(config_dir / "labs")),
+                suggestion="run `playground lab list` to see configured labs",
+            ),
+            output,
+            json_errors=False,
+        )
+
+    try:
+        resolved = resolve_lab(loaded, lab)
+    except (KeyError, ValueError) as exc:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.lab.resolve_failed",
+                severity="error",
+                message=str(exc),
+                source=SourceLocation(path=str(config_dir / "labs" / f"{lab}.yaml")),
+            ),
+            output,
+            json_errors=False,
+        )
+
+    vm_ips, fetch_diagnostics = fetch_vm_ips(tofu_dir)
+    _exit_on_errors(fetch_diagnostics, output, json_errors=False)
+
+    body, render_diagnostics = render_inventory(resolved, vm_ips)
+    _exit_on_errors(render_diagnostics, output, json_errors=False)
+
+    destination = out or (
+        Path(".playground") / "state" / "inventory" / f"{lab}.ini"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(body)
+
+    if output is OutputFormat.json:
+        _print_json(
+            {
+                "ok": True,
+                "lab": lab,
+                "path": str(destination),
+                "vm_count": len(resolved.vms),
+            }
+        )
+        return
+
+    typer.echo(f"wrote {destination}")
+    typer.echo(f"  lab: {lab}")
+    typer.echo(f"  vms: {len(resolved.vms)}")
 
 
 def _load_config_or_exit(

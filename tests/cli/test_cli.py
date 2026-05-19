@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from playground.cli.main import app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
+
+
+def _write_fake_tofu(tmp_path: Path, payload: str) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tofu = bin_dir / "tofu"
+    tofu.write_text(f"#!/usr/bin/env bash\ncat <<'EOF'\n{payload}\nEOF\n")
+    tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
 
 
 def test_validate_committed_config_succeeds() -> None:
@@ -83,3 +95,99 @@ def test_lab_show_unknown_lab_fails() -> None:
     assert result.exit_code == 1
     assert result.stdout == ""
     assert "config.lab.unknown" in result.stderr
+
+
+def test_inventory_render_unknown_lab(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "inventory",
+            "render",
+            "missing-lab",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tmp_path),
+            "--out",
+            str(tmp_path / "out.ini"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.lab.unknown" in result.stderr
+    assert not (tmp_path / "out.ini").exists()
+
+
+def test_inventory_render_reports_missing_tofu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "inventory",
+            "render",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tmp_path),
+            "--out",
+            str(tmp_path / "out.ini"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.inventory.tofu_binary_missing" in result.stderr
+    assert not (tmp_path / "out.ini").exists()
+
+
+def test_inventory_render_writes_inventory_and_json_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json.dumps(
+        {
+            "vm_ips": {
+                "sensitive": False,
+                "type": ["tuple", ["string", "string", "string"]],
+                "value": ["10.0.10.42", "10.0.10.43", "10.0.10.44"],
+            }
+        }
+    )
+    bin_dir = _write_fake_tofu(tmp_path, payload)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    out_path = tmp_path / "out.ini"
+    result = CliRunner().invoke(
+        app,
+        [
+            "inventory",
+            "render",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tmp_path),
+            "--out",
+            str(out_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "ok": True,
+        "lab": "generic-infra",
+        "path": str(out_path),
+        "vm_count": 3,
+    }
+    body = out_path.read_text()
+    assert "[playground]" in body
+    assert "node1 ansible_host=10.0.10.42" in body
+    assert "router1 ansible_host=10.0.10.44" in body
+    assert "pg_lab=generic-infra" in body
