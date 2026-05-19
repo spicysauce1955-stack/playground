@@ -318,11 +318,17 @@ def test_libvirt_apparmor_security_driver_none_silences(
     assert doctor.check_libvirt_apparmor() == []
 
 
-def test_libvirt_apparmor_machinery_present_silences(
+def test_libvirt_apparmor_silent_when_dir_has_only_stock_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """An empty (or stock-only) libvirt dir means no VMs are defined
+    yet; nothing to verify, so no diagnostic."""
     apparmor_libvirt = tmp_path / "apparmor.d" / "libvirt"
     apparmor_libvirt.mkdir(parents=True)
+    # Stock distro ships these; they aren't per-VM profiles and don't
+    # need .files companions.
+    (apparmor_libvirt / "libvirt-qemu").write_text("# abstraction\n")
+    (apparmor_libvirt / "TEMPLATE.qemu").write_text("# template\n")
     profiles = tmp_path / "profiles"
     profiles.write_text("nothing\n")
     _patch_apparmor_constants(
@@ -331,13 +337,84 @@ def test_libvirt_apparmor_machinery_present_silences(
         qemu_conf=tmp_path / "missing.conf",
         libvirt_dir=apparmor_libvirt,
     )
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"apparmor_parser"}))
     assert doctor.check_libvirt_apparmor() == []
 
 
-def test_libvirt_apparmor_warns_when_neither_path_satisfied(
+def test_libvirt_apparmor_silent_when_every_profile_has_a_companion(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    apparmor_libvirt = tmp_path / "apparmor.d" / "libvirt"
+    apparmor_libvirt.mkdir(parents=True)
+    for uuid in ("aaaa-1111", "bbbb-2222"):
+        (apparmor_libvirt / f"libvirt-{uuid}").write_text("profile {}\n")
+        (apparmor_libvirt / f"libvirt-{uuid}.files").write_text("/some/disk r,\n")
+    profiles = tmp_path / "profiles"
+    profiles.write_text("nothing\n")
+    _patch_apparmor_constants(
+        monkeypatch,
+        profiles_path=profiles,
+        qemu_conf=tmp_path / "missing.conf",
+        libvirt_dir=apparmor_libvirt,
+    )
+    assert doctor.check_libvirt_apparmor() == []
+
+
+def test_libvirt_apparmor_errors_on_orphan_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `libvirt-<uuid>` profile WITHOUT a matching `.files` companion
+    is the virt-aa-helper-broken signature. Must be reported as ERROR."""
+    apparmor_libvirt = tmp_path / "apparmor.d" / "libvirt"
+    apparmor_libvirt.mkdir(parents=True)
+    # Pair that's fine
+    (apparmor_libvirt / "libvirt-good-uuid").write_text("profile {}\n")
+    (apparmor_libvirt / "libvirt-good-uuid.files").write_text("/disk r,\n")
+    # Orphan profile — virt-aa-helper failed to generate the companion
+    (apparmor_libvirt / "libvirt-broken-uuid").write_text("profile {}\n")
+    profiles = tmp_path / "profiles"
+    profiles.write_text("nothing\n")
+    _patch_apparmor_constants(
+        monkeypatch,
+        profiles_path=profiles,
+        qemu_conf=tmp_path / "missing.conf",
+        libvirt_dir=apparmor_libvirt,
+    )
+    diagnostics = doctor.check_libvirt_apparmor()
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.apparmor_orphan_profiles"
+    assert diagnostics[0].severity == "error"
+    assert "libvirt-broken-uuid" in diagnostics[0].message
+    # The good pair must NOT appear in the orphan list.
+    assert "libvirt-good-uuid" not in diagnostics[0].message
+    assert "virt-aa-helper" in (diagnostics[0].suggestion or "")
+
+
+def test_libvirt_apparmor_error_silenced_by_security_driver_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Explicit opt-out wins even when orphan profiles exist — the
+    operator told libvirt to skip AppArmor entirely."""
+    apparmor_libvirt = tmp_path / "apparmor.d" / "libvirt"
+    apparmor_libvirt.mkdir(parents=True)
+    (apparmor_libvirt / "libvirt-orphan").write_text("profile {}\n")
+    qemu_conf = tmp_path / "qemu.conf"
+    qemu_conf.write_text('security_driver = "none"\n')
+    profiles = tmp_path / "profiles"
+    profiles.write_text("nothing\n")
+    _patch_apparmor_constants(
+        monkeypatch,
+        profiles_path=profiles,
+        qemu_conf=qemu_conf,
+        libvirt_dir=apparmor_libvirt,
+    )
+    assert doctor.check_libvirt_apparmor() == []
+
+
+def test_libvirt_apparmor_warns_when_libvirt_dir_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Distinct from the orphan case: the per-VM dir doesn't exist at
+    all. Rare on stock distros; keep it as a warning."""
     profiles = tmp_path / "profiles"
     profiles.write_text("nothing\n")
     _patch_apparmor_constants(
@@ -346,11 +423,32 @@ def test_libvirt_apparmor_warns_when_neither_path_satisfied(
         qemu_conf=tmp_path / "missing.conf",
         libvirt_dir=tmp_path / "no-libvirt",
     )
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory(set()))
     diagnostics = doctor.check_libvirt_apparmor()
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "runtime.doctor.apparmor_libvirt_unconfigured"
     assert diagnostics[0].severity == "warning"
+
+
+def test_libvirt_apparmor_lists_at_most_three_orphans(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When many orphans are present the message names a few and
+    summarizes the rest so it stays scannable."""
+    apparmor_libvirt = tmp_path / "apparmor.d" / "libvirt"
+    apparmor_libvirt.mkdir(parents=True)
+    for i in range(7):
+        (apparmor_libvirt / f"libvirt-orphan-{i:02d}").write_text("profile {}\n")
+    profiles = tmp_path / "profiles"
+    profiles.write_text("nothing\n")
+    _patch_apparmor_constants(
+        monkeypatch,
+        profiles_path=profiles,
+        qemu_conf=tmp_path / "missing.conf",
+        libvirt_dir=apparmor_libvirt,
+    )
+    diagnostics = doctor.check_libvirt_apparmor()
+    assert len(diagnostics) == 1
+    assert "7 total" in diagnostics[0].message
 
 
 # ---------------------------------------------------------------------------

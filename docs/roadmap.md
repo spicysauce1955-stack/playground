@@ -549,6 +549,21 @@ pre-apply hook so `playground apply` runs the doctor checks
 first and refuses to proceed on errors. Keep the manual command
 either way for "what's wrong before I even try?".
 
+Slice 12 follow-up (done): tighten the AppArmor check. The
+original check verified that `/etc/apparmor.d/libvirt/` exists
+and `apparmor_parser` is on PATH — both true on every stock
+libvirt install, so the check returned green even when
+`virt-aa-helper` was silently broken (libvirt creates the
+`libvirt-<uuid>` profile but no `.files` companion, qemu then
+fails to read disk images at runtime). Replaced with a direct
+scan for orphan `libvirt-<uuid>` profiles without matching
+`.files` companions. New diagnostic
+`runtime.doctor.apparmor_orphan_profiles` (error). The
+machinery-missing warning (`apparmor_libvirt_unconfigured`)
+now fires only when `/etc/apparmor.d/libvirt/` doesn't exist
+at all, which is rare. `security_driver = "none"` still
+silences both.
+
 ## 13. `playground reset` — scrub-by-name cleanup
 
 Status: done.

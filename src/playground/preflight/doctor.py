@@ -403,17 +403,34 @@ def check_ssh_public_key(path: Path | None = None) -> list[Diagnostic]:
 
 
 def check_libvirt_apparmor() -> list[Diagnostic]:
-    """When AppArmor is active, libvirt's qemu driver needs either:
+    """Verify libvirt + AppArmor are actually working together.
 
-    1. an explicit ``security_driver = "none"`` line in
-       ``/etc/libvirt/qemu.conf`` (opt-out), or
-    2. the per-VM AppArmor profile generation machinery in place
-       (``apparmor_parser`` on PATH + ``/etc/apparmor.d/libvirt/``
-       directory exists, so libvirt drops profiles there at runtime).
+    Two failure modes get distinct diagnostics:
 
-    Without either, qemu silently fails to read disk images for new
-    domains on AppArmor-enabled hosts. Skipped silently when AppArmor
-    isn't even running.
+    1. ``apparmor_libvirt_unconfigured`` (warning) — AppArmor is
+       loaded but ``/etc/apparmor.d/libvirt/`` doesn't even exist;
+       the per-VM profile machinery is absent entirely. Rare on a
+       stock distro install; mostly catches custom rebuilds.
+    2. ``apparmor_orphan_profiles`` (error) — the machinery is
+       installed but ``virt-aa-helper`` isn't producing the
+       ``libvirt-<uuid>.files`` companions next to the
+       ``libvirt-<uuid>`` profile files. In this state libvirt
+       starts domains but qemu fails to read their disk images
+       because the AppArmor profile has no path includes. Concrete
+       symptom: ``virsh start <vm>`` succeeds, then qemu logs
+       "permission denied" on the disk path.
+
+    Both checks are skipped when AppArmor isn't loaded
+    (``/sys/kernel/security/apparmor/profiles`` missing) or when
+    ``security_driver = "none"`` is set in
+    ``/etc/libvirt/qemu.conf`` (explicit opt-out).
+
+    Note: when ``/etc/apparmor.d/libvirt/`` exists but is empty
+    (or has only the stock ``libvirt-qemu`` abstraction + a
+    ``TEMPLATE.qemu``), the check silently passes — no VM has
+    been defined yet, so there's nothing to verify. The error
+    only fires when at least one ``libvirt-<uuid>`` profile
+    exists but its ``.files`` companion does not.
     """
     if not _APPARMOR_PROFILES_FILE.exists():
         return []
@@ -421,30 +438,88 @@ def check_libvirt_apparmor() -> list[Diagnostic]:
     if _security_driver_disabled():
         return []
 
-    machinery_present = (
-        shutil.which("apparmor_parser") is not None and _APPARMOR_LIBVIRT_DIR.is_dir()
-    )
-    if machinery_present:
+    if not _APPARMOR_LIBVIRT_DIR.is_dir():
+        return [
+            Diagnostic(
+                id="runtime.doctor.apparmor_libvirt_unconfigured",
+                severity="warning",
+                message=(
+                    "AppArmor is active but the per-VM profile directory "
+                    f"{_APPARMOR_LIBVIRT_DIR} does not exist; "
+                    "libvirt's qemu driver has no way to drop per-domain "
+                    "profiles, so new VMs may fail to read their disk images"
+                ),
+                source=_host_source(str(_QEMU_CONF)),
+                suggestion=(
+                    "easiest fix: echo 'security_driver = \"none\"' | sudo tee -a "
+                    f"{_QEMU_CONF} && sudo systemctl restart libvirtd"
+                ),
+            )
+        ]
+
+    orphans = _orphan_libvirt_profiles(_APPARMOR_LIBVIRT_DIR)
+    if not orphans:
         return []
 
+    sample = ", ".join(sorted(orphans)[:3])
+    if len(orphans) > 3:
+        sample = f"{sample}, … ({len(orphans)} total)"
     return [
         Diagnostic(
-            id="runtime.doctor.apparmor_libvirt_unconfigured",
-            severity="warning",
+            id="runtime.doctor.apparmor_orphan_profiles",
+            severity="error",
             message=(
-                "AppArmor is active but libvirt has neither "
-                "`security_driver = \"none\"` in /etc/libvirt/qemu.conf "
-                "nor the per-VM profile machinery on this host "
-                f"(checked {_APPARMOR_LIBVIRT_DIR} + `apparmor_parser`); "
-                "new domains may fail to read their disk images"
+                f"AppArmor profile(s) without matching `.files` companion "
+                f"in {_APPARMOR_LIBVIRT_DIR}: {sample}. "
+                "virt-aa-helper isn't generating path includes for these "
+                "domains, so qemu will be denied access to their disk "
+                "images even though `virsh start` succeeds"
             ),
-            source=_host_source(str(_QEMU_CONF)),
+            source=_host_source(str(_APPARMOR_LIBVIRT_DIR)),
             suggestion=(
-                "easiest fix: echo 'security_driver = \"none\"' | sudo tee -a "
-                f"{_QEMU_CONF} && sudo systemctl restart libvirtd"
+                "check `dpkg -l libvirt-daemon-system apparmor-utils` and "
+                "`ls -l /usr/lib/libvirt/virt-aa-helper` (must be setuid); "
+                "as a fallback, set `security_driver = \"none\"` in "
+                f"{_QEMU_CONF} and restart libvirtd"
             ),
         )
     ]
+
+
+def _orphan_libvirt_profiles(libvirt_dir: Path) -> set[str]:
+    """Return the set of per-VM profile names whose ``.files`` is missing.
+
+    Per-VM profile filenames look like ``libvirt-<uuid>`` where
+    ``<uuid>`` contains a hyphen. That excludes the stock
+    ``libvirt-qemu`` abstraction (which ships on every libvirt
+    install and never has a ``.files`` companion). Returns an empty
+    set on any I/O error so callers don't crash on a permissions
+    glitch.
+    """
+    try:
+        entries = list(libvirt_dir.iterdir())
+    except OSError:
+        return set()
+
+    profiles: set[str] = set()
+    files: set[str] = set()
+    for entry in entries:
+        if not entry.is_file():
+            continue
+        name = entry.name
+        if not name.startswith("libvirt-"):
+            continue
+        if name.endswith(".files"):
+            stripped = name[: -len(".files")]
+            if "-" in stripped[len("libvirt-"):]:
+                files.add(stripped)
+        else:
+            # `libvirt-qemu` is the stock abstraction; per-VM profile
+            # names have an extra hyphen in the suffix (UUIDs do).
+            if "-" in name[len("libvirt-"):]:
+                profiles.add(name)
+
+    return profiles - files
 
 
 def _security_driver_disabled() -> bool:
