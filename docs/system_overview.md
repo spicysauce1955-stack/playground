@@ -391,7 +391,7 @@ categories:
 | `config.budget.*` | validator | `exceeded` |
 | `config.artifact.*` | validator | `offline_missing` |
 | `config.backend.*` | validator | `per_vm_resources_unsupported` |
-| `config.backend.*` | validator | `per_vm_resources_unsupported` |
+| `config.network.*` | validator | `ip_not_in_cidr`, `duplicate_ip` |
 | `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
 | `config.discovery.*` | CLI | `not_directory` |
 | `config.lab.*` | CLI | `unknown`, `resolve_failed` |
