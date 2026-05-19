@@ -17,6 +17,16 @@
     # other VMs by hostname (workaround for missing lab-scoped DNS).
     - extra_hosts
 
+- name: Baseline configuration
+  hosts: playground
+  become: yes
+  gather_facts: no  # gathered by the extra_hosts play above
+  roles:
+    # Sets timezone (UTC), enables systemd-timesyncd, installs
+    # jq / curl / ca-certificates. Runs before docker so workload
+    # roles can rely on these being present.
+    - common
+
 - name: Configure Playground Guests
   hosts: playground
   become: yes

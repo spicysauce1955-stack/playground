@@ -1,0 +1,13 @@
+---
+# Baseline configuration applied to every playground VM before
+# workload-specific roles run. Kept deliberately minimal — anything
+# beyond timezone + time sync + a couple of QoL packages should go
+# into a workload-specific role so labs without that workload don't
+# pay the cost.
+
+common_timezone: UTC
+
+common_packages:
+  - jq
+  - curl
+  - ca-certificates
