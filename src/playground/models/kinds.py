@@ -327,15 +327,59 @@ class LabWorkload(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class LabVmNetwork(StrictModel):
+    """One VM-to-network attachment, optionally with a pinned IP.
+
+    Labs can declare a VM joins ``deploy-net`` with ``ip: 10.20.40.20``;
+    the tofu adapter turns that into a DHCP reservation (or a domain-
+    side IP pin, depending on the provider's capabilities). Today's
+    labs that use the legacy ``networks: [edge, lab-private]`` shape
+    are normalized into this model by :func:`LabVm.coerce_network_strings`.
+    """
+
+    name: str = Field(min_length=1)
+    ip: str | None = None
+    """Optional IPv4 dotted-quad. Validated against the lab's
+    ``LabNetwork.cidr`` by :func:`validation.validator`."""
+
+
 class LabVm(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str = Field(min_length=1)
     role: str = Field(min_length=1)
-    networks: list[str] = Field(min_length=1)
+    networks: list[LabVmNetwork] = Field(min_length=1)
+    """Networks this VM attaches to. Accepts both the legacy
+    ``list[str]`` shape (back-compat for labs predating per-VM IPs)
+    and the rich ``list[{name, ip?}]`` shape via
+    :func:`coerce_network_strings`."""
     resources: Resources | None = None
     tags: list[str] = Field(default_factory=list)
+    extra_hosts: list[str] = Field(default_factory=list)
+    """Lines to append to ``/etc/hosts`` on this VM at provision time.
+
+    Workaround for the missing lab-scoped DNS (tracked in the
+    roadmap backlog). Each entry is a literal ``/etc/hosts`` line
+    such as ``"10.20.40.21 target"``.
+    """
     provider_overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("networks", mode="before")
+    @classmethod
+    def coerce_network_strings(cls, value: Any) -> Any:
+        """Accept the legacy ``list[str]`` shape alongside ``list[{name, ip?}]``.
+
+        Existing labs that wrote ``networks: [edge, lab-private]``
+        continue to parse — each string becomes ``{name: <string>}``
+        with no IP pinned. New labs use the object form to pin
+        per-network IPs.
+        """
+        if isinstance(value, list):
+            return [
+                {"name": item} if isinstance(item, str) else item
+                for item in value
+            ]
+        return value
 
 
 class LabCommands(StrictModel):
@@ -444,6 +488,7 @@ __all__ = [
     "LabNetwork",
     "LabSpec",
     "LabVm",
+    "LabVmNetwork",
     "LabWorkload",
     "NetworkDns",
     "NetworkProfile",

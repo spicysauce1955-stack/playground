@@ -116,6 +116,75 @@ def test_source_map_seeded(resolved_generic_infra) -> None:
     assert resolved_generic_infra.source_map["spec"].endswith("generic-infra.yaml")
 
 
+def test_resolver_propagates_network_ips_and_extra_hosts(tmp_path) -> None:
+    """A lab using the new per-VM-network IP + extra_hosts shape
+    should land both on ResolvedVm."""
+    from textwrap import dedent
+
+    config_dir = tmp_path / "config"
+    # Mirror the committed tree just enough for the resolver.
+    for sub in ("artifacts", "commands", "labs", "networks", "providers", "roles"):
+        (config_dir / sub).mkdir(parents=True, exist_ok=True)
+    # Reuse the committed config for everything except the lab itself.
+    import shutil as _shutil
+    for sub in ("artifacts", "commands", "networks", "providers", "roles"):
+        for f in (CONFIG_DIR / sub).iterdir():
+            _shutil.copy(f, config_dir / sub / f.name)
+    _shutil.copy(CONFIG_DIR / "defaults.yaml", config_dir / "defaults.yaml")
+    (config_dir / "labs" / "static-ip.yaml").write_text(
+        dedent(
+            """
+            apiVersion: playground/v1
+            kind: Lab
+            metadata:
+              name: static-ip
+            spec:
+              backend: local-libvirt
+              networks:
+                - name: deploy-net
+                  profile: isolated
+                  cidr: 10.20.40.0/24
+              vms:
+                - name: vm-a
+                  role: generic-node
+                  networks:
+                    - name: deploy-net
+                      ip: 10.20.40.20
+                  extra_hosts:
+                    - "10.20.40.21 vm-b"
+                - name: vm-b
+                  role: generic-node
+                  networks:
+                    - name: deploy-net
+                      ip: 10.20.40.21
+                  extra_hosts:
+                    - "10.20.40.20 vm-a"
+            """
+        ).lstrip("\n")
+    )
+
+    loaded, diagnostics = load_config(config_dir)
+    assert diagnostics == []
+    resolved = resolve_lab(loaded, "static-ip")
+
+    by_name = {vm.name: vm for vm in resolved.vms}
+    assert by_name["vm-a"].networks == ["deploy-net"]
+    assert by_name["vm-a"].network_ips == {"deploy-net": "10.20.40.20"}
+    assert by_name["vm-a"].extra_hosts == ["10.20.40.21 vm-b"]
+    assert by_name["vm-b"].network_ips == {"deploy-net": "10.20.40.21"}
+    assert by_name["vm-b"].extra_hosts == ["10.20.40.20 vm-a"]
+
+
+def test_resolver_legacy_networks_have_empty_network_ips(
+    resolved_generic_infra,
+) -> None:
+    """The committed `generic-infra` lab uses the legacy `networks: [name, ...]`
+    shape — every VM gets an empty network_ips map (no IPs pinned)."""
+    for vm in resolved_generic_infra.vms:
+        assert vm.network_ips == {}
+        assert vm.extra_hosts == []
+
+
 def test_unknown_lab_raises_keyerror() -> None:
     loaded, diagnostics = load_config(CONFIG_DIR)
     assert diagnostics == []

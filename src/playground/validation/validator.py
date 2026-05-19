@@ -24,10 +24,15 @@ Diagnostic IDs:
   classes from ``requirements.md`` §5.13 are tracked for a later slice)
 - ``config.backend.per_vm_resources_unsupported`` (warning; today's
   ``local-libvirt`` backend applies global ``var.vm_memory`` / ``var.vm_vcpu``)
+- ``config.network.ip_not_in_cidr`` (per-VM pinned IP outside the lab
+  network's CIDR)
+- ``config.network.duplicate_ip`` (two VMs pin the same IP on the same
+  network)
 """
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from typing import Literal
 
@@ -231,15 +236,15 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
                     ),
                 )
             )
-        for net_idx, net_name in enumerate(vm.networks):
-            if net_name not in declared_network_names:
+        for net_idx, vm_net in enumerate(vm.networks):
+            if vm_net.name not in declared_network_names:
                 diagnostics.append(
                     Diagnostic(
                         id="config.reference.unknown_network",
                         severity="error",
                         message=(
                             f"VM {vm.name!r} attaches to undeclared network "
-                            f"{net_name!r}"
+                            f"{vm_net.name!r}"
                         ),
                         source=source,
                         key_path=f"spec.vms[{idx}].networks[{net_idx}]",
@@ -296,7 +301,88 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_budget(lab, loaded, source))
     diagnostics.extend(_check_offline_artifacts(lab, loaded, source))
     diagnostics.extend(_check_backend_capability(lab, loaded, source))
+    diagnostics.extend(_check_network_ips(lab, source))
 
+    return diagnostics
+
+
+def _check_network_ips(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
+    """Validate per-VM IP pins against the lab's network CIDRs.
+
+    Two checks:
+
+    - ``config.network.ip_not_in_cidr`` — the pinned IP must fall inside
+      the corresponding ``LabNetwork.cidr``. Skipped silently when the
+      VM references a network the lab doesn't declare; the existing
+      ``config.reference.unknown_network`` check already covers that.
+    - ``config.network.duplicate_ip`` — two VMs in the same lab can't
+      pin the same IP on the same network.
+    """
+    diagnostics: list[Diagnostic] = []
+    cidrs: dict[str, ipaddress.IPv4Network | ipaddress.IPv6Network] = {}
+    for net in lab.spec.networks:
+        try:
+            cidrs[net.name] = ipaddress.ip_network(net.cidr, strict=False)
+        except ValueError:
+            # Malformed CIDR — surfaced by pydantic field constraints
+            # elsewhere; not this check's concern.
+            continue
+
+    seen: dict[tuple[str, str], str] = {}  # (network, ip) -> first VM name
+    for vm_idx, vm in enumerate(lab.spec.vms):
+        for net_idx, vm_net in enumerate(vm.networks):
+            if vm_net.ip is None:
+                continue
+            try:
+                addr = ipaddress.ip_address(vm_net.ip)
+            except ValueError:
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.network.ip_not_in_cidr",
+                        severity="error",
+                        message=(
+                            f"VM {vm.name!r} pins network {vm_net.name!r} "
+                            f"to {vm_net.ip!r}, which is not a valid IP"
+                        ),
+                        source=source,
+                        key_path=f"spec.vms[{vm_idx}].networks[{net_idx}].ip",
+                    )
+                )
+                continue
+            cidr = cidrs.get(vm_net.name)
+            if cidr is not None and addr not in cidr:
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.network.ip_not_in_cidr",
+                        severity="error",
+                        message=(
+                            f"VM {vm.name!r} pins network {vm_net.name!r} to "
+                            f"{vm_net.ip!r}, which is outside the network's "
+                            f"CIDR ({cidr})"
+                        ),
+                        source=source,
+                        key_path=f"spec.vms[{vm_idx}].networks[{net_idx}].ip",
+                        suggestion=f"pick an address inside {cidr}",
+                    )
+                )
+                continue
+            key = (vm_net.name, vm_net.ip)
+            if key in seen:
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.network.duplicate_ip",
+                        severity="error",
+                        message=(
+                            f"VM {vm.name!r} pins network {vm_net.name!r} to "
+                            f"{vm_net.ip!r}, but VM {seen[key]!r} already "
+                            "pins the same IP"
+                        ),
+                        source=source,
+                        key_path=f"spec.vms[{vm_idx}].networks[{net_idx}].ip",
+                    )
+                )
+                continue
+            seen[key] = vm.name
     return diagnostics
 
 

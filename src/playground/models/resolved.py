@@ -42,11 +42,18 @@ class ResolvedVm(StrictModel):
     memory_mb: int = Field(ge=128)
     disk_gb: int = Field(ge=1)
     networks: list[str]
+    network_ips: dict[str, str] = Field(default_factory=dict)
+    """Pinned IPs per network name (only the networks the lab pinned).
+    The tofu adapter translates this into DHCP reservations or
+    domain-side IP pins."""
     ssh: SshConfig
     provisioners: list[dict[str, str]] = Field(default_factory=list)
     capabilities: dict[str, Any] = Field(default_factory=dict)
     routing: VmRouting | None = None
     tags: list[str] = Field(default_factory=list)
+    extra_hosts: list[str] = Field(default_factory=list)
+    """Raw ``/etc/hosts`` lines to append on this VM at provision time.
+    Workaround for missing lab-scoped DNS (roadmap backlog)."""
     provider_overrides: dict[str, Any] = Field(default_factory=dict)
 
 

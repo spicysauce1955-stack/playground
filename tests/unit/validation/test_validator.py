@@ -698,6 +698,107 @@ def test_role_unknown_extends(committed_load: LoadedConfig) -> None:
     assert "orphan" in matching[0].message
 
 
+def test_network_ip_not_in_cidr_is_validation_error(
+    committed_load: LoadedConfig,
+) -> None:
+    bad = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: bad-ip
+        spec:
+          backend: local-libvirt
+          networks:
+            - name: deploy-net
+              profile: isolated
+              cidr: 10.20.40.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks:
+                - name: deploy-net
+                  ip: 10.99.0.5
+        """
+    )
+    committed_load.labs[bad.metadata.name] = bad
+
+    diagnostics = validate(committed_load)
+
+    matching = [d for d in diagnostics if d.id == "config.network.ip_not_in_cidr"]
+    assert len(matching) == 1
+    assert "10.99.0.5" in matching[0].message
+    assert "10.20.40.0/24" in matching[0].message
+
+
+def test_network_duplicate_ip_is_validation_error(
+    committed_load: LoadedConfig,
+) -> None:
+    bad = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: dup-ip
+        spec:
+          backend: local-libvirt
+          networks:
+            - name: deploy-net
+              profile: isolated
+              cidr: 10.20.40.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks:
+                - name: deploy-net
+                  ip: 10.20.40.10
+            - name: vm2
+              role: generic-node
+              networks:
+                - name: deploy-net
+                  ip: 10.20.40.10
+        """
+    )
+    committed_load.labs[bad.metadata.name] = bad
+
+    diagnostics = validate(committed_load)
+
+    matching = [d for d in diagnostics if d.id == "config.network.duplicate_ip"]
+    assert len(matching) == 1
+    assert "'vm1'" in matching[0].message
+    assert "'vm2'" in matching[0].message
+
+
+def test_network_ip_not_a_valid_address(committed_load: LoadedConfig) -> None:
+    bad = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: junk-ip
+        spec:
+          backend: local-libvirt
+          networks:
+            - name: deploy-net
+              profile: isolated
+              cidr: 10.20.40.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks:
+                - name: deploy-net
+                  ip: nope
+        """
+    )
+    committed_load.labs[bad.metadata.name] = bad
+
+    diagnostics = validate(committed_load)
+
+    matching = [d for d in diagnostics if d.id == "config.network.ip_not_in_cidr"]
+    assert len(matching) == 1
+    assert "'nope'" in matching[0].message
+
+
 def test_unknown_image_reference_against_artifact_sources(
     committed_load: LoadedConfig,
 ) -> None:

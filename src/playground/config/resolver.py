@@ -182,12 +182,14 @@ def _resolve_vm(
         vcpu=vcpu,
         memory_mb=memory_mb,
         disk_gb=disk_gb,
-        networks=list(vm.networks),
+        networks=[n.name for n in vm.networks],
+        network_ips={n.name: n.ip for n in vm.networks if n.ip is not None},
         ssh=ssh,
         provisioners=[{"ansible_role": p.ansible_role} for p in flattened_role.provisioners],
         capabilities=dict(flattened_role.capabilities),
         routing=flattened_role.routing,
         tags=list(vm.tags),
+        extra_hosts=list(vm.extra_hosts),
         provider_overrides=dict(vm.provider_overrides),
     )
 

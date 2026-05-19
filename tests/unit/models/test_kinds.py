@@ -125,6 +125,48 @@ def test_lab_rejects_duplicate_vm_names() -> None:
     assert "duplicate names" in str(exc.value)
 
 
+def test_lab_vm_networks_accepts_legacy_string_shape() -> None:
+    """The committed `generic-infra` lab uses the legacy `networks:
+    [name, name]` shape — it must keep parsing unchanged."""
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    lab = parse_resource(raw)
+    assert isinstance(lab, Lab)
+    # Every VM normalizes to LabVmNetwork objects with no IP pinned.
+    for vm in lab.spec.vms:
+        assert all(net.ip is None for net in vm.networks)
+    docker_nets = next(vm for vm in lab.spec.vms if vm.name == "docker1").networks
+    assert [n.name for n in docker_nets] == ["edge", "lab-private"]
+
+
+def test_lab_vm_networks_accepts_object_shape_with_ip() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    raw["spec"]["networks"].append(
+        {"name": "deploy-net", "profile": "isolated", "cidr": "10.20.40.0/24"}
+    )
+    raw["spec"]["vms"][0]["networks"] = [
+        {"name": "lab-private"},  # no ip
+        {"name": "deploy-net", "ip": "10.20.40.42"},  # pinned
+    ]
+    lab = parse_resource(raw)
+    assert isinstance(lab, Lab)
+    nets = lab.spec.vms[0].networks
+    assert nets[0].name == "lab-private" and nets[0].ip is None
+    assert nets[1].name == "deploy-net" and nets[1].ip == "10.20.40.42"
+
+
+def test_lab_vm_extra_hosts_defaults_to_empty_list() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    lab = parse_resource(raw)
+    assert all(vm.extra_hosts == [] for vm in lab.spec.vms)
+
+
+def test_lab_vm_extra_hosts_parses_when_set() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    raw["spec"]["vms"][0]["extra_hosts"] = ["10.20.40.21 target", "10.20.40.22 other"]
+    lab = parse_resource(raw)
+    assert lab.spec.vms[0].extra_hosts == ["10.20.40.21 target", "10.20.40.22 other"]
+
+
 def test_lab_rejects_duplicate_network_names() -> None:
     raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
     raw["spec"]["networks"].append({"name": "edge", "profile": "nat", "cidr": "10.99.0.0/24"})
