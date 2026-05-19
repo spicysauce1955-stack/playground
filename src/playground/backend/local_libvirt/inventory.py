@@ -30,7 +30,11 @@ from pathlib import Path
 
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
-from playground.planner import schedule_workloads, workload_to_ansible_payload
+from playground.planner import (
+    assign_swarm_membership,
+    schedule_workloads,
+    workload_to_ansible_payload,
+)
 
 # Public diagnostic id constants. Importing modules (e.g.
 # backend/local_libvirt/status.py) special-case `TOFU_NO_STATE` as
@@ -181,6 +185,10 @@ def render_inventory(
 
     schedule, schedule_diagnostics = schedule_workloads(resolved)
     diagnostics.extend(schedule_diagnostics)
+    swarm_membership, swarm_diagnostics = assign_swarm_membership(
+        schedule, resolved.vms
+    )
+    diagnostics.extend(swarm_diagnostics)
 
     placed_vms: list[tuple[str, str, str]] = []  # (name, role, host-line)
 
@@ -216,6 +224,9 @@ def render_inventory(
             host_vars.append(f"pg_networks={','.join(vm.networks)}")
         if vm.tags:
             host_vars.append(f"pg_tags={','.join(vm.tags)}")
+        swarm_role = swarm_membership.get(vm.name, "none")
+        if swarm_role != "none":
+            host_vars.append(f"pg_swarm_role={swarm_role}")
         workloads = schedule.get(vm.name, [])
         if workloads:
             # JSON-encoded list of workload dicts. Ansible reads it via
@@ -264,6 +275,20 @@ def render_inventory(
             f"[{role_group}]",
             *role_to_vms[role_group],
         ]
+
+    # Swarm membership groups so site.yml plays can target managers
+    # and workers separately. Only emitted when the lab has swarm
+    # workloads (everyone-is-"none" otherwise).
+    swarm_role_to_group = {"manager": "swarm_manager", "worker": "swarm_worker"}
+    swarm_groups: dict[str, list[str]] = {"swarm_manager": [], "swarm_worker": []}
+    for vm_name, _, _ in placed_vms:
+        role = swarm_membership.get(vm_name, "none")
+        group = swarm_role_to_group.get(role)
+        if group is not None:
+            swarm_groups[group].append(vm_name)
+    for group_name, members in swarm_groups.items():
+        if members:
+            lines += ["", f"[{group_name}]", *members]
 
     lines += [
         "",

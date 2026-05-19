@@ -73,6 +73,47 @@ def test_render_inventory_emits_pg_workloads_for_scheduled_host(
     assert "pg_workloads=" not in node_line
 
 
+def test_render_inventory_emits_swarm_groups_when_swarm_workload_present(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    # Flip the committed compose workload to swarm and add a second
+    # docker-capable VM so we see both manager and worker groups.
+    docker1 = resolved_generic_infra.vms[1]
+    docker2 = docker1.model_copy(update={"name": "docker2"})
+    new_vms = [resolved_generic_infra.vms[0], docker1, docker2,
+               resolved_generic_infra.vms[2]]
+    original = resolved_generic_infra.workloads[0]
+    swarm_wl = original.model_copy(update={"type": "swarm"})
+    lab = resolved_generic_infra.model_copy(
+        update={"vms": new_vms, "workloads": [swarm_wl]}
+    )
+    ips = {**lab_ips, "docker2": "10.0.10.45"}
+
+    body, diagnostics = render_inventory(lab, ips)
+
+    assert diagnostics == []
+    # docker1 has pg_swarm_role=manager; docker2 has worker.
+    docker1_line = next(line for line in body.splitlines() if line.startswith("docker1 "))
+    docker2_line = next(line for line in body.splitlines() if line.startswith("docker2 "))
+    assert "pg_swarm_role=manager" in docker1_line
+    assert "pg_swarm_role=worker" in docker2_line
+    # node1 / router1 lack docker capability → no swarm role attribute.
+    node_line = next(line for line in body.splitlines() if line.startswith("node1 "))
+    assert "pg_swarm_role" not in node_line
+    # Groups present.
+    assert "[swarm_manager]\ndocker1" in body
+    assert "[swarm_worker]\ndocker2" in body
+
+
+def test_render_inventory_omits_swarm_groups_when_no_swarm_workload(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    body, _ = render_inventory(resolved_generic_infra, lab_ips)
+
+    assert "[swarm_manager]" not in body
+    assert "[swarm_worker]" not in body
+
+
 def test_render_inventory_escapes_single_quotes_in_workload_payload(
     resolved_generic_infra, lab_ips: dict[str, str]
 ) -> None:

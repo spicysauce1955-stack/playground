@@ -1,0 +1,23 @@
+---
+# Initialize the Swarm on the manager host. Stores the worker join
+# token as a host fact so the subsequent worker-join play can read it
+# via hostvars[manager]['pg_swarm_worker_token'].
+#
+# Idempotent: community.docker.docker_swarm reconciles to declared
+# state. Re-running against an already-initialized swarm reports no
+# change.
+
+- name: Skip non-managers in the init pass
+  ansible.builtin.meta: end_host
+  when: pg_swarm_role | default('none') != 'manager'
+
+- name: Initialize Swarm
+  community.docker.docker_swarm:
+    state: present
+    advertise_addr: "{{ ansible_host }}"
+  register: pg_swarm_init
+
+- name: Expose worker join token to other hosts
+  ansible.builtin.set_fact:
+    pg_swarm_worker_token: "{{ pg_swarm_init.swarm_facts.JoinTokens.Worker }}"
+    pg_swarm_advertise_addr: "{{ ansible_host }}"

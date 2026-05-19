@@ -9,6 +9,7 @@ import pytest
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
 from playground.planner.scheduling import (
+    assign_swarm_membership,
     schedule_workloads,
     stage_workload_files,
     workload_to_ansible_payload,
@@ -198,6 +199,90 @@ def test_stage_workload_files_reports_missing_source(
     assert staged["docker1"] == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.workload.source_missing"
+
+
+def test_swarm_membership_assigns_first_docker_vm_as_manager(
+    resolved_generic_infra,
+) -> None:
+    # Flip the committed compose workload to swarm so membership engages.
+    original = resolved_generic_infra.workloads[0]
+    swarm_wl = original.model_copy(update={"type": "swarm"})
+    lab = resolved_generic_infra.model_copy(update={"workloads": [swarm_wl]})
+    scheduled, _ = schedule_workloads(lab)
+
+    membership, diagnostics = assign_swarm_membership(scheduled, lab.vms)
+
+    assert diagnostics == []
+    # generic-infra has one docker-capable VM (docker1) → it's the manager.
+    assert membership["docker1"] == "manager"
+    # node1 and router1 lack docker capability → no swarm membership.
+    assert membership["node1"] == "none"
+    assert membership["router1"] == "none"
+
+
+def test_swarm_membership_promotes_additional_docker_vms_as_workers(
+    resolved_generic_infra,
+) -> None:
+    # Add a second docker-capable VM ahead of docker1 in the list so we
+    # can verify worker assignment for the non-first docker VMs.
+    docker1 = resolved_generic_infra.vms[1]
+    docker2 = docker1.model_copy(update={"name": "docker2"})
+    new_vms = [docker1, docker2, *resolved_generic_infra.vms[2:]]
+    original = resolved_generic_infra.workloads[0]
+    swarm_wl = original.model_copy(update={"type": "swarm"})
+    lab = resolved_generic_infra.model_copy(
+        update={"vms": new_vms, "workloads": [swarm_wl]}
+    )
+    scheduled, _ = schedule_workloads(lab)
+
+    membership, _ = assign_swarm_membership(scheduled, lab.vms)
+
+    assert membership["docker1"] == "manager"
+    assert membership["docker2"] == "worker"
+
+
+def test_swarm_membership_silent_when_no_swarm_workloads(
+    resolved_generic_infra,
+) -> None:
+    scheduled, _ = schedule_workloads(resolved_generic_infra)
+
+    membership, diagnostics = assign_swarm_membership(scheduled, resolved_generic_infra.vms)
+
+    assert diagnostics == []
+    assert set(membership.values()) == {"none"}
+
+
+def test_swarm_membership_errors_when_no_docker_capable_vm(
+    resolved_generic_infra,
+) -> None:
+    # Strip docker capability from every VM, then add a swarm workload.
+    plain_vms = [
+        vm.model_copy(update={"capabilities": {}}) for vm in resolved_generic_infra.vms
+    ]
+    original = resolved_generic_infra.workloads[0]
+    # Target docker-host so schedule_workloads' role match still succeeds —
+    # we want to isolate the swarm-membership error, not the no-target one.
+    # But none of the VMs have docker-host role after the strip... so use
+    # auto placement which falls back to first docker-capable (also fails).
+    # We need scheduling to *succeed* so the swarm-check fires. Easiest:
+    # give one VM a target_vm pin and strip docker on it.
+    swarm_wl = original.model_copy(
+        update={
+            "type": "swarm",
+            "placement": original.placement.model_copy(
+                update={"target_role": None, "target_vm": "node1"}
+            ),
+        }
+    )
+    lab = resolved_generic_infra.model_copy(
+        update={"vms": plain_vms, "workloads": [swarm_wl]}
+    )
+    scheduled, _ = schedule_workloads(lab)
+
+    _, diagnostics = assign_swarm_membership(scheduled, lab.vms)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "config.workload.swarm_needs_docker_host"
 
 
 def test_workload_payload_includes_staged_source_when_provided() -> None:

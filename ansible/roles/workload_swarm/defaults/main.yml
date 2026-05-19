@@ -1,0 +1,10 @@
+---
+# Default values for the workload_swarm role.
+#
+# The role is split into three task files in site.yml — manager init,
+# worker join, and stack deploy — because Ansible can't reorder tasks
+# across hosts within a single play. Each task file checks
+# `pg_swarm_role` and skips if the host doesn't participate.
+pg_workloads: '[]'
+pg_swarm_role: none  # one of {manager, worker, none}
+pg_swarm_root: /opt/playground/swarm

@@ -22,3 +22,34 @@
   gather_facts: no
   roles:
     - workload_compose
+
+# Swarm spans hosts: manager initializes first, workers join using the
+# token the manager exposed, then stacks deploy on the manager. Each
+# phase is a separate play because Ansible can't reorder tasks across
+# hosts within a single play.
+- name: Initialize Swarm on managers
+  hosts: swarm_manager
+  become: yes
+  gather_facts: no
+  tasks:
+    - ansible.builtin.include_role:
+        name: workload_swarm
+        tasks_from: init
+
+- name: Join Swarm workers
+  hosts: swarm_worker
+  become: yes
+  gather_facts: no
+  tasks:
+    - ansible.builtin.include_role:
+        name: workload_swarm
+        tasks_from: join
+
+- name: Deploy Swarm stacks on managers
+  hosts: swarm_manager
+  become: yes
+  gather_facts: no
+  tasks:
+    - ansible.builtin.include_role:
+        name: workload_swarm
+        tasks_from: deploy

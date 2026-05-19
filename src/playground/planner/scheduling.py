@@ -175,7 +175,65 @@ def stage_workload_files(
     return staged, diagnostics
 
 
+def assign_swarm_membership(
+    scheduled: dict[str, list[ResolvedWorkload]],
+    vms: list[ResolvedVm],
+) -> tuple[dict[str, str], list[Diagnostic]]:
+    """Decide each VM's role in the lab's Swarm cluster.
+
+    Today's model: there is at most one Swarm per lab. When the lab
+    has any ``type: swarm`` workload:
+
+    - The first docker-capable VM (lab declaration order) becomes the
+      Swarm **manager**. Stack workloads land on it.
+    - Every other docker-capable VM becomes a **worker**. Workers
+      contribute capacity but don't host stack-deploy directives.
+    - VMs without ``capabilities['docker']`` are tagged ``"none"``.
+
+    Per ``docs/product/requirements.md`` §5.7 the model promises
+    "hybrid automatic/explicit manager-worker assignment". Today only
+    automatic is implemented; explicit overrides (a future
+    ``LabVm.swarm_role`` field or workload-level pin) layer on top of
+    this function without changing its signature.
+
+    Emits ``config.workload.swarm_needs_docker_host`` if a swarm
+    workload is present but no VM is docker-capable.
+    """
+    has_swarm = any(
+        wl.type == "swarm" for workloads in scheduled.values() for wl in workloads
+    )
+    membership: dict[str, str] = {vm.name: "none" for vm in vms}
+    diagnostics: list[Diagnostic] = []
+    if not has_swarm:
+        return membership, diagnostics
+
+    docker_vms = [vm for vm in vms if vm.capabilities.get("docker")]
+    if not docker_vms:
+        diagnostics.append(
+            Diagnostic(
+                id="config.workload.swarm_needs_docker_host",
+                severity="error",
+                message=(
+                    "lab declares swarm workloads but no VM advertises "
+                    "capabilities.docker=true; cannot init a swarm"
+                ),
+                source=SourceLocation(path="config/labs/"),
+                suggestion=(
+                    "give one of the lab VMs the docker-host role, or "
+                    "remove the swarm workload"
+                ),
+            )
+        )
+        return membership, diagnostics
+
+    membership[docker_vms[0].name] = "manager"
+    for vm in docker_vms[1:]:
+        membership[vm.name] = "worker"
+    return membership, diagnostics
+
+
 __all__ = [
+    "assign_swarm_membership",
     "schedule_workloads",
     "stage_workload_files",
     "workload_to_ansible_payload",

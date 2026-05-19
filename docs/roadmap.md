@@ -240,7 +240,7 @@ Carried forward to future work:
 
 ## 8. Docker Workloads
 
-Status: in progress (container done; compose + swarm queued).
+Status: done.
 
 Slice 8a (done):
 
@@ -264,20 +264,48 @@ Slice 8a (done):
   items are skipped by the `when: item.type == 'container'` guard.
 - New diagnostic ID `config.workload.no_target`.
 
-Slice 8b (queued): Docker Compose
+Slice 8b (done): Docker Compose
 
-- New ansible role `workload_compose`. Stage the lab's Compose file
-  on the target VM (file-on-disk under `.playground/state/<lab>/
-  workloads/`), run `docker compose up -d`.
-- The inventory's inline `pg_workloads` JSON is fine for Compose only
-  if compose files stay short; the §8b slice is the natural moment
-  to migrate to file-on-disk staging.
+- `stage_workload_files()` copies each scheduled compose source from
+  `<config_dir>/../<workload.source>` into
+  `.playground/state/workloads/<lab>/<vm>/<workload>.yml`. Missing
+  sources emit `config.workload.source_missing` and abort apply
+  before tofu touches infrastructure.
+- New ansible role `workload_compose` reads the per-VM
+  `pg_workloads` JSON, filters to `type == compose`,
+  `ansible.builtin.copy`s the staged file onto the target as
+  `/opt/playground/compose/<workload>/docker-compose.yml`, and runs
+  `community.docker.docker_compose_v2`. Idempotent.
+- Example `compose/demo.yaml` next to `config/` gives the committed
+  `generic-infra` lab a real compose file to stage.
 
-Slice 8c (queued): Docker Swarm
+Slice 8c (done): Docker Swarm
 
-- Manager/worker assignment per requirements §5.7. Scheduler shape
-  will need to grow from `dict[str, list[ResolvedWorkload]]` to
-  identify the manager role and replicate services across workers.
+- `assign_swarm_membership()` decides each VM's role in the lab's
+  swarm. Auto-pick: first docker-capable VM (lab declaration order)
+  becomes manager, other docker-capable VMs become workers.
+  Non-docker VMs are `"none"`. Hybrid explicit assignment lands in
+  a follow-up when `LabVm.swarm_role` or workload-level pins exist.
+- New diagnostic `config.workload.swarm_needs_docker_host` fires
+  when a swarm workload exists but no VM is docker-capable.
+- Inventory renderer emits `[swarm_manager]` and `[swarm_worker]`
+  groups when applicable, and adds a `pg_swarm_role` host var on
+  participating VMs.
+- New ansible role `workload_swarm` split across three task files
+  (`init` / `join` / `deploy`) because Ansible can't reorder tasks
+  across hosts within a single play. `site.yml` includes the role
+  three times with explicit `tasks_from` against the matching host
+  group. The manager's `docker swarm init` exposes the worker join
+  token via host facts; workers pick it up through
+  `hostvars[manager]`. Stacks deploy via
+  `community.docker.docker_stack`.
+
+Carried forward:
+
+- Workload `networks` field (lab-level network names) still doesn't
+  reach the workload_* roles. Mapping lab networks to docker
+  networks is the next follow-up.
+- Explicit swarm-role assignment via lab YAML.
 
 Carried forward:
 

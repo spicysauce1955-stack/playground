@@ -1,0 +1,19 @@
+---
+# Workers join the Swarm using the token the manager exposed during
+# the init pass. Idempotent via community.docker.docker_swarm.
+
+- name: Skip non-workers in the join pass
+  ansible.builtin.meta: end_host
+  when: pg_swarm_role | default('none') != 'worker'
+
+- name: Resolve the manager host
+  ansible.builtin.set_fact:
+    pg_manager_host: "{{ groups['swarm_manager'] | first }}"
+
+- name: Join Swarm as worker
+  community.docker.docker_swarm:
+    state: join
+    advertise_addr: "{{ ansible_host }}"
+    join_token: "{{ hostvars[pg_manager_host]['pg_swarm_worker_token'] }}"
+    remote_addrs:
+      - "{{ hostvars[pg_manager_host]['pg_swarm_advertise_addr'] }}:2377"

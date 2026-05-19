@@ -1,0 +1,59 @@
+---
+# Deploy each type=swarm workload as a Swarm stack on the manager.
+# The compose-style YAML was staged by `playground inventory render`
+# at `item.staged_source` on the controller; we ansible.builtin.copy
+# it to the manager and run `docker stack deploy`.
+#
+# Idempotent — `community.docker.docker_stack` reconciles to the
+# declared state of the stack.
+
+- name: Skip non-managers in the deploy pass
+  ansible.builtin.meta: end_host
+  when: pg_swarm_role | default('none') != 'manager'
+
+- name: Parse pg_workloads JSON payload
+  ansible.builtin.set_fact:
+    pg_workloads_parsed: "{{ pg_workloads | from_json }}"
+
+- name: Compute swarm workloads only
+  ansible.builtin.set_fact:
+    pg_swarm_workloads: >-
+      {{
+        pg_workloads_parsed
+          | selectattr('type', 'equalto', 'swarm')
+          | list
+      }}
+
+- name: Skip when no swarm stacks scheduled
+  ansible.builtin.meta: end_host
+  when: pg_swarm_workloads | length == 0
+
+- name: Ensure per-stack directories exist
+  ansible.builtin.file:
+    path: "{{ pg_swarm_root }}/{{ item.name }}"
+    state: directory
+    mode: '0755'
+  loop: "{{ pg_swarm_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Stage compose files on the manager
+  ansible.builtin.copy:
+    src: "{{ item.staged_source }}"
+    dest: "{{ pg_swarm_root }}/{{ item.name }}/stack.yml"
+    mode: '0644'
+  loop: "{{ pg_swarm_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.staged_source is defined
+
+- name: Deploy swarm stacks
+  community.docker.docker_stack:
+    name: "{{ item.name }}"
+    state: present
+    compose:
+      - "{{ pg_swarm_root }}/{{ item.name }}/stack.yml"
+  loop: "{{ pg_swarm_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.staged_source is defined

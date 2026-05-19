@@ -17,6 +17,7 @@ from playground.planner.plan import (
     render_plan,
 )
 from playground.planner.scheduling import (
+    assign_swarm_membership,
     schedule_workloads,
     stage_workload_files,
     workload_to_ansible_payload,
@@ -26,6 +27,7 @@ __all__ = [
     "Plan",
     "PlanAction",
     "PlanBudget",
+    "assign_swarm_membership",
     "render_plan",
     "schedule_workloads",
     "stage_workload_files",

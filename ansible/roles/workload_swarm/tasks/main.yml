@@ -1,0 +1,9 @@
+---
+# Phase selector: site.yml includes this role with `tasks_from` so each
+# play (init / join / deploy) hits the right file. Including the role
+# without specifying a phase is a misuse.
+- name: workload_swarm requires an explicit phase
+  ansible.builtin.fail:
+    msg: >-
+      Include workload_swarm via `tasks_from: init|join|deploy`. The
+      bare role has no default phase; site.yml ships three plays.
