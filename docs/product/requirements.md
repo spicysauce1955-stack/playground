@@ -217,10 +217,23 @@ The primary user is the project owner/operator:
 
 ## 7. Open Questions
 
-- Exact implementation language and packaging model.
-- Exact TUI framework.
-- Exact schema validation format and tooling.
-- Whether generated backend files are rendered from templates or invoked through adapter commands.
-- How much of the existing `tofu/` and `ansible/` modules should be refactored versus wrapped.
+- Exact TUI framework. `textual` is reserved as an optional dependency in
+  `pyproject.toml` but no TUI work has started.
 - How router behavior should be implemented in the first technical slice.
-- Whether the first Swarm implementation must be full production-grade cluster management or a minimal lab-oriented workflow.
+  The `router` role exists in config, but `ansible/roles/router/` does
+  not, and routing is not exercised end-to-end.
+- Whether the first Swarm implementation must be full production-grade
+  cluster management or a minimal lab-oriented workflow.
+
+Resolved questions (kept here as a record):
+
+- Implementation language and packaging — Python 3.12+ via `hatchling`
+  (`pyproject.toml`).
+- Schema validation tooling — Pydantic 2 with `StrictModel`
+  (`extra="forbid"`, `frozen=True`).
+- Backend file generation — rendered from Python
+  (`backend/local_libvirt/inventory.py`, `tfvars.py`); `tofu` and
+  `ansible-playbook` are invoked as subprocess commands rather than
+  re-implemented. See ADR-0002.
+- Refactor vs wrap the existing `tofu/` / `ansible/` modules — wrap.
+  See ADR-0002.

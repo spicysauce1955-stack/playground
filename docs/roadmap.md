@@ -160,3 +160,12 @@ Slice 5b (queued):
   details where applicable.
 - Promote `plan` to a subapp (`plan render`, `plan show <run-id>`,
   `plan diff`) once operation runs land.
+
+## Backlog (acknowledged, not sequenced)
+
+Items confirmed as real product needs but explicitly not urgent —
+captured here so they aren't lost.
+
+- `TargetSelector.network` field — requirements §5.9 calls for
+  selectors keyed on **network** in addition to name / role / tag.
+  Today's `TargetSelector` has `role / vm / tag / any` only.
