@@ -158,7 +158,9 @@ change when execution lands.
 
 - Generated platform data must live under `.playground/`.
 - `.playground/` must be Git-ignored by default.
-- Every meaningful operation must create an operation run record.
+- Every mutating operation must create an operation run record.
+  Read-only inspection commands (`validate`, `lab list`, `lab show`,
+  `plan`, and similar) do not create runs.
 - Long-running operations must emit structured lifecycle events while they run.
 - CLI, TUI, logs, status views, and future UI updates must consume the same operation event stream.
 - Logs must be structured by:
