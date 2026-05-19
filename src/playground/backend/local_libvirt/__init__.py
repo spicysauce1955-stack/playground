@@ -6,10 +6,22 @@ Future slices will add plan/apply/destroy wrappers that consume the same
 model.
 """
 
+from playground.backend.local_libvirt.apply import (
+    run_ansible_playbook,
+    run_tofu_apply,
+    tail_log,
+)
 from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
 from playground.backend.local_libvirt.tfvars import render_tfvars
 
-__all__ = ["fetch_vm_ips", "render_inventory", "render_tfvars"]
+__all__ = [
+    "fetch_vm_ips",
+    "render_inventory",
+    "render_tfvars",
+    "run_ansible_playbook",
+    "run_tofu_apply",
+    "tail_log",
+]

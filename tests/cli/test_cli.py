@@ -25,6 +25,43 @@ def _write_fake_tofu(tmp_path: Path, payload: str) -> Path:
     return bin_dir
 
 
+def _write_apply_shims(
+    tmp_path: Path,
+    *,
+    tofu_apply_exit: int = 0,
+    ansible_exit: int = 0,
+    vm_ips_payload: str | None = None,
+) -> Path:
+    """Write tofu + ansible-playbook shims that handle both apply and output.
+
+    `tofu apply ...` exits with ``tofu_apply_exit``; `tofu output -json`
+    returns ``vm_ips_payload``. ansible-playbook exits with ``ansible_exit``.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    default_ips = (
+        '{"vm_ips": {"sensitive": false, "type": ["map","string"], '
+        '"value": {"node1":"10.0.10.42","docker1":"10.0.10.43","router1":"10.0.10.44"}}}'
+    )
+    payload = vm_ips_payload if vm_ips_payload is not None else default_ips
+    tofu = bin_dir / "tofu"
+    tofu.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f"  apply) echo 'tofu apply ok'; exit {tofu_apply_exit} ;;\n"
+        f"  output) cat <<'PAYLOAD'\n{payload}\nPAYLOAD\n   ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    ansible = bin_dir / "ansible-playbook"
+    ansible.write_text(
+        f"#!/usr/bin/env bash\necho ansible ran\nexit {ansible_exit}\n"
+    )
+    ansible.chmod(ansible.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
+
+
 def test_validate_committed_config_succeeds() -> None:
     result = CliRunner().invoke(app, ["validate", "--config-dir", str(CONFIG_DIR)])
 
@@ -147,6 +184,168 @@ def test_inventory_render_reports_missing_tofu(
     assert result.exit_code == 1
     assert "config.inventory.tofu_binary_missing" in result.stderr
     assert not (tmp_path / "out.ini").exists()
+
+
+def test_apply_happy_path_writes_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    # The CLI shells out to `tofu` and `ansible-playbook` — both are
+    # PATH-shimmed above. State lives entirely under tmp_path/.playground/.
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("- name: stub\n  hosts: playground\n")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--ansible-dir",
+            str(ansible_dir),
+            "--state-dir",
+            str(state_dir),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "succeeded"
+    assert payload["operation"] == "apply"
+    assert payload["lab"] == "generic-infra"
+    assert [s["name"] for s in payload["steps"]] == ["tofu-apply", "ansible-playbook"]
+    assert all(s["exit_code"] == 0 for s in payload["steps"])
+    # Run record on disk matches the printed payload.
+    run_dir = state_dir / "runs" / payload["run_id"]
+    on_disk = json.loads((run_dir / "run.json").read_text())
+    assert on_disk == payload
+    # Tofu vars + inventory written to standard locations.
+    assert (state_dir / "state" / "tofu" / "generic-infra.tfvars.json").exists()
+    assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
+
+
+def test_apply_tofu_failure_leaves_failed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path, tofu_apply_exit=2)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--ansible-dir",
+            str(ansible_dir),
+            "--state-dir",
+            str(state_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "apply failed" in result.stderr
+    assert "tofu apply ok" in result.stderr  # tail of failing log was dumped
+    # Exactly one run record exists, marked failed, with only tofu in steps.
+    runs = list((state_dir / "runs").iterdir())
+    assert len(runs) == 1
+    record = json.loads((runs[0] / "run.json").read_text())
+    assert record["status"] == "failed"
+    assert [s["name"] for s in record["steps"]] == ["tofu-apply"]
+    assert record["steps"][0]["exit_code"] == 2
+
+
+def test_apply_ansible_failure_after_tofu_success_records_partial_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The operationally-dangerous path: tofu succeeded so VMs are alive,
+    # but ansible failed so they're unconfigured. The run summary must
+    # tell the operator what state they're in.
+    bin_dir = _write_apply_shims(tmp_path, tofu_apply_exit=0, ansible_exit=2)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--ansible-dir",
+            str(ansible_dir),
+            "--state-dir",
+            str(state_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    runs = list((state_dir / "runs").iterdir())
+    assert len(runs) == 1
+    record = json.loads((runs[0] / "run.json").read_text())
+    assert record["status"] == "failed"
+    # Both steps recorded; tofu succeeded, ansible failed.
+    assert [s["name"] for s in record["steps"]] == ["tofu-apply", "ansible-playbook"]
+    assert record["steps"][0]["exit_code"] == 0
+    assert record["steps"][1]["exit_code"] == 2
+    # Summary tells the operator the state is partial and what to do.
+    assert "VMs were provisioned" in record["summary"]
+    assert "tofu destroy" in record["summary"]
+    # Inventory + tfvars files both exist on disk (we got past render).
+    assert (state_dir / "state" / "tofu" / "generic-infra.tfvars.json").exists()
+    assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
+
+
+def test_apply_unknown_lab_fails_before_running_tofu(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "ghost-lab",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tmp_path),
+            "--ansible-dir",
+            str(tmp_path),
+            "--state-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.lab.unknown" in result.stderr
+    # No run record should be created — we exit before start_run.
+    assert not (tmp_path / "runs").exists()
 
 
 def test_plan_renders_human_summary() -> None:

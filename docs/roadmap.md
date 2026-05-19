@@ -161,6 +161,41 @@ Slice 5b (queued):
 - Promote `plan` to a subapp (`plan render`, `plan show <run-id>`,
   `plan diff`) once operation runs land.
 
+## 6. Apply / Status / Destroy
+
+Status: in progress (apply done; status and destroy queued).
+
+Slice 6a (done):
+
+- `playground apply <lab>` chains render tfvars → tofu apply →
+  fetch_vm_ips → render inventory → ansible-playbook, wrapped in an
+  operation run record.
+- New module `src/playground/runs/operation.py`: `OperationRun`,
+  `StepResult`, `allocate_run_id`, `start_run`, `finish_run`. Writes
+  `.playground/runs/<id>/run.json` plus captured subprocess logs.
+- New module `src/playground/backend/local_libvirt/apply.py`: thin
+  subprocess wrappers for `tofu apply` and `ansible-playbook` with
+  combined-stream log capture.
+- Failure protocol: any step's nonzero exit (or missing-binary
+  diagnostic) finalizes the run as `failed` with a summary tailored
+  to what state the lab is now in (e.g. "VMs were provisioned but
+  Ansible configuration failed — re-run apply or destroy via tofu").
+- Two new diagnostic IDs: `runtime.apply.tofu_binary_missing`,
+  `runtime.apply.ansible_binary_missing`. New `runtime.*` namespace
+  separates execution-time concerns from config-side `config.*`
+  diagnostics.
+
+Slice 6b (queued):
+
+- `playground destroy <lab>` — invoke `tofu destroy` (and a future
+  ansible teardown if needed); same run-record machinery.
+
+Slice 6c (queued):
+
+- `playground status <lab>` — query tofu state + ansible reachability
+  + docker readiness against an applied lab; surface as a structured
+  status report.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

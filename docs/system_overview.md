@@ -350,6 +350,7 @@ categories:
 | `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
 | `config.discovery.*` | CLI | `not_directory` |
 | `config.lab.*` | CLI | `unknown`, `resolve_failed` |
+| `runtime.apply.*` | backend | `tofu_binary_missing`, `ansible_binary_missing` (execution-time concerns, separate from `config.*`) |
 
 Diagnostic IDs are **stable public contract** — they show up in JSON output
 that downstream tools may grep. Don't rename without a deprecation plan.
@@ -378,13 +379,18 @@ flowchart LR
     s4b --> s5
     s4c --> s5
     s4d --> s5
-    s5 --> s6 --> s7 --> s8 --> s9
+    s5 --> s6a[§6a apply]
+    s6a --> s6b[§6b destroy]
+    s6a --> s6c[§6c status]
+    s6b --> s7
+    s6c --> s7
+    s7 --> s8 --> s9
 
     classDef done fill:#cfc,stroke:#383
     classDef next fill:#ffd,stroke:#cc0
     classDef queued fill:#eee,stroke:#888
-    class s1,s2,s3,s4a,s4b,s4c,s4d,s5 done
-    class s6 next
+    class s1,s2,s3,s4a,s4b,s4c,s4d,s5,s6a done
+    class s6b,s6c next
     class s7,s8,s9 queued
 ```
 
