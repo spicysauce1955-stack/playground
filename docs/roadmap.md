@@ -163,7 +163,7 @@ Slice 5b (queued):
 
 ## 6. Apply / Status / Destroy
 
-Status: in progress (apply + destroy done; status queued).
+Status: done.
 
 Slice 6a (done):
 
@@ -196,11 +196,20 @@ Slice 6b (done):
   sees the same `var.vm_names` as the apply did, so destroy
   targets the right resources.
 
-Slice 6c (queued):
+Slice 6c (done):
 
-- `playground status <lab>` — query tofu state + ansible reachability
-  + docker readiness against an applied lab; surface as a structured
-  status report.
+- `playground status <lab>` — read-only snapshot. Pairs
+  `ResolvedLab.vms` with `tofu output -json` to report
+  `provisioned` / `missing` per VM. No run record (read-only per
+  §5.10). Ansible reachability + docker readiness are reserved as
+  states (`running` / `failed` / `degraded` in `VmState`) and land
+  alongside §8 (Docker workloads).
+- New backend-neutral model `playground.models.status` (`LabStatus`,
+  `VmStatus`). Adapter `playground.backend.local_libvirt.status`
+  composes `fetch_vm_ips` with the model and treats `tofu_no_state`
+  as the steady "nothing applied yet" status rather than an error.
+- `TOFU_NO_STATE_DIAGNOSTIC_ID` exported from `inventory.py` so the
+  status adapter doesn't depend on a magic string.
 
 ## Backlog (acknowledged, not sequenced)
 

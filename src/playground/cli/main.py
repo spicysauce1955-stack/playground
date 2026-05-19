@@ -11,6 +11,7 @@ import typer
 
 from playground.backend.local_libvirt import (
     fetch_vm_ips,
+    query_status,
     render_inventory,
     render_tfvars,
     run_ansible_playbook,
@@ -22,6 +23,7 @@ from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
+from playground.models.status import LabStatus
 from playground.planner import Plan, PlanAction, render_plan
 from playground.runs import OperationRun, StepResult, finish_run, start_run
 from playground.validation import validate as validate_loaded_config
@@ -497,6 +499,58 @@ def apply_command(
     typer.echo(f"  record: {run_dir / 'run.json'}")
     for step in finished.steps:
         typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
+
+
+@app.command("status")
+def status_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to inspect.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format."),
+    ] = OutputFormat.human,
+) -> None:
+    """Show observed state of ``lab`` (read-only)."""
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    status, query_diagnostics = query_status(resolved, tofu_dir)
+    _exit_on_errors(query_diagnostics, output, json_errors=False)
+
+    if output is OutputFormat.json:
+        _print_json(status.model_dump(mode="json", exclude_none=True))
+        return
+
+    _render_status_human(status)
+
+
+def _render_status_human(status: LabStatus) -> None:
+    typer.echo(f"Lab {status.lab!r} on {status.backend}")
+    typer.echo(
+        f"  {status.provisioned_vms} of {status.expected_vms} VMs provisioned"
+    )
+    typer.echo("")
+    for vm in status.vms:
+        marker = "+" if vm.state == "provisioned" else "-"
+        ip = vm.ip or "—"
+        typer.echo(f"  {marker} {vm.name}  role={vm.role}  ip={ip}")
+    if status.unknown_vms:
+        typer.echo("")
+        typer.echo(
+            f"  unknown VMs in observed state (not in lab): "
+            f"{', '.join(status.unknown_vms)}"
+        )
 
 
 @app.command("destroy")

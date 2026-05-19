@@ -31,6 +31,12 @@ from pathlib import Path
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 
+# Public diagnostic id constants. Importing modules (e.g.
+# backend/local_libvirt/status.py) special-case `TOFU_NO_STATE` as
+# "nothing has been applied yet" — fine for status queries, an error
+# for inventory rendering.
+TOFU_NO_STATE_DIAGNOSTIC_ID = "config.inventory.tofu_no_state"
+
 
 def fetch_vm_ips(
     tofu_dir: Path,
@@ -112,7 +118,7 @@ def fetch_vm_ips(
     if not isinstance(data, dict) or "vm_ips" not in data:
         return {}, [
             Diagnostic(
-                id="config.inventory.tofu_no_state",
+                id=TOFU_NO_STATE_DIAGNOSTIC_ID,
                 severity="error",
                 message=(
                     "`tofu output -json` returned no `vm_ips` — has the lab "
@@ -246,4 +252,8 @@ def _role_group(role: str) -> str:
     return role.replace("-", "_")
 
 
-__all__ = ["fetch_vm_ips", "render_inventory"]
+__all__ = [
+    "TOFU_NO_STATE_DIAGNOSTIC_ID",
+    "fetch_vm_ips",
+    "render_inventory",
+]

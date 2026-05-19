@@ -328,6 +328,102 @@ def test_apply_ansible_failure_after_tofu_success_records_partial_state(
     assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
 
 
+def test_status_reports_all_vms_provisioned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "status",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["lab"] == "generic-infra"
+    assert payload["expected_vms"] == 3
+    assert payload["provisioned_vms"] == 3
+    assert {v["state"] for v in payload["vms"]} == {"provisioned"}
+
+
+def test_status_human_output_lists_each_vm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(
+        tmp_path,
+        vm_ips_payload='{"vm_ips": {"value": {"docker1": "10.0.10.43"}}}',
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "status",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "1 of 3 VMs provisioned" in result.stdout
+    assert "+ docker1" in result.stdout  # provisioned VM
+    assert "- node1" in result.stdout    # missing
+    assert "- router1" in result.stdout  # missing
+
+
+def test_status_does_not_create_a_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # status is read-only — per requirements §5.10 it must not leave a
+    # run record on disk.
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    state_dir = tmp_path / ".playground"
+
+    # Even though `status` doesn't have a --state-dir flag, we point
+    # cwd elsewhere so .playground/ wouldn't be in our repo. Invoke
+    # via isolated filesystem to be safe.
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+        result = runner.invoke(
+            app,
+            [
+                "status",
+                "generic-infra",
+                "--config-dir",
+                str(CONFIG_DIR),
+                "--tofu-dir",
+                str(tofu_dir),
+            ],
+        )
+        assert result.exit_code == 0
+        assert not (Path(cwd) / ".playground" / "runs").exists()
+    # Belt-and-braces: explicit state_dir we passed also has no runs.
+    assert not (state_dir / "runs").exists()
+
+
 def test_destroy_happy_path_writes_run_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

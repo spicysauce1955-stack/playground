@@ -16,10 +16,12 @@ from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
+from playground.backend.local_libvirt.status import query_status
 from playground.backend.local_libvirt.tfvars import render_tfvars
 
 __all__ = [
     "fetch_vm_ips",
+    "query_status",
     "render_inventory",
     "render_tfvars",
     "run_ansible_playbook",
