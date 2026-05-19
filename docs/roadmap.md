@@ -334,16 +334,30 @@ Slice 9a (done):
   test suite can import it; Textual `App.run_test()` Pilot drives
   the two new tests.
 
-Slice 9b (queued): mutating actions
+Slice 9b (done): mutating actions
 
-- `apply` / `destroy` from inside the TUI. Will subscribe to the
-  §7 event bus to stream step progress live rather than dumping
-  log tails. Needs richer per-step events first.
+- ``a`` / ``d`` keybindings run apply / destroy from the TUI through
+  the shared service layer
+  (:func:`playground.backend.local_libvirt.runner.execute_apply` /
+  ``execute_destroy``). A modal confirm guards each mutating action.
+- Each operation runs in a background daemon thread; the
+  :class:`EventBus` ``log_line`` subscriber bridges to the foreground
+  via :meth:`textual.app.App.call_from_thread`, appending to a live
+  log pane bounded at ~1000 lines. The detail pane refreshes when
+  the operation completes so observed status reflects the new VMs.
+- Both the TUI and the CLI go through the same runner, so the
+  failure protocols (run record persisted as ``failed``,
+  ``operation_finished`` event with ``status=failed``) are
+  identical no matter how the operator triggered the work.
 
-Slice 9c (queued): runs viewer
+Slice 9c (done): runs viewer
 
-- Browse historical runs (`playground runs list/show` in TUI form)
-  with the events.jsonl feed rendered as a timeline.
+- ``v`` keybinding opens :class:`RunsScreen` listing recorded runs
+  (newest first), rendering id / operation / status / start / end
+  per row. Selecting one opens :class:`RunDetailScreen` which
+  renders the persisted run record plus the full ``events.jsonl``
+  timeline (one line per event, ``log_line`` events show
+  ``step: line``).
 
 ## Backlog (acknowledged, not sequenced)
 

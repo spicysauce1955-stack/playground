@@ -322,7 +322,7 @@ def test_apply_ansible_failure_after_tofu_success_records_partial_state(
     assert record["steps"][1]["exit_code"] == 2
     # Summary tells the operator the state is partial and what to do.
     assert "VMs were provisioned" in record["summary"]
-    assert "tofu destroy" in record["summary"]
+    assert "tear down via destroy" in record["summary"]
     # Inventory + tfvars files both exist on disk (we got past render).
     assert (state_dir / "state" / "tofu" / "generic-infra.tfvars.json").exists()
     assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()

@@ -10,29 +10,22 @@ from typing import Annotated, NoReturn
 import typer
 
 from playground.backend.local_libvirt import (
+    execute_apply,
+    execute_destroy,
     fetch_vm_ips,
     query_status,
     render_inventory,
     render_tfvars,
-    run_ansible_playbook,
-    run_tofu_apply,
-    run_tofu_destroy,
     tail_log,
 )
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
-from playground.events import EventBus, JsonlWriter
+from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
-from playground.planner import (
-    Plan,
-    PlanAction,
-    render_plan,
-    schedule_workloads,
-    stage_workload_files,
-)
-from playground.runs import OperationRun, StepResult, finish_run, start_run
+from playground.planner import Plan, PlanAction, render_plan
+from playground.runs import OperationRun
 from playground.validation import validate as validate_loaded_config
 
 
@@ -261,8 +254,16 @@ def tui_command(
         Path,
         typer.Option("--tofu-dir", help="OpenTofu working directory."),
     ] = Path("tofu"),
+    ansible_dir: Annotated[
+        Path,
+        typer.Option("--ansible-dir", help="Ansible directory (containing site.yml)."),
+    ] = Path("ansible"),
+    state_dir: Annotated[
+        Path,
+        typer.Option("--state-dir", help="Generated state root."),
+    ] = Path(".playground"),
 ) -> None:
-    """Launch the read-only operator TUI (requires the ``[tui]`` extra)."""
+    """Launch the operator TUI (requires the ``[tui]`` extra)."""
     try:
         from playground.tui import run_app
     except ImportError as exc:
@@ -277,7 +278,12 @@ def tui_command(
             OutputFormat.human,
             json_errors=False,
         )
-    run_app(config_dir=config_dir, tofu_dir=tofu_dir)
+    run_app(
+        config_dir=config_dir,
+        tofu_dir=tofu_dir,
+        ansible_dir=ansible_dir,
+        state_dir=state_dir,
+    )
 
 
 @app.command("plan")
@@ -444,131 +450,27 @@ def apply_command(
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
 
-    # Pre-flight: scheduling + workload staging are pure-config decisions
-    # that must succeed before tofu apply provisions anything. Failing
-    # here means no VMs are touched and no run record is created.
-    scheduled, schedule_diagnostics = schedule_workloads(resolved)
-    _exit_on_errors(schedule_diagnostics, output, json_errors=False)
-
-    workload_stage_dir = state_dir / "state" / "workloads" / lab
-    if workload_stage_dir.exists():
-        # Drop any previous slugged files so a removed compose workload
-        # doesn't keep getting copied to the target.
-        import shutil as _shutil  # local import: cheap, scope-limited
-        _shutil.rmtree(workload_stage_dir)
-    staged_workloads, stage_diagnostics = stage_workload_files(
-        scheduled,
-        source_base=config_dir.parent.resolve(),
-        stage_dir=workload_stage_dir,
-    )
-    _exit_on_errors(stage_diagnostics, output, json_errors=False)
-
-    runs_dir = state_dir / "runs"
-    run, run_dir = start_run(runs_dir, "apply", lab)
-    logs_dir = run_dir / "logs"
-
+    # JsonlWriter is attached inside execute_apply as soon as start_run
+    # creates the run directory. The CLI only needs an empty bus.
     bus = EventBus()
-    bus.subscribe(JsonlWriter(run_dir))
-    bus.publish(run.run_id, "operation_started", {"operation": "apply", "lab": lab})
 
-    tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
-    inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
-
-    steps: list[StepResult] = []
-
-    # 1. Render tofu vars
-    tfvars_path.parent.mkdir(parents=True, exist_ok=True)
-    tfvars = render_tfvars(resolved)
-    tfvars_path.write_text(json.dumps(tfvars, indent=2, sort_keys=True) + "\n")
-
-    # 2. tofu apply
-    bus.publish(run.run_id, "step_started", {"step": "tofu-apply"})
-    tofu_step, tofu_diagnostics = run_tofu_apply(
-        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-apply.log",
-        bus=bus, run_id=run.run_id,
+    finished, diagnostics = execute_apply(
+        resolved=resolved,
+        state_dir=state_dir,
+        tofu_dir=tofu_dir,
+        ansible_dir=ansible_dir,
+        config_dir=config_dir,
+        bus=bus,
     )
-    steps.append(tofu_step)
-    bus.publish(
-        run.run_id, "step_finished",
-        {"step": "tofu-apply", "exit_code": tofu_step.exit_code},
-    )
-    if tofu_diagnostics or tofu_step.exit_code != 0:
-        _fail_apply(
-            output, run, run_dir, steps,
-            diagnostics=tofu_diagnostics,
-            summary="tofu apply failed; no VMs provisioned",
-            log_path=tofu_step.log_path,
-            bus=bus,
-        )
 
-    # 3. Fetch vm_ips & render inventory.
-    # If anything from here on fails, tofu has already provisioned VMs —
-    # the summary tells the operator the state is partial.
-    vm_ips, fetch_ip_diagnostics = fetch_vm_ips(tofu_dir)
-    if fetch_ip_diagnostics:
-        _fail_apply(
-            output, run, run_dir, steps,
-            diagnostics=fetch_ip_diagnostics,
-            summary=(
-                "tofu apply succeeded but reading state failed; VMs are alive. "
-                "Investigate, then re-run `playground apply` or tear down via "
-                "`cd tofu && tofu destroy`."
-            ),
-            log_path=None,
-            bus=bus,
-        )
+    if finished is None:
+        # Pre-flight rejected the apply; no run record created.
+        _exit_on_errors(diagnostics, output, json_errors=False)
+        return
 
-    inventory_body, render_diagnostics = render_inventory(
-        resolved, vm_ips, staged_workloads=staged_workloads,
-    )
-    if render_diagnostics:
-        _fail_apply(
-            output, run, run_dir, steps,
-            diagnostics=render_diagnostics,
-            summary=(
-                "tofu apply succeeded but inventory render failed; VMs are "
-                "alive. Investigate, then re-run `playground apply` or "
-                "tear down via `cd tofu && tofu destroy`."
-            ),
-            log_path=None,
-            bus=bus,
-        )
-    inventory_path.parent.mkdir(parents=True, exist_ok=True)
-    inventory_path.write_text(inventory_body)
-
-    # 4. ansible-playbook
-    bus.publish(run.run_id, "step_started", {"step": "ansible-playbook"})
-    ansible_step, ansible_diagnostics = run_ansible_playbook(
-        ansible_dir / "site.yml",
-        inventory_path.resolve(),
-        logs_dir / "ansible.log",
-        cwd=ansible_dir.parent.resolve(),
-        bus=bus, run_id=run.run_id,
-    )
-    steps.append(ansible_step)
-    bus.publish(
-        run.run_id, "step_finished",
-        {"step": "ansible-playbook", "exit_code": ansible_step.exit_code},
-    )
-    if ansible_diagnostics or ansible_step.exit_code != 0:
-        _fail_apply(
-            output, run, run_dir, steps,
-            diagnostics=ansible_diagnostics,
-            summary=(
-                "VMs were provisioned but Ansible configuration failed. "
-                "Ansible roles are idempotent: re-run `playground apply` "
-                "after fixing the failure, or tear down via "
-                "`cd tofu && tofu destroy`."
-            ),
-            log_path=ansible_step.log_path,
-            bus=bus,
-        )
-
-    finished = finish_run(
-        run, run_dir, status="succeeded", steps=steps,
-        summary=f"applied lab {lab!r} ({len(resolved.vms)} VMs)",
-    )
-    bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
+    if finished.status == "failed":
+        _present_apply_failure(output, finished, diagnostics, state_dir)
+        raise typer.Exit(code=1)
 
     if output is OutputFormat.json:
         _print_json(finished.model_dump(mode="json", exclude_none=True))
@@ -576,7 +478,7 @@ def apply_command(
 
     typer.echo(f"applied lab {lab!r}")
     typer.echo(f"  run: {finished.run_id}")
-    typer.echo(f"  record: {run_dir / 'run.json'}")
+    typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
     for step in finished.steps:
         typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
 
@@ -781,49 +683,17 @@ def destroy_command(
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
 
-    runs_dir = state_dir / "runs"
-    run, run_dir = start_run(runs_dir, "destroy", lab)
-    logs_dir = run_dir / "logs"
-
     bus = EventBus()
-    bus.subscribe(JsonlWriter(run_dir))
-    bus.publish(run.run_id, "operation_started", {"operation": "destroy", "lab": lab})
-
-    # Re-render the tfvars so tofu destroy sees the same var.vm_names
-    # apply did — symmetric, deterministic, doesn't rely on stale state.
-    tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
-    tfvars_path.parent.mkdir(parents=True, exist_ok=True)
-    tfvars = render_tfvars(resolved)
-    tfvars_path.write_text(json.dumps(tfvars, indent=2, sort_keys=True) + "\n")
-
-    steps: list[StepResult] = []
-    bus.publish(run.run_id, "step_started", {"step": "tofu-destroy"})
-    tofu_step, tofu_diagnostics = run_tofu_destroy(
-        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log",
-        bus=bus, run_id=run.run_id,
+    finished, diagnostics = execute_destroy(
+        resolved=resolved,
+        state_dir=state_dir,
+        tofu_dir=tofu_dir,
+        bus=bus,
     )
-    steps.append(tofu_step)
-    bus.publish(
-        run.run_id, "step_finished",
-        {"step": "tofu-destroy", "exit_code": tofu_step.exit_code},
-    )
-    if tofu_diagnostics or tofu_step.exit_code != 0:
-        _fail_apply(
-            output, run, run_dir, steps,
-            diagnostics=tofu_diagnostics,
-            summary=(
-                "tofu destroy failed; some resources may remain. Inspect "
-                "tofu state with `cd tofu && tofu state list` and retry."
-            ),
-            log_path=tofu_step.log_path,
-            bus=bus,
-        )
 
-    finished = finish_run(
-        run, run_dir, status="succeeded", steps=steps,
-        summary=f"destroyed lab {lab!r}",
-    )
-    bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
+    if finished.status == "failed":
+        _present_apply_failure(output, finished, diagnostics, state_dir)
+        raise typer.Exit(code=1)
 
     if output is OutputFormat.json:
         _print_json(finished.model_dump(mode="json", exclude_none=True))
@@ -831,40 +701,39 @@ def destroy_command(
 
     typer.echo(f"destroyed lab {lab!r}")
     typer.echo(f"  run: {finished.run_id}")
-    typer.echo(f"  record: {run_dir / 'run.json'}")
+    typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
 
 
-def _fail_apply(
+def _present_apply_failure(
     output: OutputFormat,
     run: OperationRun,
-    run_dir: Path,
-    steps: list[StepResult],
-    *,
     diagnostics: list[Diagnostic],
-    summary: str,
-    log_path: str | None,
-    bus: EventBus | None = None,
-) -> NoReturn:
-    """Finalize ``run`` as failed, print diagnostics + log tail, exit nonzero.
+    state_dir: Path,
+) -> None:
+    """Print diagnostics + tail of the failing step's log to stderr.
 
-    Single-call failure protocol: this is the only path that finalizes a
-    failed run record, so the "running" state can't survive on disk.
-    Also publishes ``operation_finished`` (status=failed) so any
-    subscribed event log gets the final marker before we exit.
+    The runner already persisted the failed run record and published
+    ``operation_finished`` (status=failed). This helper only handles
+    CLI presentation — the TUI uses a different presentation path.
     """
-    finish_run(run, run_dir, status="failed", steps=steps, summary=summary)
-    if bus is not None:
-        bus.publish(run.run_id, "operation_finished", {"status": "failed"})
+    run_dir = state_dir / "runs" / run.run_id
     if diagnostics:
         _print_diagnostics(diagnostics, err=True)
-    if log_path:
-        tail = tail_log(Path(log_path))
+    # Find the last failed step and dump the tail of its log.
+    failing = next(
+        (s for s in reversed(run.steps) if s.exit_code != 0), None
+    )
+    if failing is not None:
+        tail = tail_log(Path(failing.log_path))
         if tail:
-            typer.echo(f"--- tail of {log_path} ---", err=True)
+            typer.echo(f"--- tail of {failing.log_path} ---", err=True)
             typer.echo(tail, err=True)
-    typer.echo(summary, err=True)
-    typer.echo(f"{run.operation} failed; run record at {run_dir / 'run.json'}", err=True)
-    raise typer.Exit(code=1)
+    if run.summary:
+        typer.echo(run.summary, err=True)
+    typer.echo(
+        f"{run.operation} failed; run record at {run_dir / 'run.json'}",
+        err=True,
+    )
 
 
 def _resolve_lab_or_exit(

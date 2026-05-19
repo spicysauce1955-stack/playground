@@ -390,6 +390,9 @@ flowchart LR
     classDef next fill:#ffd,stroke:#cc0
     classDef queued fill:#eee,stroke:#888
     class s1,s2,s3,s4a,s4b,s4c,s4d,s5,s6a,s6b,s6c,s7,s8,s9 done
+
+    %% (Full slice ledger lives in docs/roadmap.md; this diagram tracks
+    %% the high-level phase status only.)
 ```
 
 Done is green; the two immediate follow-ups inside §4 are yellow. Everything
