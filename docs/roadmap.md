@@ -169,3 +169,8 @@ captured here so they aren't lost.
 - `TargetSelector.network` field — requirements §5.9 calls for
   selectors keyed on **network** in addition to name / role / tag.
   Today's `TargetSelector` has `role / vm / tag / any` only.
+- Lab-scoped DNS — Story 5.2 / §5.6 require DNS names scoped per
+  lab. Today `tofu/main.tf` hardcodes `domain = "playground.local"`
+  and the schema has no per-lab `dns_domain`. Worth landing
+  alongside the §6 apply slice so DNS shows up correctly the first
+  time real VMs come up.
