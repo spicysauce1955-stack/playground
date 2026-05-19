@@ -13,6 +13,8 @@ scheduling).
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Any
 
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -89,16 +91,26 @@ def _pick_target_vm(
     )
 
 
-def workload_to_ansible_payload(workload: ResolvedWorkload) -> dict[str, Any]:
+def workload_to_ansible_payload(
+    workload: ResolvedWorkload,
+    *,
+    staged_source: Path | None = None,
+) -> dict[str, Any]:
     """Serialize a workload for the workload_* ansible roles.
 
-    Backend-neutral projection — lives here so future
-    ``workload_compose`` / ``workload_swarm`` slices can reuse it.
-    The ``networks`` field is intentionally **omitted** today because
-    today's `workload_container` role doesn't attach Docker networks
-    (mapping lab-level network names to docker networks is a follow-up).
+    Backend-neutral projection — lives here so the
+    ``workload_container`` / ``workload_compose`` / ``workload_swarm``
+    roles each consume the same shape. For compose/swarm workloads,
+    ``staged_source`` (the absolute path of the file
+    :func:`stage_workload_files` wrote on the controller) is included so
+    the role can ``ansible.builtin.copy`` it to the target VM.
+
+    The lab-level ``networks`` field is intentionally **omitted** today
+    — mapping lab network names to docker networks is a follow-up; the
+    field is preserved on :class:`ResolvedWorkload` so the future slice
+    can wire it in.
     """
-    return {
+    payload: dict[str, Any] = {
         "name": workload.name,
         "type": workload.type,
         "source": workload.source,
@@ -106,6 +118,65 @@ def workload_to_ansible_payload(workload: ResolvedWorkload) -> dict[str, Any]:
         "volumes": list(workload.volumes),
         "environment": dict(workload.environment),
     }
+    if staged_source is not None:
+        payload["staged_source"] = str(staged_source)
+    return payload
 
 
-__all__ = ["schedule_workloads", "workload_to_ansible_payload"]
+def stage_workload_files(
+    scheduled: dict[str, list[ResolvedWorkload]],
+    *,
+    source_base: Path,
+    stage_dir: Path,
+) -> tuple[dict[str, dict[str, Path]], list[Diagnostic]]:
+    """Copy compose/swarm source files into ``stage_dir/<vm>/<workload>.yml``.
+
+    Convention: ``workload.source`` is a path interpreted relative to
+    ``source_base`` (typically the repo root — the directory above
+    ``config/``). ``container`` workloads don't have a file to stage
+    and are skipped silently. Missing source files emit
+    ``config.workload.source_missing``.
+
+    Returns a mapping ``{vm_name: {workload_name: staged_path}}`` so the
+    caller (inventory renderer) can thread staged paths into the
+    Ansible payload for each VM.
+    """
+    diagnostics: list[Diagnostic] = []
+    staged: dict[str, dict[str, Path]] = {vm: {} for vm in scheduled}
+
+    for vm_name, workloads in scheduled.items():
+        for workload in workloads:
+            if workload.type == "container":
+                continue
+            src = (source_base / workload.source).resolve()
+            if not src.is_file():
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.workload.source_missing",
+                        severity="error",
+                        message=(
+                            f"workload {workload.name!r} declares "
+                            f"source {workload.source!r} but the file "
+                            f"does not exist at {src}"
+                        ),
+                        source=SourceLocation(path=str(src)),
+                        suggestion=(
+                            f"create {src} (relative paths are resolved "
+                            f"against {source_base})"
+                        ),
+                    )
+                )
+                continue
+            dest = stage_dir / vm_name / f"{workload.name}{src.suffix}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+            staged[vm_name][workload.name] = dest
+
+    return staged, diagnostics
+
+
+__all__ = [
+    "schedule_workloads",
+    "stage_workload_files",
+    "workload_to_ansible_payload",
+]

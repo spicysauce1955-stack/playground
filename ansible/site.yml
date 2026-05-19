@@ -11,6 +11,14 @@
   become: yes
   gather_facts: no  # facts already gathered by the first play
   roles:
-    # The role's first task ends the host when pg_workloads is empty
-    # (the default-fact is `[]`). No play-level conditional needed.
+    # Each workload_* role ends the host early when no matching
+    # workloads are scheduled, so non-applicable hosts pay only the
+    # task-skip cost.
     - workload_container
+
+- name: Deploy compose workloads
+  hosts: playground
+  become: yes
+  gather_facts: no
+  roles:
+    - workload_compose

@@ -1,0 +1,10 @@
+# Example Compose stack referenced by config/labs/generic-infra.yaml.
+# Deploys a small nginx workload — replace with anything you want to
+# experiment with. Path is resolved by `playground apply` relative to
+# the config tree's parent directory (the repo root).
+services:
+  web:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"

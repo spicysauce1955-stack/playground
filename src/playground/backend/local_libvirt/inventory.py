@@ -159,6 +159,8 @@ def fetch_vm_ips(
 def render_inventory(
     resolved: ResolvedLab,
     vm_ips: dict[str, str],
+    *,
+    staged_workloads: dict[str, dict[str, Path]] | None = None,
 ) -> tuple[str, list[Diagnostic]]:
     """Produce an ``ansible/inventory.ini`` body for ``resolved``.
 
@@ -217,14 +219,21 @@ def render_inventory(
         workloads = schedule.get(vm.name, [])
         if workloads:
             # JSON-encoded list of workload dicts. Ansible reads it via
-            # `pg_workloads | from_json` in the workload_container role.
-            # We shell-escape embedded single quotes (rare in practice
-            # but possible in env values). Inline JSON in a host var is
-            # acceptable for §8a's container-only scope; §8b/§8c will
-            # migrate to file-on-disk staging when compose files need
-            # to ride along.
+            # `pg_workloads | from_json` inside the workload_* roles.
+            # Compose / Swarm workloads carry an additional
+            # `staged_source` field pointing at the controller-side
+            # file copied here by `stage_workload_files`; the role
+            # uses ansible.builtin.copy to push it to the target.
+            # Inline JSON in a host var is fine for the metadata —
+            # file *bodies* never ride along.
+            staged_for_vm = (staged_workloads or {}).get(vm.name, {})
             payload = json.dumps(
-                [workload_to_ansible_payload(wl) for wl in workloads],
+                [
+                    workload_to_ansible_payload(
+                        wl, staged_source=staged_for_vm.get(wl.name)
+                    )
+                    for wl in workloads
+                ],
                 separators=(",", ":"),
             )
             escaped = payload.replace("'", "'\\''")

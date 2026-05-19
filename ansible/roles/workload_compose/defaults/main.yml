@@ -1,0 +1,8 @@
+---
+# Default values for the workload_compose role.
+# pg_workloads is JSON-encoded by `playground inventory render`. Empty
+# list => the first task's filter yields nothing => role is a no-op.
+pg_workloads: '[]'
+# Where compose stacks land on the target VM. Each workload gets a
+# subdirectory so multiple stacks coexist.
+pg_compose_root: /opt/playground/compose

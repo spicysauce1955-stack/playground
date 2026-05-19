@@ -25,7 +25,13 @@ from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
-from playground.planner import Plan, PlanAction, render_plan, schedule_workloads
+from playground.planner import (
+    Plan,
+    PlanAction,
+    render_plan,
+    schedule_workloads,
+    stage_workload_files,
+)
 from playground.runs import OperationRun, StepResult, finish_run, start_run
 from playground.validation import validate as validate_loaded_config
 
@@ -438,11 +444,24 @@ def apply_command(
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
 
-    # Pre-flight: scheduling is a pure-config decision that must succeed
-    # before tofu apply provisions anything. Failing here means no VMs
-    # are touched and no run record is created.
-    _, schedule_diagnostics = schedule_workloads(resolved)
+    # Pre-flight: scheduling + workload staging are pure-config decisions
+    # that must succeed before tofu apply provisions anything. Failing
+    # here means no VMs are touched and no run record is created.
+    scheduled, schedule_diagnostics = schedule_workloads(resolved)
     _exit_on_errors(schedule_diagnostics, output, json_errors=False)
+
+    workload_stage_dir = state_dir / "state" / "workloads" / lab
+    if workload_stage_dir.exists():
+        # Drop any previous slugged files so a removed compose workload
+        # doesn't keep getting copied to the target.
+        import shutil as _shutil  # local import: cheap, scope-limited
+        _shutil.rmtree(workload_stage_dir)
+    staged_workloads, stage_diagnostics = stage_workload_files(
+        scheduled,
+        source_base=config_dir.parent.resolve(),
+        stage_dir=workload_stage_dir,
+    )
+    _exit_on_errors(stage_diagnostics, output, json_errors=False)
 
     runs_dir = state_dir / "runs"
     run, run_dir = start_run(runs_dir, "apply", lab)
@@ -499,7 +518,9 @@ def apply_command(
             bus=bus,
         )
 
-    inventory_body, render_diagnostics = render_inventory(resolved, vm_ips)
+    inventory_body, render_diagnostics = render_inventory(
+        resolved, vm_ips, staged_workloads=staged_workloads,
+    )
     if render_diagnostics:
         _fail_apply(
             output, run, run_dir, steps,

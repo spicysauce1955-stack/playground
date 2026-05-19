@@ -1,0 +1,57 @@
+---
+# Deploy `type: compose` workloads scheduled on this host. The compose
+# file lives on the controller at `item.staged_source`; we copy it to
+# `pg_compose_root/<workload>/docker-compose.yml` on the target and run
+# `docker compose up -d` against it.
+#
+# Idempotent: docker compose v2 reconciles to declared state.
+# Re-running `playground apply` against a converged stack reports no
+# changes from compose itself; the file-copy step changes only when
+# the staged source changes.
+
+- name: Parse pg_workloads JSON payload
+  ansible.builtin.set_fact:
+    pg_workloads_parsed: "{{ pg_workloads | from_json }}"
+  when: pg_workloads is defined
+
+- name: Compute compose workloads only
+  ansible.builtin.set_fact:
+    pg_compose_workloads: >-
+      {{
+        (pg_workloads_parsed | default([]))
+          | selectattr('type', 'equalto', 'compose')
+          | list
+      }}
+
+- name: Skip when no compose workloads scheduled
+  ansible.builtin.meta: end_host
+  when: pg_compose_workloads | length == 0
+
+- name: Ensure per-workload compose directories exist
+  ansible.builtin.file:
+    path: "{{ pg_compose_root }}/{{ item.name }}"
+    state: directory
+    mode: '0755'
+  loop: "{{ pg_compose_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Stage compose files on the target
+  ansible.builtin.copy:
+    src: "{{ item.staged_source }}"
+    dest: "{{ pg_compose_root }}/{{ item.name }}/docker-compose.yml"
+    mode: '0644'
+  loop: "{{ pg_compose_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.staged_source is defined
+
+- name: Deploy compose stacks
+  community.docker.docker_compose_v2:
+    project_src: "{{ pg_compose_root }}/{{ item.name }}"
+    state: present
+    pull: missing
+  loop: "{{ pg_compose_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.staged_source is defined

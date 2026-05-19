@@ -18,6 +18,7 @@ from playground.planner.plan import (
 )
 from playground.planner.scheduling import (
     schedule_workloads,
+    stage_workload_files,
     workload_to_ansible_payload,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "PlanBudget",
     "render_plan",
     "schedule_workloads",
+    "stage_workload_files",
     "workload_to_ansible_payload",
 ]

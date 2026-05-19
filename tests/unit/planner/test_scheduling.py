@@ -8,7 +8,11 @@ import pytest
 
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
-from playground.planner.scheduling import schedule_workloads
+from playground.planner.scheduling import (
+    schedule_workloads,
+    stage_workload_files,
+    workload_to_ansible_payload,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
@@ -154,6 +158,64 @@ def test_schedule_handles_multiple_workloads_on_same_vm(
     assert diagnostics == []
     # Both target_role=docker-host → both land on docker1.
     assert [wl.name for wl in schedule["docker1"]] == [original.name, twin.name]
+
+
+def test_stage_workload_files_copies_compose_source(
+    resolved_generic_infra, tmp_path: Path
+) -> None:
+    # Build a fake compose source under a tmp source_base.
+    source_base = tmp_path / "src"
+    (source_base / "compose").mkdir(parents=True)
+    src = source_base / "compose" / "demo.yaml"
+    src.write_text("services:\n  web:\n    image: nginx:alpine\n")
+
+    scheduled, _ = schedule_workloads(resolved_generic_infra)
+    stage_dir = tmp_path / "stage"
+
+    staged, diagnostics = stage_workload_files(
+        scheduled, source_base=source_base, stage_dir=stage_dir
+    )
+
+    assert diagnostics == []
+    # demo-compose scheduled on docker1 → staged under stage/docker1/
+    docker_staged = staged["docker1"]["demo-compose"]
+    assert docker_staged.exists()
+    assert docker_staged.read_text() == src.read_text()
+    # Non-compose VMs have empty maps.
+    assert staged["node1"] == {}
+    assert staged["router1"] == {}
+
+
+def test_stage_workload_files_reports_missing_source(
+    resolved_generic_infra, tmp_path: Path
+) -> None:
+    scheduled, _ = schedule_workloads(resolved_generic_infra)
+    # source_base exists but has no compose/demo.yaml
+    staged, diagnostics = stage_workload_files(
+        scheduled, source_base=tmp_path, stage_dir=tmp_path / "stage"
+    )
+
+    assert staged["docker1"] == {}
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "config.workload.source_missing"
+
+
+def test_workload_payload_includes_staged_source_when_provided() -> None:
+    # workload_to_ansible_payload is straightforward; test the
+    # staged_source pass-through.
+    class _Wl:  # minimal duck-type
+        name = "x"
+        type = "compose"
+        source = "./compose/x.yaml"
+        ports: list[str] = []
+        volumes: list[str] = []
+        environment: dict[str, str] = {}
+
+    payload = workload_to_ansible_payload(_Wl(), staged_source=Path("/abs/x.yaml"))
+    assert payload["staged_source"] == "/abs/x.yaml"
+
+    bare = workload_to_ansible_payload(_Wl())
+    assert "staged_source" not in bare
 
 
 def test_schedule_emits_no_target_diagnostic_when_no_vm_matches(
