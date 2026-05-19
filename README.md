@@ -106,12 +106,34 @@ docs/              Product, architecture, config, roadmap docs
 
 ## Status
 
-- Roadmap §1 Baseline Cleanup — done
-- Roadmap §2 Read-Only CLI — done
-- Roadmap §3 Validation Hardening — done
-- Roadmap §4 OpenTofu/Ansible Bridge — **next**
+All nine roadmap phases have shipped a first slice:
 
-See [`docs/roadmap.md`](docs/roadmap.md) for full sequencing.
+- §1 Baseline Cleanup — done
+- §2 Read-Only CLI — done
+- §3 Validation Hardening — done
+- §4 OpenTofu/Ansible Bridge — done (tfvars + inventory + name-keyed pairing + per-role groups)
+- §5 Plan Rendering — done (state-observation slice queued)
+- §6 Apply / Status / Destroy — done
+- §7 Operation Runs + Events — done (live `log_line` streaming + JSONL log)
+- §8 Docker Workloads — done (container + compose + swarm)
+- §9 TUI — done (read-only + mutating actions + runs viewer)
+
+See [`docs/roadmap.md`](docs/roadmap.md) for the slice-by-slice ledger and
+the queued follow-ups (lab-network → docker-network mapping, retention
+enforcement, runtime overrides, lab-scoped DNS, etc.).
+
+## End-to-end operator workflow
+
+```bash
+playground validate                              # cross-reference check
+playground plan generic-infra                    # preview what apply would do
+playground apply generic-infra                   # tofu + ansible + record run
+playground status generic-infra                  # what's provisioned now
+playground runs list                             # browse past operations
+playground runs show <run-id>                    # inspect events.jsonl timeline
+playground destroy generic-infra                 # tear down
+playground tui                                   # Textual UI over everything above
+```
 
 ## License
 

@@ -74,18 +74,53 @@ flowchart TD
     discovery[config/discovery.py<br/>directory walk]
     kinds[models/kinds.py<br/>typed on-disk kinds]
     resolved[models/resolved.py<br/>ResolvedLab + sub-models]
+    status_model[models/status.py<br/>LabStatus, VmStatus]
     diag[models/diagnostic.py<br/>Diagnostic, Severity]
     base[models/base.py<br/>StrictModel, ResourceEnvelope]
     inventory[backend/local_libvirt/inventory.py<br/>render + fetch_vm_ips]
+    tfvars[backend/local_libvirt/tfvars.py<br/>render_tfvars]
+    apply_adapter[backend/local_libvirt/apply.py<br/>subprocess + streaming]
+    runner[backend/local_libvirt/runner.py<br/>execute_apply / destroy]
+    backend_status[backend/local_libvirt/status.py<br/>query_status]
+    planner[planner/<br/>plan + scheduling + staging]
+    events[events/<br/>EventBus + JsonlWriter]
+    runs[runs/<br/>OperationRun + start/finish]
+    tui[tui/<br/>Textual app + screens]
 
     cli --> validator
     cli --> resolver
-    cli --> loader
+    cli --> runner
+    cli --> planner
     cli --> inventory
-    cli --> diag
+    cli --> backend_status
+    cli --> tfvars
+    cli --> events
+    cli --> runs
+    cli --> tui
+    tui --> runner
+    tui --> planner
+    tui --> resolver
+    tui --> backend_status
+    tui --> events
+    tui --> runs
+
+    runner --> apply_adapter
+    runner --> inventory
+    runner --> tfvars
+    runner --> planner
+    runner --> events
+    runner --> runs
+
+    apply_adapter --> events
+    apply_adapter --> runs
+
+    backend_status --> inventory
+    backend_status --> status_model
 
     inventory --> resolved
     inventory --> diag
+    inventory --> planner
+    tfvars --> resolved
 
     validator --> loader
     validator --> kinds
@@ -99,17 +134,23 @@ flowchart TD
     loader --> kinds
     loader --> diag
 
+    planner --> resolved
+    planner --> diag
+
+    events --> base
+    runs --> base
     kinds --> base
     resolved --> kinds
     resolved --> base
+    status_model --> base
     diag --> base
 
     classDef tip fill:#ffd,stroke:#cc0
     classDef mid fill:#dfd,stroke:#585
     classDef foundation fill:#eef,stroke:#558
-    class cli,inventory tip
-    class validator,resolver,loader,discovery mid
-    class kinds,resolved,diag,base foundation
+    class cli,tui tip
+    class runner,apply_adapter,inventory,tfvars,backend_status,planner,events,runs,validator,resolver,loader,discovery mid
+    class kinds,resolved,status_model,diag,base foundation
 ```
 
 The graph is **strictly bottom-up** — arrows always point from higher layers to
@@ -119,8 +160,11 @@ from `config/`, nothing in `config/` may import from `validation/` or
 discipline — it keeps `ResolvedLab` consumable by any future adapter without
 circular imports.
 
-Placeholder modules under `src/playground/{events,logging,runs,state}/` are
-not on the graph — they're empty reservations for upcoming roadmap items.
+All the modules that started as placeholder reservations
+(`events/`, `runs/`, plus `tui/`) are now implemented and on the
+graph. `logging/` and `state/` remain reservations — they'll grow
+when the structured-log subscriber and `.playground/state/` store
+get richer than the current `JsonlWriter` + filesystem layout.
 
 ---
 
@@ -347,17 +391,76 @@ categories:
 | `config.budget.*` | validator | `exceeded` |
 | `config.artifact.*` | validator | `offline_missing` |
 | `config.backend.*` | validator | `per_vm_resources_unsupported` |
+| `config.backend.*` | validator | `per_vm_resources_unsupported` |
 | `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
 | `config.discovery.*` | CLI | `not_directory` |
 | `config.lab.*` | CLI | `unknown`, `resolve_failed` |
-| `runtime.apply.*` | backend | `tofu_binary_missing`, `ansible_binary_missing` (execution-time concerns, separate from `config.*`) |
+| `config.runs.*` | CLI | `unknown` |
+| `config.tofu.*` | (retired — moved to `config.backend.*`) | — |
+| `config.workload.*` | planner | `no_target`, `source_missing`, `swarm_needs_docker_host` |
+| `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing` |
+| `runtime.tui.*` | CLI | `missing_dependency` |
 
 Diagnostic IDs are **stable public contract** — they show up in JSON output
 that downstream tools may grep. Don't rename without a deprecation plan.
 
 ---
 
-## 7. Roadmap state on this map
+## 7. Operation lifecycle — `playground apply` end-to-end
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as cli/main.py
+    participant Runner as backend/runner.execute_apply
+    participant Planner as planner/scheduling
+    participant Renderer as backend/inventory + tfvars
+    participant Tofu as tofu (subprocess)
+    participant Ansible as ansible-playbook (subprocess)
+    participant Bus as events.EventBus
+    participant FS as .playground/runs/id/
+
+    User->>CLI: playground apply lab
+    CLI->>Runner: execute_apply(resolved, bus, ...)
+    Runner->>Planner: schedule_workloads + stage_workload_files
+    Note over Runner: Pre-flight: no run record yet
+    Runner->>FS: start_run() creates run.json (status=running)
+    Runner->>Bus: subscribe JsonlWriter(run_dir)
+    Runner->>Bus: operation_started
+    Runner->>Renderer: render_tfvars
+    Runner->>Tofu: tofu apply -auto-approve -var-file=...
+    Tofu-->>Bus: log_line events per stdout line
+    Bus-->>FS: events.jsonl + tofu-apply.log
+    Tofu-->>Runner: exit code
+    Runner->>Bus: step_finished
+    Runner->>Renderer: fetch_vm_ips + render_inventory
+    Runner->>Ansible: ansible-playbook -i ... site.yml
+    Ansible-->>Bus: log_line events per stdout line
+    Bus-->>FS: events.jsonl + ansible.log
+    Ansible-->>Runner: exit code
+    Runner->>FS: finish_run(status=succeeded|failed)
+    Runner->>Bus: operation_finished
+    Runner-->>CLI: OperationRun + diagnostics
+    CLI-->>User: human/JSON output, exit 0/1
+```
+
+Three things to notice:
+
+- **The runner never raises.** Failures finalize the run as `failed`
+  (the run record on disk has the final state) and return diagnostics.
+  Both the CLI and the TUI consume this same shape — the CLI prints
+  diagnostics + log tail and exits 1; the TUI updates the live pane
+  and re-renders the detail view.
+- **The bus is the single observation channel.** `JsonlWriter` lives
+  inside `events.jsonl`; the TUI subscribes a Textual bridge that calls
+  `App.call_from_thread()` to render log lines live. External
+  subscribers (websocket bridges, status caches) plug in identically.
+- **Pre-flight before infrastructure mutation.** Scheduling +
+  workload-file staging run **before** `start_run`. A missing compose
+  source or no-target workload aborts before any VM is touched and no
+  run record is created.
+
+## 8. Roadmap state on this map
 
 ```mermaid
 flowchart LR

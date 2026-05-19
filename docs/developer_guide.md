@@ -39,8 +39,11 @@ The repo holds **two layers** that coexist on purpose:
 
 `ADR-0002` (`docs/architecture_decisions.md:33`) is load-bearing: the Python
 layer must not hide or rewrite OpenTofu/Ansible prematurely. `ADR-0004`
-(`docs/architecture_decisions.md:77`) sets the sequence: read-only CLI before
-backend automation.
+(`docs/architecture_decisions.md:77`) was about staging — the read-only CLI
+shipped first (validate, lab list/show, plan, inventory render, tofu render,
+status, runs list/show) before the mutating slice (apply, destroy, tui). All
+nine roadmap phases have landed; runtime adapters now drive `tofu` and
+`ansible-playbook` from the resolved lab end-to-end.
 
 ---
 
@@ -48,31 +51,38 @@ backend automation.
 
 ```text
 playground/
-├── src/playground/         # Python control layer (~2200 LOC)
-│   ├── cli/                # Typer commands (validate, lab list, lab show)
+├── src/playground/         # Python control layer
+│   ├── cli/                # Typer commands (every subcommand below)
 │   ├── config/             # Discovery, loading, resolution
-│   ├── models/             # Pydantic models for every kind + ResolvedLab
+│   ├── models/             # Pydantic models: kinds, resolved, status, diagnostic
 │   ├── validation/         # Cross-reference checks → Diagnostics
-│   ├── events/             # (Placeholder — operation events)
-│   ├── logging/            # (Placeholder — structured logs)
-│   ├── runs/               # (Placeholder — operation run records)
-│   └── state/              # (Placeholder — .playground/ store)
+│   ├── planner/            # Plan rendering + workload scheduling + file staging
+│   ├── backend/            # Adapter layer (today: local_libvirt)
+│   │   └── local_libvirt/  # inventory, tfvars, apply (subprocess), status, runner
+│   ├── events/             # In-process EventBus + JsonlWriter
+│   ├── runs/               # OperationRun + start/finish helpers
+│   ├── tui/                # Textual app (lab browser, live ops, runs viewer)
+│   ├── logging/            # (Reserved — richer structured logs later)
+│   └── state/              # (Reserved — typed .playground/ store later)
 │
 ├── config/                 # User-authored lab intent (committed)
-│   ├── defaults.yaml
-│   ├── providers/
-│   ├── artifacts/
-│   ├── networks/
-│   ├── roles/
-│   ├── commands/
-│   └── labs/
+│   ├── defaults.yaml       #   project-wide defaults
+│   ├── providers/          #   backend-specific configs (libvirt URI etc.)
+│   ├── artifacts/          #   ArtifactSources singleton
+│   ├── networks/           #   NetworkProfile presets (nat/isolated/routed)
+│   ├── roles/              #   VmRole presets with `extends:` inheritance
+│   ├── commands/           #   CommandPreset for `playground run` (planned)
+│   └── labs/               #   Named labs (generic-infra today)
 │
+├── compose/                # Compose source files referenced by lab YAMLs
 ├── tofu/                   # OpenTofu module (libvirt provider)
-├── ansible/                # Ansible site.yml + roles/docker, roles/redroid
+├── ansible/                # site.yml + roles/{docker,redroid,
+│                           #   workload_container, workload_compose, workload_swarm}
 │
 ├── tests/
-│   ├── unit/               # Pytest unit tests — 90 today
-│   └── cli/                # Typer CLIRunner tests
+│   ├── unit/               # Pytest unit tests
+│   ├── cli/                # Typer CLIRunner tests
+│   └── ... (mirrors the src/ layout)
 │
 ├── docs/                   # Product, system, config, ADRs, roadmap, this file
 ├── .playground/            # GENERATED runtime state (git-ignored)
@@ -308,17 +318,24 @@ rather than producing diagnostics. The docstring says "the caller is expected
 to have run `validate` first and gated on errors" — this keeps the resolver
 small.
 
-### `src/playground/cli/main.py` (273 lines)
+### `src/playground/cli/main.py`
 
-Typer entry point. Three commands:
+Typer entry point. Subcommands:
 
-```text
-playground validate [--config-dir DIR] [--output human|json] [--check-ansible-roles]
-playground lab list [--config-dir DIR] [--output human|json]
-playground lab show LAB [--config-dir DIR] [--output human|json]
-```
+| Command | Surface | Mutates |
+|---|---|---|
+| `playground validate` | full cross-reference check | no |
+| `playground lab list` / `lab show <lab>` | inspect lab definitions | no |
+| `playground plan <lab>` | render backend-neutral preview | no |
+| `playground tofu render <lab>` | write `terraform.tfvars.json` | writes `.playground/state/tofu/` |
+| `playground inventory render <lab>` | write Ansible inventory | writes `.playground/state/inventory/` |
+| `playground status <lab>` | observed state snapshot | no |
+| `playground apply <lab>` | full deploy (tfvars → tofu → inventory → ansible) | **yes** |
+| `playground destroy <lab>` | `tofu destroy` | **yes** |
+| `playground runs list` / `runs show <id>` | browse past operations | no |
+| `playground tui` | launch Textual TUI | inside |
 
-Flow:
+Flow (read-only commands):
 
 ```python
 load_config(config_dir)                 # → (LoadedConfig, parse diagnostics)
@@ -327,20 +344,122 @@ if not _has_errors(diagnostics):
 # render human or JSON, exit 1 if any error severity
 ```
 
+Flow (mutating commands):
+
+```python
+load_config → validate → resolve_lab → execute_apply/destroy
+                                       ↑ runner handles everything below
+                                       ↑ never raises; returns OperationRun
+# CLI is a thin presentation wrapper; the TUI runs the same runner.
+```
+
 `--output json` emits `{"ok": bool, "diagnostics": […]}` so downstream tooling
 can parse without scraping human prose. The console entry point
 `playground = "playground.cli.main:app"` is wired in `pyproject.toml:30`.
 
-### Placeholder modules
+### `src/playground/planner/`
 
-These directories exist with one-line docstrings and reserve names for
-upcoming roadmap items. Don't start a feature inside them without a plan —
-their shape will be decided when the relevant roadmap item begins.
+Two sibling modules:
 
-- `events/` — operation event bus (system_design.md "Operation Runner And Events")
-- `logging/` — structured logs
-- `runs/` — operation run records under `.playground/runs/`
-- `state/` — `StateStore` over `.playground/`
+- `plan.py` — `Plan`, `PlanAction`, `PlanBudget`, `render_plan(resolved,
+  warnings=None) -> Plan`. Backend-neutral preview of what `apply` would
+  do. Today every action verb is `create`; `update / delete / no_op` are
+  reserved in `ActionVerb` for the state-observation slice.
+- `scheduling.py`:
+  - `schedule_workloads(resolved) -> ({vm_name: [workloads]},
+    diagnostics)` — resolves placement (`target_vm` / `target_role`
+    walking the **full** `spec.extends` ancestry / `target_tag` /
+    `auto` matching `capabilities['docker']`).
+  - `assign_swarm_membership(scheduled, vms) -> ({vm: "manager" |
+    "worker" | "none"}, diagnostics)` — first docker-capable VM is
+    the manager; others are workers. Emits
+    `config.workload.swarm_needs_docker_host` when none qualify.
+  - `stage_workload_files(scheduled, source_base, stage_dir) ->
+    ({vm: {workload: path}}, diagnostics)` — copies compose/swarm
+    source files from `source_base/<workload.source>` into
+    `stage_dir/<vm>/<workload>.<ext>`. Emits
+    `config.workload.source_missing` for absent files.
+  - `workload_to_ansible_payload(workload, staged_source=None) ->
+    dict` — the JSON-serialized payload the
+    `workload_container` / `workload_compose` / `workload_swarm`
+    ansible roles consume via `pg_workloads`.
+
+### `src/playground/events/`
+
+In-process pub/sub plus the canonical JSONL persistence subscriber.
+External brokers explicitly out of scope per `requirements.md` §5.11.
+
+- `OperationEvent` — `run_id`, `timestamp`, `type`, `payload`.
+- `EventType` literal — `operation_started`, `step_started`,
+  `step_finished`, `operation_finished`, `log_line`.
+- `EventBus` — synchronous; subscribers run on the publishing thread.
+  Subscriber exceptions are captured on `bus.errors`, not swallowed.
+- `JsonlWriter(run_dir)` — appends each event as one JSON line to
+  `run_dir/events.jsonl`.
+- `operation_events(bus, run_id, op, lab)` — context manager that
+  brackets a block with `operation_started` / `operation_finished`.
+
+### `src/playground/runs/`
+
+Operation lifecycle records that satisfy `requirements.md` §5.10
+("mutating ops MUST create a run record; read-only ops MUST NOT").
+
+- `OperationRun` (frozen StrictModel) — `run_id`, `operation`, `lab`,
+  `status`, `started_at`, `finished_at`, `steps`, `summary`.
+- `StepResult` — `name`, `command`, `exit_code`, `log_path`,
+  `started_at`, `finished_at`.
+- `allocate_run_id(op, lab, now=None)` — sortable id
+  `YYYYMMDDTHHmmssZ-<op>-<lab>`.
+- `start_run(runs_dir, op, lab)` — creates `runs_dir/<id>/{run.json,
+  logs/}` with `status="running"`; collisions surface loudly via
+  `mkdir(exist_ok=False)` on the run-id directory.
+- `finish_run(run, run_dir, *, status, steps, summary=None)` —
+  finalizes the on-disk record.
+
+### `src/playground/backend/local_libvirt/`
+
+Adapter layer. Six modules:
+
+- `inventory.py` — `render_inventory` (with optional staged-workload
+  map and emitted `[swarm_manager]` / `[swarm_worker]` groups when
+  applicable) and `fetch_vm_ips`.
+- `tfvars.py` — `render_tfvars(resolved) -> dict` (just `vm_names`
+  today; per-VM resources deferred).
+- `apply.py` — subprocess wrappers `run_tofu_apply`,
+  `run_tofu_destroy`, `run_ansible_playbook`. Spawns with `Popen`,
+  reads stdout line-by-line, writes to a log file AND (when given
+  `bus=` + `run_id=`) publishes one `log_line` event per line.
+  `tail_log()` reads the last N lines for failure reporting.
+- `status.py` — `query_status(resolved, tofu_dir) -> (LabStatus,
+  diagnostics)`. Treats `tofu_no_state` as the steady "nothing
+  applied yet" status, not an error.
+- `runner.py` — the **service layer**: `execute_apply` and
+  `execute_destroy` orchestrate the multi-step operations. Never
+  raise; always return a finalized `OperationRun` so both the CLI
+  and the TUI can present the result consistently.
+
+### `src/playground/tui/`
+
+Textual app over the existing primitives — no parallel business logic
+per `requirements.md` §5.8. Two-pane layout (lab list / detail) with a
+live log pane at the bottom.
+
+- `PlaygroundTui` (`app.py`) — main app with bindings: `r` refresh,
+  `a` apply, `d` destroy, `v` runs, `q` quit.
+- `_ConfirmScreen` — modal guard before mutating actions.
+- `_LogPane` — append-only widget bounded at ~1000 lines. The bus
+  bridge calls `App.call_from_thread()` so subprocess output from
+  the worker thread renders on the foreground event loop.
+- `RunsScreen` / `RunDetailScreen` — runs viewer; the detail screen
+  renders the `events.jsonl` timeline.
+
+### Reserved modules
+
+- `logging/` — richer structured logs (per-resource / per-stage
+  filters). Today's JSONL is the single log surface.
+- `state/` — typed `StateStore` over `.playground/`. Today the
+  filesystem layout is implicit (runs/, state/inventory/,
+  state/tofu/, state/workloads/, cache/).
 
 ---
 
