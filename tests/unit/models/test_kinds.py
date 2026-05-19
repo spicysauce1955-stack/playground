@@ -18,11 +18,7 @@ from ruamel.yaml import YAML
 from playground.models.kinds import (
     KNOWN_KINDS,
     Budget,
-    CommandPreset,
-    Defaults,
     Lab,
-    NetworkProfile,
-    ProviderConfig,
     Resources,
     TargetSelector,
     VmRole,
@@ -121,7 +117,9 @@ def test_workload_placement_requires_exactly_one() -> None:
 
 def test_lab_rejects_duplicate_vm_names() -> None:
     raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
-    raw["spec"]["vms"].append({"name": "node1", "role": "generic-node", "networks": ["lab-private"]})
+    raw["spec"]["vms"].append(
+        {"name": "node1", "role": "generic-node", "networks": ["lab-private"]}
+    )
     with pytest.raises(ValidationError) as exc:
         parse_resource(raw)
     assert "duplicate names" in str(exc.value)
