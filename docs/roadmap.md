@@ -359,6 +359,80 @@ Slice 9c (done): runs viewer
   timeline (one line per event, ``log_line`` events show
   ``step: line``).
 
+## 10. Cross-VM lab support (barak-deploy)
+
+Status: done.
+
+Built to host the cross-VM ship-and-deploy test described in
+`playground-requirements.md`. Six small slices on top of the existing
+§1-§9 platform. Each slice is reviewer-pass-ready independently.
+
+Slice 10a (done): Lab YAML schema for per-VM IPs + extra_hosts.
+
+- `LabVm.networks` accepts both legacy `list[str]` and new
+  `list[{name, ip?}]` via a before-validator. Existing labs need no
+  change; new labs can pin static IPs per attachment.
+- `LabVm.extra_hosts: list[str]` carries literal `/etc/hosts` lines
+  (workaround for missing lab-scoped DNS, backlog item).
+- `ResolvedVm` gains `network_ips: dict[net_name, ip]` and
+  `extra_hosts: list[str]`.
+- Two new validator diagnostics: `config.network.ip_not_in_cidr`,
+  `config.network.duplicate_ip`.
+
+Slice 10b (done): Tofu multi-network + DHCP-pinned IPs.
+
+- `tofu/main.tf` consumes `var.networks`, `var.vm_networks`, and
+  `var.vm_network_ips`. `libvirt_network` is now a `for_each` over
+  the lab's `spec.networks`. Each `libvirt_domain` builds its
+  `network_interface` blocks dynamically with pinned `addresses`
+  when the lab requested.
+- `render_tfvars` emits the new variables when the lab is
+  non-trivial; legacy single-network labs still get a clean
+  var-file with just `vm_names`.
+
+Slice 10c (done): Inventory `extra_hosts` + ansible role.
+
+- Renderer adds `pg_extra_hosts='<json>'` host var when set.
+- New `extra_hosts` ansible role runs first in `site.yml` so all
+  later plays can resolve peer VMs by name.
+
+Slice 10d (done): SSH keypair distribution + docker_tunneler.
+
+- Three new platform-generic ansible roles: `docker_tunneler`,
+  `ssh_keypair_generator`, `ssh_keypair_receiver`.
+- `site.yml` ordering: source bootstrap (generator) early, then
+  the standard plays, then target receiver. Future multi-host
+  tests reuse the same roles + groups.
+
+Slice 10e (done): barak-deploy-specific roles + lab + Makefile.
+
+- `barak_deploy_staging` + `barak_deploy_agent` ansible roles.
+- Two new VmRoles (`deployment-source`, `deployment-target`) and
+  a lab (`barak-deploy-cross-vm`) declaring two VMs on
+  10.20.40.0/24 with pinned IPs and reciprocal `extra_hosts`.
+- Root `Makefile` with `sync-from-barak-deploy` target.
+- `ansible/files/` directory; the wheel is gitignored, the
+  cross-vm config set is committed.
+
+Slice 10f (done): Multi-VM pytest harness + docs.
+
+- `tests/integration/multi_vm/test_cross_vm_deploy.py` skipped by
+  default; runs against real libvirt when
+  `PLAYGROUND_LIVE_INFRA=1` is set. Asserts every pass/fail
+  criterion from `playground-requirements.md`.
+- `docs/developer_guide.md` gains a "Multi-VM integration tests"
+  section.
+
+Carried forward to a follow-up:
+
+- `playground exec --on <vm> <cmd>` test orchestration helper.
+  The harness today uses plain `ssh`; a CLI subcommand would tidy
+  the harness and become a generic operator primitive.
+- Pre-existing minor validator quirk: the `unknown_image` check
+  runs once per lab, so an orphaned role surfaces N times when N
+  labs are loaded. Move the check outside the per-lab loop when
+  someone touches the validator next.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

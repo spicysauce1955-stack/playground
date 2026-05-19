@@ -741,6 +741,40 @@ PYTHONPATH=src uv run --no-project --with pytest --with pydantic --with ruamel.y
 
 ---
 
+## Multi-VM integration tests
+
+`tests/integration/multi_vm/` houses tests that bring up real labs
+end-to-end. They're **skipped by default** — running them needs real
+libvirt access, ~8 GiB free RAM, and the sibling `barak-deploy` repo
+checked out at `~/Workspace/barak-deploy/`.
+
+To enable:
+
+```bash
+PLAYGROUND_LIVE_INFRA=1 pytest tests/integration/multi_vm -v
+```
+
+The harness uses `subprocess` to invoke the real `playground` CLI plus
+plain `ssh` to talk to VMs once they're up. No mocking — the test
+exercises everything the operator would do by hand. A `try/finally`
+ensures `playground destroy` runs even when an assertion fails.
+
+`tests/integration/multi_vm/test_cross_vm_deploy.py` validates every
+pass/fail criterion from `playground-requirements.md`:
+
+1. Hello container running on the target VM.
+2. Templated `hello.conf` placed at `/etc/hello/`.
+3. `barak-deploy history` shows a pipeline run with status=ok and four
+   step records (`unwrap`, `load`, `place-config`, `run`).
+4. Tar archived under `/var/spool/deploys/archive/ok/`.
+5. Manifest written with the expected files + tar_sha256.
+6. Idempotency: a second ship-deploy run produces a history entry
+   where every step has `skipped: true`.
+
+Manual fallback (when you can't run pytest with `PLAYGROUND_LIVE_INFRA`
+set): the `playground-requirements.md` document at the repo root has a
+`## Bringing up the test` section with the equivalent bash commands.
+
 ## Where to read next
 
 - [`docs/system_overview.md`](system_overview.md) — diagrams of the same
