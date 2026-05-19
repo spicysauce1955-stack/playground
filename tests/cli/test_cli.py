@@ -29,13 +29,15 @@ def _write_apply_shims(
     tmp_path: Path,
     *,
     tofu_apply_exit: int = 0,
+    tofu_destroy_exit: int = 0,
     ansible_exit: int = 0,
     vm_ips_payload: str | None = None,
 ) -> Path:
-    """Write tofu + ansible-playbook shims that handle both apply and output.
+    """Write tofu + ansible-playbook shims handling apply/destroy/output.
 
-    `tofu apply ...` exits with ``tofu_apply_exit``; `tofu output -json`
-    returns ``vm_ips_payload``. ansible-playbook exits with ``ansible_exit``.
+    Each `tofu <verb>` returns the corresponding exit code; `tofu output
+    -json` returns ``vm_ips_payload``. ansible-playbook exits with
+    ``ansible_exit``.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -49,6 +51,7 @@ def _write_apply_shims(
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f"  apply) echo 'tofu apply ok'; exit {tofu_apply_exit} ;;\n"
+        f"  destroy) echo 'tofu destroy ok'; exit {tofu_destroy_exit} ;;\n"
         f"  output) cat <<'PAYLOAD'\n{payload}\nPAYLOAD\n   ;;\n"
         "  *) exit 0 ;;\n"
         "esac\n"
@@ -323,6 +326,76 @@ def test_apply_ansible_failure_after_tofu_success_records_partial_state(
     # Inventory + tfvars files both exist on disk (we got past render).
     assert (state_dir / "state" / "tofu" / "generic-infra.tfvars.json").exists()
     assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
+
+
+def test_destroy_happy_path_writes_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "destroy",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--state-dir",
+            str(state_dir),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "succeeded"
+    assert payload["operation"] == "destroy"
+    assert [s["name"] for s in payload["steps"]] == ["tofu-destroy"]
+    assert payload["steps"][0]["exit_code"] == 0
+    # tfvars re-rendered for symmetry with apply
+    assert (state_dir / "state" / "tofu" / "generic-infra.tfvars.json").exists()
+
+
+def test_destroy_tofu_failure_leaves_failed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path, tofu_destroy_exit=1)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "destroy",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--state-dir",
+            str(state_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    runs = list((state_dir / "runs").iterdir())
+    assert len(runs) == 1
+    record = json.loads((runs[0] / "run.json").read_text())
+    assert record["status"] == "failed"
+    assert record["operation"] == "destroy"
+    assert record["steps"][0]["exit_code"] == 1
+    assert "tofu destroy failed" in record["summary"]
 
 
 def test_apply_unknown_lab_fails_before_running_tofu(tmp_path: Path) -> None:

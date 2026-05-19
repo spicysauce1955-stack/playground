@@ -15,6 +15,7 @@ from playground.backend.local_libvirt import (
     render_tfvars,
     run_ansible_playbook,
     run_tofu_apply,
+    run_tofu_destroy,
     tail_log,
 )
 from playground.config.loader import LoadedConfig, load_config
@@ -496,6 +497,79 @@ def apply_command(
     typer.echo(f"  record: {run_dir / 'run.json'}")
     for step in finished.steps:
         typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
+
+
+@app.command("destroy")
+def destroy_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to tear down.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Destroy ``lab``: render the same vars apply uses, then `tofu destroy`."""
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+
+    runs_dir = state_dir / "runs"
+    run, run_dir = start_run(runs_dir, "destroy", lab)
+    logs_dir = run_dir / "logs"
+
+    # Re-render the tfvars so tofu destroy sees the same var.vm_names
+    # apply did — symmetric, deterministic, doesn't rely on stale state.
+    tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
+    tfvars_path.parent.mkdir(parents=True, exist_ok=True)
+    tfvars = render_tfvars(resolved)
+    tfvars_path.write_text(json.dumps(tfvars, indent=2, sort_keys=True) + "\n")
+
+    steps: list[StepResult] = []
+    tofu_step, tofu_diagnostics = run_tofu_destroy(
+        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log"
+    )
+    steps.append(tofu_step)
+    if tofu_diagnostics or tofu_step.exit_code != 0:
+        _fail_apply(
+            output, run, run_dir, steps,
+            diagnostics=tofu_diagnostics,
+            summary=(
+                "tofu destroy failed; some resources may remain. Inspect "
+                "tofu state with `cd tofu && tofu state list` and retry."
+            ),
+            log_path=tofu_step.log_path,
+        )
+
+    finished = finish_run(
+        run, run_dir, status="succeeded", steps=steps,
+        summary=f"destroyed lab {lab!r}",
+    )
+
+    if output is OutputFormat.json:
+        _print_json(finished.model_dump(mode="json", exclude_none=True))
+        return
+
+    typer.echo(f"destroyed lab {lab!r}")
+    typer.echo(f"  run: {finished.run_id}")
+    typer.echo(f"  record: {run_dir / 'run.json'}")
 
 
 def _fail_apply(

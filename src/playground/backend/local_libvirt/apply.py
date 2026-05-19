@@ -48,6 +48,32 @@ def run_tofu_apply(
     )
 
 
+def run_tofu_destroy(
+    tofu_dir: Path,
+    var_file: Path,
+    log_path: Path,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Invoke ``tofu destroy -auto-approve -var-file=<var_file>`` in ``tofu_dir``.
+
+    Captures combined stdout+stderr to ``log_path``. Symmetric with
+    :func:`run_tofu_apply` — destroy uses the same var-file so that the
+    set of resources tofu thinks it owns matches what was applied.
+    """
+    return _run_step(
+        name="tofu-destroy",
+        command=[
+            "tofu",
+            "destroy",
+            "-auto-approve",
+            "-input=false",
+            f"-var-file={var_file}",
+        ],
+        cwd=tofu_dir,
+        log_path=log_path,
+        missing_binary_id="runtime.apply.tofu_binary_missing",
+    )
+
+
 def run_ansible_playbook(
     playbook: Path,
     inventory: Path,
@@ -143,4 +169,9 @@ def tail_log(log_path: Path, lines: int = 20) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
-__all__ = ["run_ansible_playbook", "run_tofu_apply", "tail_log"]
+__all__ = [
+    "run_ansible_playbook",
+    "run_tofu_apply",
+    "run_tofu_destroy",
+    "tail_log",
+]

@@ -163,7 +163,7 @@ Slice 5b (queued):
 
 ## 6. Apply / Status / Destroy
 
-Status: in progress (apply done; status and destroy queued).
+Status: in progress (apply + destroy done; status queued).
 
 Slice 6a (done):
 
@@ -185,10 +185,16 @@ Slice 6a (done):
   separates execution-time concerns from config-side `config.*`
   diagnostics.
 
-Slice 6b (queued):
+Slice 6b (done):
 
-- `playground destroy <lab>` — invoke `tofu destroy` (and a future
-  ansible teardown if needed); same run-record machinery.
+- `playground destroy <lab>` re-renders the same tfvars apply uses,
+  then runs `tofu destroy -auto-approve -var-file=...`. Wrapped in
+  an OperationRun with `operation: destroy`. Same failure protocol
+  as apply: nonzero tofu exit finalizes the run as `failed` with a
+  summary telling the operator what to inspect.
+- Symmetric with apply: re-rendering the tfvars guarantees tofu
+  sees the same `var.vm_names` as the apply did, so destroy
+  targets the right resources.
 
 Slice 6c (queued):
 

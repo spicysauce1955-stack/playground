@@ -11,6 +11,7 @@ import pytest
 from playground.backend.local_libvirt.apply import (
     run_ansible_playbook,
     run_tofu_apply,
+    run_tofu_destroy,
     tail_log,
 )
 
@@ -90,6 +91,49 @@ def test_run_tofu_apply_reports_missing_binary(
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "runtime.apply.tofu_binary_missing"
     assert step.exit_code == 127  # sentinel: nothing actually ran
+
+
+# ---------------------------------------------------------------------------
+# run_tofu_destroy
+# ---------------------------------------------------------------------------
+
+
+def test_run_tofu_destroy_succeeds_and_captures_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_shim(tmp_path, "tofu", exit_code=0, stdout="destroy complete\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    log_path = tmp_path / "logs" / "tofu-destroy.log"
+    step, diagnostics = run_tofu_destroy(
+        tofu_dir=tmp_path,
+        var_file=tmp_path / "vars.tfvars.json",
+        log_path=log_path,
+    )
+
+    assert diagnostics == []
+    assert step.exit_code == 0
+    assert step.name == "tofu-destroy"
+    assert step.command[:3] == ["tofu", "destroy", "-auto-approve"]
+    assert f"-var-file={tmp_path / 'vars.tfvars.json'}" in step.command
+    assert "destroy complete" in log_path.read_text()
+
+
+def test_run_tofu_destroy_records_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_shim(tmp_path, "tofu", exit_code=1, stdout="cannot destroy\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    log_path = tmp_path / "logs" / "tofu-destroy.log"
+    step, diagnostics = run_tofu_destroy(
+        tofu_dir=tmp_path,
+        var_file=tmp_path / "vars.tfvars.json",
+        log_path=log_path,
+    )
+
+    assert diagnostics == []
+    assert step.exit_code == 1
 
 
 # ---------------------------------------------------------------------------

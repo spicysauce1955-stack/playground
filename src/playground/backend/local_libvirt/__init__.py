@@ -9,6 +9,7 @@ model.
 from playground.backend.local_libvirt.apply import (
     run_ansible_playbook,
     run_tofu_apply,
+    run_tofu_destroy,
     tail_log,
 )
 from playground.backend.local_libvirt.inventory import (
@@ -23,5 +24,6 @@ __all__ = [
     "render_tfvars",
     "run_ansible_playbook",
     "run_tofu_apply",
+    "run_tofu_destroy",
     "tail_log",
 ]
