@@ -41,6 +41,20 @@
     # in the bootstrap play. Runs late so the fact is populated.
     - ssh_keypair_receiver
 
+- name: Stage barak-deploy demo artifacts on sources
+  hosts: deployment_source
+  become: yes
+  gather_facts: no
+  roles:
+    - barak_deploy_staging
+
+- name: Install barak-deploy on targets
+  hosts: deployment_target
+  become: yes
+  gather_facts: no
+  roles:
+    - barak_deploy_agent
+
 - name: Deploy container workloads
   hosts: playground
   become: yes

@@ -1,0 +1,9 @@
+---
+# Default paths into `ansible/files/` for the barak-deploy artifacts.
+# The Makefile target `sync-from-barak-deploy` populates these from the
+# sibling barak-deploy repo. Override on a CLI run with `-e` if needed.
+
+barak_deploy_wheel: barak_deploy-1.0.0-py3-none-any.whl
+barak_deploy_examples_dir: cross-vm
+barak_deploy_systemd_unit: barak-deploy.service
+barak_deploy_env_example: barak-deploy.env.example

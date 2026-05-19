@@ -1,0 +1,39 @@
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: barak-deploy-cross-vm
+  description: |
+    Two-VM lab for the barak-deploy cross-VM ship-and-deploy test.
+    `central` stages a wrapper bundle and ships it via docker-tunneler.
+    `target` runs barak-deploy and deploys the bundle on receipt.
+  tags: [barak-deploy, cross-vm]
+
+spec:
+  backend: local-libvirt
+
+  networks:
+    - name: deploy-net
+      profile: isolated
+      cidr: 10.20.40.0/24
+
+  vms:
+    - name: central
+      role: deployment-source
+      networks:
+        - name: deploy-net
+          ip: 10.20.40.20
+      extra_hosts:
+        - "10.20.40.21 target"
+
+    - name: target
+      role: deployment-target
+      networks:
+        - name: deploy-net
+          ip: 10.20.40.21
+      extra_hosts:
+        - "10.20.40.20 central"
+
+  providers:
+    local-libvirt:
+      uri: qemu:///system
+      pool: default

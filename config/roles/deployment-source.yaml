@@ -1,0 +1,15 @@
+apiVersion: playground/v1
+kind: VmRole
+metadata:
+  name: deployment-source
+  description: VM that stages and ships barak-deploy wrapper bundles.
+
+spec:
+  extends: docker-host
+  capabilities:
+    docker: true
+    deployment_source: true
+  provisioners:
+    - ansible_role: docker_tunneler
+    - ansible_role: ssh_keypair_generator
+    - ansible_role: barak_deploy_staging

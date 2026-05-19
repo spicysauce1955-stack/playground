@@ -1,0 +1,20 @@
+# Sample identity file for VM B (the deployment target) in the cross-VM demo.
+# Deployed at /etc/barak-deploy/identity.yaml.
+#
+# Built-in identity (user, home, hostname, ip) is always available — this file
+# layers on a few demo vars to show how identity flows into the pipeline.
+# Replace `host:` with the actual hostname of your VM B if it differs from
+# the playground's default ("target").
+
+host: target
+
+vars:
+  role: deployment-target
+  # The hostname of VM A — useful in log messages and as a sanity check in
+  # `when:` expressions. The playground's lab YAML pins both A and B to static
+  # IPs and `extra_hosts` entries, so name resolution works without DNS.
+  source_host: central
+  # Operator-defined free-form vars. Anything you reference as ${vars.<key>}
+  # or ${<key>} in a pipeline must exist here (or in the built-in / deployment
+  # identity layers) or `--strict-vars` flags it at validate time.
+  app_dir: /etc/hello

@@ -1,0 +1,15 @@
+apiVersion: playground/v1
+kind: VmRole
+metadata:
+  name: deployment-target
+  description: VM that receives shipped bundles and deploys via barak-deploy.
+
+spec:
+  extends: docker-host
+  capabilities:
+    docker: true
+    deployment_target: true
+  provisioners:
+    - ansible_role: docker_tunneler
+    - ansible_role: ssh_keypair_receiver
+    - ansible_role: barak_deploy_agent

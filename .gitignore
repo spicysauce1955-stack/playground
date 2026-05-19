@@ -26,6 +26,10 @@ htmlcov/
 .terraform/
 .terraform.lock.hcl
 
+# Per-lab artifacts staged via `make sync-from-barak-deploy`.
+# The cross-vm config set IS committed; the wheel is a build artifact.
+/ansible/files/*.whl
+
 # Editor / OS
 .DS_Store
 *.swp

@@ -1,0 +1,117 @@
+---
+# Install barak-deploy on the target VM:
+#  - barak-deploy system user (member of docker group so the agent can
+#    talk to dockerd)
+#  - state, config, spool, and config-output directories
+#  - barak-deploy wheel from ansible/files/ (sync via `make
+#    sync-from-barak-deploy`)
+#  - four config files from ansible/files/cross-vm/
+#  - systemd unit + env file, enabled and started
+#
+# All ansible.builtin.copy operations use `src:` paths relative to the
+# role's `files/` lookup path; the Makefile populates `ansible/files/`
+# from the sibling barak-deploy repo at provision time.
+
+- name: Pre-flight — confirm the barak-deploy wheel is staged
+  ansible.builtin.stat:
+    path: "{{ role_path }}/../../files/{{ barak_deploy_wheel }}"
+  register: pg_barak_wheel_stat
+  delegate_to: localhost
+  become: no
+
+- name: Fail early when the wheel is missing
+  ansible.builtin.fail:
+    msg: |
+      ansible/files/{{ barak_deploy_wheel }} is missing.
+      Run `make sync-from-barak-deploy` on the Ansible controller
+      (the playground repo) to copy artifacts from ~/Workspace/barak-deploy.
+  when: not pg_barak_wheel_stat.stat.exists
+
+- name: Create barak-deploy system user
+  ansible.builtin.user:
+    name: barak-deploy
+    system: yes
+    create_home: yes
+    home: /var/lib/barak-deploy
+    shell: /usr/sbin/nologin
+    groups: docker
+
+- name: Ensure state, config, spool, and config-output directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/barak-deploy, owner: root, group: root, mode: "0755" }
+    - { path: /etc/barak-deploy/pipelines, owner: root, group: root, mode: "0755" }
+    - { path: /var/lib/barak-deploy, owner: barak-deploy, group: barak-deploy, mode: "0755" }
+    - { path: /var/lib/barak-deploy/runs, owner: barak-deploy, group: barak-deploy, mode: "0755" }
+    - { path: /var/lock/barak-deploy, owner: barak-deploy, group: barak-deploy, mode: "0755" }
+    - { path: /var/spool/deploys, owner: barak-deploy, group: barak-deploy, mode: "0755" }
+    - { path: /var/spool/deploys/archive, owner: barak-deploy, group: barak-deploy, mode: "0755" }
+    - { path: /etc/hello, owner: root, group: root, mode: "0755" }
+
+- name: Allow ubuntu to write into the spool dir (incoming SCP target)
+  ansible.posix.acl:
+    path: /var/spool/deploys
+    entity: ubuntu
+    etype: user
+    permissions: rwx
+    state: present
+
+- name: Install pip3 if not present
+  ansible.builtin.apt:
+    name: python3-pip
+    state: present
+    update_cache: yes
+
+- name: Copy the barak-deploy wheel to the target
+  ansible.builtin.copy:
+    src: "{{ barak_deploy_wheel }}"
+    dest: "/tmp/{{ barak_deploy_wheel }}"
+
+- name: Install barak-deploy from the staged wheel
+  ansible.builtin.pip:
+    name: "file:///tmp/{{ barak_deploy_wheel }}"
+    extras: ["redis", "metrics"]
+    state: present
+    extra_args: "--break-system-packages"
+
+- name: Drop barak-deploy config files
+  ansible.builtin.copy:
+    src: "{{ barak_deploy_examples_dir }}/{{ item.src }}"
+    dest: "/etc/barak-deploy/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: bundles.yaml, dest: bundles.yaml }
+    - { src: triggers.yaml, dest: triggers.yaml }
+    - { src: identity.yaml, dest: identity.yaml }
+    - { src: pipelines/deploy-demo.yaml, dest: pipelines/deploy-demo.yaml }
+
+- name: Drop barak-deploy systemd unit
+  ansible.builtin.copy:
+    src: "{{ barak_deploy_systemd_unit }}"
+    dest: /etc/systemd/system/barak-deploy.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: Drop barak-deploy environment file
+  ansible.builtin.copy:
+    src: "{{ barak_deploy_env_example }}"
+    dest: /etc/barak-deploy/barak.env
+    owner: root
+    group: barak-deploy
+    mode: "0640"
+
+- name: Enable + start barak-deploy.service
+  ansible.builtin.systemd:
+    name: barak-deploy
+    state: started
+    enabled: yes
+    daemon_reload: yes

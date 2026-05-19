@@ -97,7 +97,8 @@ def test_lab_list_shows_committed_lab() -> None:
 
     assert result.exit_code == 0
     # Warnings land on stderr via _print_warnings; stdout stays clean.
-    assert result.stdout.splitlines() == ["generic-infra"]
+    assert "generic-infra" in result.stdout.splitlines()
+    assert "barak-deploy-cross-vm" in result.stdout.splitlines()
     assert "config.backend.per_vm_resources_unsupported" in result.stderr
 
 
@@ -109,13 +110,14 @@ def test_lab_list_json_shows_committed_lab() -> None:
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["labs"] == [
-        {
-            "name": "generic-infra",
-            "description": "Generic VM, Docker, and network playground.",
-            "tags": ["infra", "local"],
-        }
-    ]
+    names = {lab["name"] for lab in payload["labs"]}
+    assert names == {"generic-infra", "barak-deploy-cross-vm"}
+    generic = next(lab for lab in payload["labs"] if lab["name"] == "generic-infra")
+    assert generic == {
+        "name": "generic-infra",
+        "description": "Generic VM, Docker, and network playground.",
+        "tags": ["infra", "local"],
+    }
 
 
 def test_lab_show_defaults_to_resolved_json() -> None:
