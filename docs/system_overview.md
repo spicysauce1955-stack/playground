@@ -346,6 +346,7 @@ categories:
 | `config.role.*` | validator | `inheritance_cycle`, `unknown_extends` |
 | `config.budget.*` | validator | `exceeded` |
 | `config.artifact.*` | validator | `offline_missing` |
+| `config.backend.*` | validator | `per_vm_resources_unsupported` |
 | `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
 | `config.discovery.*` | CLI | `not_directory` |
 | `config.lab.*` | CLI | `unknown`, `resolve_failed` |
@@ -382,8 +383,8 @@ flowchart LR
     classDef done fill:#cfc,stroke:#383
     classDef next fill:#ffd,stroke:#cc0
     classDef queued fill:#eee,stroke:#888
-    class s1,s2,s3,s4a,s4b done
-    class s4c,s4d next
+    class s1,s2,s3,s4a,s4b,s4d done
+    class s4c next
     class s5,s6,s7,s8,s9 queued
 ```
 

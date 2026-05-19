@@ -1,13 +1,15 @@
 """Local libvirt backend adapter.
 
-Today's surface is read-side: render an Ansible inventory from a
-``ResolvedLab`` and the output of ``tofu output -json``. Future slices
-will add plan/apply/destroy wrappers that consume the same model.
+Today's surface is read-side: render tofu ``-var-file`` inputs and an
+Ansible inventory from a :class:`ResolvedLab` plus ``tofu output -json``.
+Future slices will add plan/apply/destroy wrappers that consume the same
+model.
 """
 
 from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
+from playground.backend.local_libvirt.tfvars import render_tfvars
 
-__all__ = ["fetch_vm_ips", "render_inventory"]
+__all__ = ["fetch_vm_ips", "render_inventory", "render_tfvars"]

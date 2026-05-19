@@ -503,6 +503,56 @@ def test_budget_exceeded_warns_in_permissive_mode(committed_load: LoadedConfig) 
     assert matching[0].severity == "warning"
 
 
+def test_backend_capability_warns_on_heterogeneous_resources(
+    committed_load: LoadedConfig,
+) -> None:
+    # generic-infra: node1 + router1 inherit role resources (1/2048/20);
+    # docker1 sets explicit (2/4096/40). local-libvirt backend can't
+    # apply per-VM values today, so we warn.
+    diagnostics = validate(committed_load)
+
+    matching = [
+        d for d in diagnostics if d.id == "config.backend.per_vm_resources_unsupported"
+    ]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+    assert matching[0].key_path == "spec.vms[*].resources"
+
+
+def test_backend_capability_silent_on_homogeneous_resources(
+    committed_load: LoadedConfig,
+) -> None:
+    # Strip docker1 (the one VM with explicit per-VM resources) from the
+    # committed lab — the remaining two share role-inherited resources.
+    lab = committed_load.labs["generic-infra"]
+    trimmed_vms = [vm for vm in lab.spec.vms if vm.name != "docker1"]
+    committed_load.labs["generic-infra"] = lab.model_copy(
+        update={"spec": lab.spec.model_copy(update={"vms": trimmed_vms})}
+    )
+
+    diagnostics = validate(committed_load)
+
+    assert not [
+        d for d in diagnostics if d.id == "config.backend.per_vm_resources_unsupported"
+    ]
+
+
+def test_backend_capability_check_skipped_for_other_backends(
+    committed_load: LoadedConfig,
+) -> None:
+    # Flip the lab's backend; the local-libvirt-specific check must not fire.
+    lab = committed_load.labs["generic-infra"]
+    committed_load.labs["generic-infra"] = lab.model_copy(
+        update={"spec": lab.spec.model_copy(update={"backend": "cloud-vmware"})}
+    )
+
+    diagnostics = validate(committed_load)
+
+    assert not [
+        d for d in diagnostics if d.id == "config.backend.per_vm_resources_unsupported"
+    ]
+
+
 def test_offline_lab_errors_when_image_local_path_missing(
     committed_load: LoadedConfig,
 ) -> None:

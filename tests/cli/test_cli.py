@@ -29,7 +29,10 @@ def test_validate_committed_config_succeeds() -> None:
     result = CliRunner().invoke(app, ["validate", "--config-dir", str(CONFIG_DIR)])
 
     assert result.exit_code == 0
-    assert "0 errors, 0 warnings" in result.output
+    # generic-infra has docker1 with explicit per-VM resources, so the
+    # local-libvirt backend-capability warning fires. No errors.
+    assert "0 errors, 1 warnings" in result.output
+    assert "config.backend.per_vm_resources_unsupported" in result.output
     assert "ERROR" not in result.output
 
 
@@ -53,7 +56,9 @@ def test_lab_list_shows_committed_lab() -> None:
     result = CliRunner().invoke(app, ["lab", "list", "--config-dir", str(CONFIG_DIR)])
 
     assert result.exit_code == 0
-    assert result.output.splitlines() == ["generic-infra"]
+    # Warnings land on stderr via _print_warnings; stdout stays clean.
+    assert result.stdout.splitlines() == ["generic-infra"]
+    assert "config.backend.per_vm_resources_unsupported" in result.stderr
 
 
 def test_lab_list_json_shows_committed_lab() -> None:
@@ -142,6 +147,77 @@ def test_inventory_render_reports_missing_tofu(
     assert result.exit_code == 1
     assert "config.inventory.tofu_binary_missing" in result.stderr
     assert not (tmp_path / "out.ini").exists()
+
+
+def test_tofu_render_unknown_lab(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "tofu",
+            "render",
+            "missing-lab",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--out",
+            str(tmp_path / "out.json"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.lab.unknown" in result.stderr
+    assert not (tmp_path / "out.json").exists()
+
+
+def test_tofu_render_writes_tfvars_and_json_payload(tmp_path: Path) -> None:
+    out_path = tmp_path / "generic-infra.tfvars.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "tofu",
+            "render",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--out",
+            str(out_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "ok": True,
+        "lab": "generic-infra",
+        "path": str(out_path),
+        "vars": ["vm_names"],
+    }
+    assert json.loads(out_path.read_text()) == {
+        "vm_names": ["node1", "docker1", "router1"]
+    }
+    # Backend-capability warning surfaces during validate, on stderr
+    assert "config.backend.per_vm_resources_unsupported" in result.stderr
+
+
+def test_tofu_render_default_destination_and_apply_hint(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+        result = runner.invoke(
+            app,
+            ["tofu", "render", "generic-infra", "--config-dir", str(CONFIG_DIR)],
+        )
+
+        assert result.exit_code == 0
+        default_path = Path(cwd) / ".playground" / "state" / "tofu" / "generic-infra.tfvars.json"
+        assert default_path.exists()
+        assert json.loads(default_path.read_text()) == {
+            "vm_names": ["node1", "docker1", "router1"]
+        }
+        # Apply hint must use the absolute resolved path so it works no
+        # matter what cwd the operator runs `tofu` from.
+        assert f"-var-file={default_path.resolve()}" in result.stdout
+        assert "tofu -chdir=tofu apply" in result.stdout
 
 
 def test_inventory_render_writes_inventory_and_json_payload(

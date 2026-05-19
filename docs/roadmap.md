@@ -76,7 +76,7 @@ error.
 
 ## 4. OpenTofu / Ansible Bridge
 
-Status: in progress (slices 4a and 4b done; follow-ups queued).
+Status: in progress (slices 4a, 4b, 4d done; 4c queued).
 
 Goal: reduce manual handoff without changing runtime behavior.
 
@@ -97,18 +97,33 @@ Slice 4b (done):
   libvirt domains after their lab VMs (`lab.spec.vms[*].name`); default
   falls back to `pg-node-N` for backward compatibility
 - renderer matches by name; mismatches surface as
-  `config.inventory.vm_ip_not_found` with a suggestion that lists the
-  known tofu domain names
+  `config.inventory.vm_ip_not_found`
 - legacy positional `vm_ips` payloads from pre-4b state are explicitly
   rejected so silent index drift can't return
 
+Slice 4d (done):
+
+- `playground tofu render <lab>` writes
+  `.playground/state/tofu/<lab>.tfvars.json` from a `ResolvedLab` so
+  `var.vm_names` stays in sync with the lab. Closes the last manual
+  handoff: operator runs `playground tofu render … && tofu -chdir=tofu
+  apply -var-file=…`.
+- new validator check `config.backend.per_vm_resources_unsupported`
+  (warning) fires whenever a lab declares heterogeneous per-VM resources
+  that the local-libvirt backend cannot honor today. Surfaces under
+  `playground validate` and every command that depends on it.
+- `_resolve_lab_or_exit` helper extracted from the three CLI commands
+  that resolve a lab (`lab show`, `inventory render`, `tofu render`).
+
 Known limitations to close in follow-up slices:
 
-- The operator still has to keep `var.vm_names` in `tofu/terraform.tfvars`
-  aligned with `lab.spec.vms[*].name` by hand. Next slice: auto-generate
-  `terraform.tfvars` from the resolved lab so the two stay in sync.
-- Only a single `[playground]` group is emitted today. `[docker_host]` /
-  `[router]` groups can be added when a playbook needs them.
+- Slice 4c: only a single `[playground]` group is emitted today.
+  `[docker_host]` / `[router]` groups can be added when a playbook
+  needs them.
+- Per-VM `resources` from the lab still don't reach tofu. Today's
+  `tofu/main.tf` applies global `var.vm_memory` / `var.vm_vcpu`
+  uniformly; the warning above documents the gap. Future slice can
+  enrich tofu to accept per-VM resources as a list of objects.
 - CLI imports the concrete `playground.backend.local_libvirt` adapter
   directly. Introduce a small adapter protocol / registry only when a
   second backend appears.

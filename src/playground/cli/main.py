@@ -9,10 +9,15 @@ from typing import Annotated, NoReturn
 
 import typer
 
-from playground.backend.local_libvirt import fetch_vm_ips, render_inventory
+from playground.backend.local_libvirt import (
+    fetch_vm_ips,
+    render_inventory,
+    render_tfvars,
+)
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
 from playground.models.diagnostic import Diagnostic, SourceLocation
+from playground.models.resolved import ResolvedLab
 from playground.validation import validate as validate_loaded_config
 
 
@@ -27,8 +32,13 @@ inventory_app = typer.Typer(
     no_args_is_help=True,
     help="Render Ansible inventory from resolved labs and tofu state.",
 )
+tofu_app = typer.Typer(
+    no_args_is_help=True,
+    help="Render OpenTofu input files from resolved labs.",
+)
 app.add_typer(lab_app, name="lab")
 app.add_typer(inventory_app, name="inventory")
+app.add_typer(tofu_app, name="tofu")
 
 
 @app.command("validate")
@@ -142,32 +152,7 @@ def show_lab(
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
-    if name not in loaded.labs:
-        _exit_with_diagnostic(
-            Diagnostic(
-                id="config.lab.unknown",
-                severity="error",
-                message=f"unknown lab {name!r}",
-                source=SourceLocation(path=str(config_dir / "labs")),
-                suggestion="run `playground lab list` to see configured labs",
-            ),
-            output,
-            json_errors=False,
-        )
-
-    try:
-        resolved = resolve_lab(loaded, name)
-    except (KeyError, ValueError) as exc:
-        _exit_with_diagnostic(
-            Diagnostic(
-                id="config.lab.resolve_failed",
-                severity="error",
-                message=str(exc),
-                source=SourceLocation(path=str(config_dir / "labs" / f"{name}.yaml")),
-            ),
-            output,
-            json_errors=False,
-        )
+    resolved = _resolve_lab_or_exit(loaded, name, config_dir, output)
 
     if output is OutputFormat.json:
         _print_json(resolved.model_dump(mode="json"))
@@ -219,32 +204,7 @@ def render_inventory_command(
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
-    if lab not in loaded.labs:
-        _exit_with_diagnostic(
-            Diagnostic(
-                id="config.lab.unknown",
-                severity="error",
-                message=f"unknown lab {lab!r}",
-                source=SourceLocation(path=str(config_dir / "labs")),
-                suggestion="run `playground lab list` to see configured labs",
-            ),
-            output,
-            json_errors=False,
-        )
-
-    try:
-        resolved = resolve_lab(loaded, lab)
-    except (KeyError, ValueError) as exc:
-        _exit_with_diagnostic(
-            Diagnostic(
-                id="config.lab.resolve_failed",
-                severity="error",
-                message=str(exc),
-                source=SourceLocation(path=str(config_dir / "labs" / f"{lab}.yaml")),
-            ),
-            output,
-            json_errors=False,
-        )
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
 
     vm_ips, fetch_diagnostics = fetch_vm_ips(tofu_dir)
     _exit_on_errors(fetch_diagnostics, output, json_errors=False)
@@ -272,6 +232,105 @@ def render_inventory_command(
     typer.echo(f"wrote {destination}")
     typer.echo(f"  lab: {lab}")
     typer.echo(f"  vms: {len(resolved.vms)}")
+
+
+@tofu_app.command("render")
+def render_tfvars_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to render tofu vars for.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help=(
+                "Write tfvars JSON to this path. Defaults to "
+                "`.playground/state/tofu/<lab>.tfvars.json`."
+            ),
+        ),
+    ] = None,
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Render a ``-var-file`` payload for ``lab`` so ``tofu apply`` is in sync."""
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+
+    payload = render_tfvars(resolved)
+
+    destination = out or (
+        Path(".playground") / "state" / "tofu" / f"{lab}.tfvars.json"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    if output is OutputFormat.json:
+        _print_json(
+            {
+                "ok": True,
+                "lab": lab,
+                "path": str(destination),
+                "vars": sorted(payload),
+            }
+        )
+        return
+
+    typer.echo(f"wrote {destination}")
+    typer.echo(f"  lab: {lab}")
+    typer.echo(f"  vars: {', '.join(sorted(payload))}")
+    typer.echo(
+        f"  apply with: tofu -chdir=tofu apply -var-file={destination.resolve()}"
+    )
+
+
+def _resolve_lab_or_exit(
+    loaded: LoadedConfig,
+    name: str,
+    config_dir: Path,
+    output: OutputFormat,
+) -> ResolvedLab:
+    """Shared CLI helper: unknown-lab and resolver-error gate.
+
+    Replicates the three byte-identical try/except blocks that grew across
+    ``lab show``, ``inventory render``, and ``tofu render``. Returns the
+    resolved lab on success; exits with the appropriate diagnostic
+    otherwise.
+    """
+    if name not in loaded.labs:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.lab.unknown",
+                severity="error",
+                message=f"unknown lab {name!r}",
+                source=SourceLocation(path=str(config_dir / "labs")),
+                suggestion="run `playground lab list` to see configured labs",
+            ),
+            output,
+            json_errors=False,
+        )
+
+    try:
+        return resolve_lab(loaded, name)
+    except (KeyError, ValueError) as exc:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.lab.resolve_failed",
+                severity="error",
+                message=str(exc),
+                source=SourceLocation(path=str(config_dir / "labs" / f"{name}.yaml")),
+            ),
+            output,
+            json_errors=False,
+        )
 
 
 def _load_config_or_exit(

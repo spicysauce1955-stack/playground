@@ -22,6 +22,8 @@ Diagnostic IDs:
 - ``config.budget.exceeded``
 - ``config.artifact.offline_missing`` (VM images only in §3 — other artifact
   classes from ``requirements.md`` §5.13 are tracked for a later slice)
+- ``config.backend.per_vm_resources_unsupported`` (warning; today's
+  ``local-libvirt`` backend applies global ``var.vm_memory`` / ``var.vm_vcpu``)
 """
 
 from __future__ import annotations
@@ -293,6 +295,7 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
 
     diagnostics.extend(_check_budget(lab, loaded, source))
     diagnostics.extend(_check_offline_artifacts(lab, loaded, source))
+    diagnostics.extend(_check_backend_capability(lab, loaded, source))
 
     return diagnostics
 
@@ -502,6 +505,52 @@ def _role_ancestors(loaded: LoadedConfig, role_name: str) -> list[str]:
             break
         current = role.spec.extends
     return chain
+
+
+def _check_backend_capability(
+    lab: Lab,
+    loaded: LoadedConfig,
+    source: SourceLocation,
+) -> list[Diagnostic]:
+    """Warn when the lab declares intent the chosen backend can't honor.
+
+    Today only ``local-libvirt`` is checked: ``tofu/main.tf`` applies a
+    single global ``var.vm_memory`` / ``var.vm_vcpu`` to every domain, so a
+    lab with heterogeneous per-VM resources will not be reproduced
+    accurately on apply. Permissive per engineering principle #10 — warn,
+    don't block.
+    """
+    if lab.spec.backend != "local-libvirt":
+        return []
+
+    resources_per_vm = [_resources_for_vm(loaded, vm) for vm in lab.spec.vms]
+    populated = [r for r in resources_per_vm if r is not None]
+    if len(populated) < 2:
+        return []
+
+    first = (populated[0].vcpu, populated[0].memory_mb, populated[0].disk_gb)
+    if all((r.vcpu, r.memory_mb, r.disk_gb) == first for r in populated[1:]):
+        return []
+
+    return [
+        Diagnostic(
+            id="config.backend.per_vm_resources_unsupported",
+            severity="warning",
+            message=(
+                f"lab {lab.metadata.name!r} declares heterogeneous per-VM "
+                "resources, but the local-libvirt backend applies global "
+                "var.vm_memory/var.vm_vcpu uniformly. Per-VM resources will "
+                "not be honored until tofu is enriched."
+            ),
+            source=source,
+            key_path="spec.vms[*].resources",
+            suggestion=(
+                "tune var.vm_memory and var.vm_vcpu in tofu/terraform.tfvars "
+                "to fit the largest VM, or wait for tofu support for per-VM "
+                "resources"
+            ),
+        )
+    ]
 
 
 def _resources_for_vm(loaded: LoadedConfig, vm: LabVm) -> Resources | None:
