@@ -16,13 +16,18 @@ from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
-from playground.backend.local_libvirt.runner import execute_apply, execute_destroy
+from playground.backend.local_libvirt.runner import (
+    execute_apply,
+    execute_destroy,
+    execute_reset,
+)
 from playground.backend.local_libvirt.status import query_status
 from playground.backend.local_libvirt.tfvars import render_tfvars
 
 __all__ = [
     "execute_apply",
     "execute_destroy",
+    "execute_reset",
     "fetch_vm_ips",
     "query_status",
     "render_inventory",

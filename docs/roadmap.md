@@ -549,6 +549,50 @@ pre-apply hook so `playground apply` runs the doctor checks
 first and refuses to proceed on errors. Keep the manual command
 either way for "what's wrong before I even try?".
 
+## 13. `playground reset` — scrub-by-name cleanup
+
+Status: done.
+
+The cleanup path of last resort. ``playground destroy`` is
+tofu-state-driven and refuses to make progress when state is
+corrupt or out of sync with reality. ``playground reset`` skips
+that dependency: it reads the lab YAML, enumerates expected
+libvirt resources by name, and force-removes whatever's there.
+
+Steps:
+
+1. **scrub-libvirt** — for every VM in the resolved lab, run
+   `virsh destroy` then
+   `virsh undefine --nvram --managed-save --snapshots-metadata`;
+   delete `<vm>.qcow2` and `commoninit-<vm>.iso` from the
+   `default` pool. For every network, run `virsh net-destroy`
+   then `virsh net-undefine`. Resources are only touched when a
+   pre-flight `virsh ... --all --name` listing shows they exist,
+   so the step is idempotent (re-running is a no-op). Fatal on
+   missing `virsh` or unreachable libvirtd; tolerant of
+   "domain not running", "network not active", etc.
+2. **tofu-destroy** — best-effort. Step 1 already cleaned
+   reality, so a tofu failure here just means state may hold
+   stale entries; emit `runtime.reset.tofu_destroy_warning` and
+   continue.
+3. **clean-state-files** — remove the lab's per-lab artifacts
+   under `.playground/state/{tofu,inventory,workloads}/`. Never
+   touches the shared `tofu/terraform.tfstate`, the
+   `ubuntu-noble.qcow2` base image, other labs' state, or any
+   `OperationRun` records under `.playground/runs/`.
+
+Diagnostic IDs: `runtime.reset.*`. Lifecycle is the standard
+OperationRun (`operation: "reset"`) so reset runs show up in
+`playground runs list` and the TUI alongside apply/destroy.
+
+Module: `src/playground/backend/local_libvirt/scrub.py`
+(pure scrub logic; subprocess-shimmed in tests). Orchestrator:
+`execute_reset` in `runner.py`. CLI: `reset_command` in
+`cli/main.py`. Tests: 7 unit tests for `scrub_lab` (every
+tolerance + every fatal path) + 5 CLI tests (full pipeline,
+tofu failure, mocked execute_reset, failure surface, JSON
+shape).
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

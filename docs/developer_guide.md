@@ -333,6 +333,7 @@ Typer entry point. Subcommands:
 | `playground status <lab>` | observed state snapshot | no |
 | `playground apply <lab>` | full deploy (tfvars → tofu → inventory → ansible) | **yes** |
 | `playground destroy <lab>` | `tofu destroy` | **yes** |
+| `playground reset <lab>` | scrub-by-name (virsh) + best-effort tofu destroy + per-lab state wipe | **yes** |
 | `playground runs list` / `runs show <id>` | browse past operations | no |
 | `playground tui` | launch Textual TUI | inside |
 

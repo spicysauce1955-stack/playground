@@ -66,6 +66,305 @@ def _write_apply_shims(
     return bin_dir
 
 
+def _write_reset_shims(
+    tmp_path: Path, *, tofu_destroy_exit: int = 0
+) -> Path:
+    """PATH shim with virsh + tofu for `playground reset` integration tests.
+
+    virsh emits canned listings keyed on the subcommand so the scrub
+    sees ``node1`` / ``edge`` etc. as present, then every other call
+    (destroy / undefine / vol-delete) succeeds. tofu destroy is
+    parametrizable to validate the best-effort tofu warning path.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    virsh = bin_dir / "virsh"
+    virsh.write_text(
+        "#!/usr/bin/env bash\n"
+        '# strip global flags so positional logic is easier\n'
+        "args=()\n"
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in --quiet|--connect) shift; [ "$1" != "" ] && [ "${1:0:1}" != "-" ] && shift ;;\n'
+        '    *) args+=("$1"); shift ;;\n'
+        "  esac\n"
+        "done\n"
+        '# The --connect URI follows --connect; the strip above already handled it.\n'
+        'case "${args[0]}" in\n'
+        '  list) echo "node1"; echo "docker1"; echo "router1" ;;\n'
+        '  net-list) echo "edge"; echo "lab-private"; echo "routed-a" ;;\n'
+        '  vol-list)\n'
+        '    echo " Name                Path"\n'
+        '    echo "-------------------------------------"\n'
+        '    for vm in node1 docker1 router1; do\n'
+        '      echo " ${vm}.qcow2          /var/lib/libvirt/images/${vm}.qcow2"\n'
+        '      echo " commoninit-${vm}.iso /var/lib/libvirt/images/commoninit-${vm}.iso"\n'
+        '    done\n'
+        '    echo " ubuntu-noble.qcow2     /var/lib/libvirt/images/ubuntu-noble.qcow2"\n'
+        '    ;;\n'
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    virsh.chmod(virsh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    tofu = bin_dir / "tofu"
+    tofu.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f"  destroy) exit {tofu_destroy_exit} ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
+
+
+def test_reset_full_pipeline_scrubs_and_cleans_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: virsh + tofu shimmed, lab state files pre-populated,
+    `playground reset` removes everything. Validates step ordering and
+    cleanup contract together."""
+    bin_dir = _write_reset_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    # Pre-populate the per-lab state files the cleanup step targets.
+    tfvars = state_dir / "state" / "tofu" / "generic-infra.tfvars.json"
+    inventory = state_dir / "state" / "inventory" / "generic-infra.ini"
+    workloads = state_dir / "state" / "workloads" / "generic-infra"
+    tfvars.parent.mkdir(parents=True, exist_ok=True)
+    inventory.parent.mkdir(parents=True, exist_ok=True)
+    workloads.mkdir(parents=True, exist_ok=True)
+    tfvars.write_text("{}\n")
+    inventory.write_text("[playground]\n")
+    (workloads / "stale.txt").write_text("leftover\n")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "reset",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--state-dir",
+            str(state_dir),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["operation"] == "reset"
+    assert payload["status"] == "succeeded"
+    assert [s["name"] for s in payload["steps"]] == [
+        "scrub-libvirt",
+        "tofu-destroy",
+        "clean-state-files",
+    ]
+    assert all(s["exit_code"] == 0 for s in payload["steps"])
+
+    # Per-lab state files were removed; the inventory + workloads dir
+    # are gone. tofu working dir is untouched.
+    assert not inventory.exists()
+    # tfvars gets re-rendered by execute_reset before scrub, then
+    # cleaned up at the end — assert post-state, not in-flight state.
+    assert not tfvars.exists()
+    assert not workloads.exists()
+    assert tofu_dir.exists()
+
+    # The run record on disk matches the printed payload.
+    run_dir = state_dir / "runs" / payload["run_id"]
+    on_disk = json.loads((run_dir / "run.json").read_text())
+    assert on_disk["operation"] == "reset"
+
+
+def test_reset_continues_when_tofu_destroy_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tofu destroy is best-effort: a non-zero exit becomes a warning,
+    but the cleanup step still runs and the overall reset succeeds."""
+    bin_dir = _write_reset_shims(tmp_path, tofu_destroy_exit=2)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    tfvars = state_dir / "state" / "tofu" / "generic-infra.tfvars.json"
+    tfvars.parent.mkdir(parents=True, exist_ok=True)
+    tfvars.write_text("{}\n")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "reset",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--state-dir",
+            str(state_dir),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "succeeded"
+    # The tofu warning is on the diagnostics list.
+    diag_ids = [d["id"] for d in payload["diagnostics"]]
+    assert "runtime.reset.tofu_destroy_warning" in diag_ids
+    # State files still cleaned despite tofu failure.
+    assert not tfvars.exists()
+
+
+def test_reset_invokes_execute_reset_and_prints_run_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from playground.cli import main as cli_main
+    from playground.runs import OperationRun
+
+    captured: dict[str, object] = {}
+
+    def _stub_execute_reset(**kwargs: object) -> tuple[OperationRun, list[object]]:
+        captured.update(kwargs)
+        run = OperationRun(
+            run_id="20260519T000000Z-reset-generic-infra",
+            operation="reset",
+            lab="generic-infra",
+            status="succeeded",
+            started_at="2026-05-19T00:00:00+00:00",
+            finished_at="2026-05-19T00:00:01+00:00",
+            steps=[],
+            summary="reset lab 'generic-infra' (scrubbed by name)",
+        )
+        return run, []
+
+    monkeypatch.setattr(cli_main, "execute_reset", _stub_execute_reset)
+    result = CliRunner().invoke(
+        app,
+        [
+            "reset",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "reset lab 'generic-infra'" in result.stdout
+    assert "20260519T000000Z-reset-generic-infra" in result.stdout
+    # Sanity: the CLI passed the resolved lab + state dir through.
+    assert captured["state_dir"] == tmp_path / "state"
+
+
+def test_reset_surfaces_failure_with_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from playground.cli import main as cli_main
+    from playground.models.diagnostic import Diagnostic
+    from playground.runs import OperationRun, StepResult
+
+    def _stub_execute_reset(**_kwargs: object) -> tuple[OperationRun, list[Diagnostic]]:
+        run = OperationRun(
+            run_id="failed-run",
+            operation="reset",
+            lab="generic-infra",
+            status="failed",
+            started_at="2026-05-19T00:00:00+00:00",
+            finished_at="2026-05-19T00:00:01+00:00",
+            steps=[
+                StepResult(
+                    name="scrub-libvirt",
+                    command=["virsh"],
+                    exit_code=127,
+                    log_path=str(tmp_path / "scrub.log"),
+                    started_at="2026-05-19T00:00:00+00:00",
+                    finished_at="2026-05-19T00:00:01+00:00",
+                )
+            ],
+            summary="reset aborted",
+        )
+        return run, [
+            Diagnostic(
+                id="runtime.reset.virsh_missing",
+                severity="error",
+                message="virsh missing",
+            )
+        ]
+
+    monkeypatch.setattr(cli_main, "execute_reset", _stub_execute_reset)
+    result = CliRunner().invoke(
+        app,
+        [
+            "reset",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "runtime.reset.virsh_missing" in result.stderr
+
+
+def test_reset_json_output_includes_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from playground.cli import main as cli_main
+    from playground.models.diagnostic import Diagnostic
+    from playground.runs import OperationRun
+
+    def _stub_execute_reset(**_kwargs: object) -> tuple[OperationRun, list[Diagnostic]]:
+        run = OperationRun(
+            run_id="r1",
+            operation="reset",
+            lab="generic-infra",
+            status="succeeded",
+            started_at="2026-05-19T00:00:00+00:00",
+            finished_at="2026-05-19T00:00:01+00:00",
+            steps=[],
+            summary="reset done",
+        )
+        return run, [
+            Diagnostic(
+                id="runtime.reset.tofu_destroy_warning",
+                severity="warning",
+                message="tofu destroy exited 1",
+            )
+        ]
+
+    monkeypatch.setattr(cli_main, "execute_reset", _stub_execute_reset)
+    result = CliRunner().invoke(
+        app,
+        [
+            "reset",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--output",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["operation"] == "reset"
+    assert payload["status"] == "succeeded"
+    assert payload["diagnostics"][0]["id"] == "runtime.reset.tofu_destroy_warning"
+
+
 def test_doctor_all_passing_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     from playground.cli import main as cli_main
 

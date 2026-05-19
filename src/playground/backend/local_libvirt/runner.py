@@ -35,6 +35,7 @@ from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
+from playground.backend.local_libvirt.scrub import scrub_lab
 from playground.backend.local_libvirt.tfvars import render_tfvars
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic
@@ -213,6 +214,202 @@ def execute_destroy(
     return finished, []
 
 
+def execute_reset(
+    *,
+    resolved: ResolvedLab,
+    state_dir: Path,
+    tofu_dir: Path,
+    bus: EventBus,
+) -> tuple[OperationRun, list[Diagnostic]]:
+    """Scrub-by-name → best-effort tofu destroy → wipe per-lab state files.
+
+    The lab-state cleanup path of last resort. Used when ``playground
+    destroy`` can't proceed (tofu state corrupt, libvirt out of sync,
+    lab YAML changed without a prior destroy). The lab YAML is the only
+    source of truth for which resources to remove — tofu state is
+    treated as best-effort.
+
+    Lifecycle is the same as ``execute_destroy`` (OperationRun +
+    EventBus + step records) so the resulting run shows up in
+    ``playground runs list`` and the TUI alongside apply/destroy.
+
+    Order matters:
+
+    1. **scrub-libvirt**: enumerate live libvirt resources, force-stop
+       and undefine the ones whose names match this lab's VMs and
+       networks; remove per-VM disk volumes and cloud-init ISOs in the
+       default pool. Skipped silently on "already gone". Fatal on
+       missing virsh or unreachable libvirtd.
+    2. **tofu-destroy**: best-effort. tofu state may already match
+       reality (everything destroyed) or be irrecoverably out of sync.
+       Non-zero exit attaches a warning diagnostic but does not fail
+       the reset — the operator chose reset precisely because tofu
+       was already unreliable.
+    3. **clean-state-files**: remove per-lab artifacts under
+       ``.playground/state/{tofu,inventory,workloads}/`` so the next
+       ``playground apply`` starts from a clean slate. Shared
+       artifacts (tofu/terraform.tfstate, ubuntu-noble.qcow2 base
+       image) are never touched.
+
+    Returns ``(OperationRun, diagnostics)``. The run's ``status`` is
+    ``succeeded`` when step 1 succeeded; the tofu warning and any
+    state-file warnings live on the diagnostics list regardless.
+    """
+    lab = resolved.lab_name
+    runs_dir = state_dir / "runs"
+    run, run_dir = start_run(runs_dir, "reset", lab)
+    logs_dir = run_dir / "logs"
+    bus.subscribe(JsonlWriter(run_dir))
+    bus.publish(run.run_id, "operation_started", {"operation": "reset", "lab": lab})
+
+    tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
+    inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
+    workload_dir = state_dir / "state" / "workloads" / lab
+
+    tfvars_path.parent.mkdir(parents=True, exist_ok=True)
+    tfvars = render_tfvars(resolved)
+    tfvars_path.write_text(json.dumps(tfvars, indent=2, sort_keys=True) + "\n")
+
+    steps: list[StepResult] = []
+    all_diagnostics: list[Diagnostic] = []
+
+    # ---- Step 1: scrub-libvirt (fatal on virsh missing/unreachable) ----
+    bus.publish(run.run_id, "step_started", {"step": "scrub-libvirt"})
+    scrub_step, scrub_diagnostics = scrub_lab(
+        resolved=resolved,
+        log_path=logs_dir / "scrub-libvirt.log",
+        bus=bus,
+        run_id=run.run_id,
+    )
+    steps.append(scrub_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "scrub-libvirt", "exit_code": scrub_step.exit_code},
+    )
+    fatal_scrub = [
+        d for d in scrub_diagnostics
+        if d.id in ("runtime.reset.virsh_missing", "runtime.reset.virsh_unreachable")
+    ]
+    all_diagnostics.extend(scrub_diagnostics)
+    if fatal_scrub:
+        return _finalize_failure(
+            run, run_dir, steps, bus, all_diagnostics,
+            "reset aborted: virsh missing or libvirtd unreachable",
+        )
+
+    # ---- Step 2: tofu-destroy (best-effort) ----
+    bus.publish(run.run_id, "step_started", {"step": "tofu-destroy"})
+    tofu_step, tofu_diagnostics = run_tofu_destroy(
+        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log",
+        bus=bus, run_id=run.run_id,
+    )
+    steps.append(tofu_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "tofu-destroy", "exit_code": tofu_step.exit_code},
+    )
+    if tofu_step.exit_code != 0:
+        # Downgrade severity: scrub already cleaned reality, so a tofu
+        # failure here is informational. Surface it as a warning so the
+        # operator knows tofu state may still have stale entries.
+        all_diagnostics.append(
+            Diagnostic(
+                id="runtime.reset.tofu_destroy_warning",
+                severity="warning",
+                message=(
+                    f"`tofu destroy` exited {tofu_step.exit_code} during reset; "
+                    "scrub-libvirt already removed lab resources, but tofu "
+                    "state may still hold stale entries"
+                ),
+                suggestion=(
+                    "`cd tofu && tofu state list` to inspect; "
+                    "`tofu state rm` to drop stale entries manually"
+                ),
+            )
+        )
+
+    # ---- Step 3: clean-state-files (warnings only on per-file failure) ----
+    bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
+    cleanup_step, cleanup_diagnostics = _clean_state_files(
+        lab=lab,
+        targets=[tfvars_path, inventory_path, workload_dir],
+        log_path=logs_dir / "clean-state-files.log",
+    )
+    steps.append(cleanup_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "clean-state-files", "exit_code": cleanup_step.exit_code},
+    )
+    all_diagnostics.extend(cleanup_diagnostics)
+
+    finished = finish_run(
+        run, run_dir, status="succeeded", steps=steps,
+        summary=f"reset lab {lab!r} (scrubbed by name)",
+    )
+    bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
+    return finished, all_diagnostics
+
+
+def _clean_state_files(
+    *,
+    lab: str,
+    targets: list[Path],
+    log_path: Path,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Remove per-lab artifacts under ``.playground/state/``.
+
+    Each target is either a file or a directory. Missing paths are
+    silently OK (the goal is "be gone"). Any other OSError emits a
+    warning diagnostic so the operator can clean up manually.
+    """
+    from datetime import UTC, datetime
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    lines = [f"# clean-state-files for lab {lab!r}"]
+    diagnostics: list[Diagnostic] = []
+    removed: list[str] = []
+
+    for target in targets:
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+                removed.append(str(target))
+                lines.append(f"removed dir {target}")
+            elif target.exists():
+                target.unlink()
+                removed.append(str(target))
+                lines.append(f"removed file {target}")
+            else:
+                lines.append(f"skipped (absent) {target}")
+        except OSError as exc:
+            lines.append(f"FAILED to remove {target}: {exc}")
+            diagnostics.append(
+                Diagnostic(
+                    id="runtime.reset.state_cleanup_failed",
+                    severity="warning",
+                    message=f"could not remove per-lab state {target}: {exc}",
+                    suggestion=f"remove manually: `rm -rf {target}`",
+                )
+            )
+
+    if not removed and not diagnostics:
+        lines.append("nothing to remove (no per-lab state files present)")
+    log_path.write_text("\n".join(lines) + "\n")
+
+    return (
+        StepResult(
+            name="clean-state-files",
+            command=["python", "-c", "clean-state-files"],
+            exit_code=1 if diagnostics else 0,
+            log_path=str(log_path),
+            started_at=started_at,
+            finished_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+        ),
+        diagnostics,
+    )
+
+
 def _finalize_failure(
     run: OperationRun,
     run_dir: Path,
@@ -230,4 +427,4 @@ def _finalize_failure(
     return finished, diagnostics
 
 
-__all__ = ["execute_apply", "execute_destroy"]
+__all__ = ["execute_apply", "execute_destroy", "execute_reset"]

@@ -132,7 +132,8 @@ playground apply generic-infra                   # tofu + ansible + record run
 playground status generic-infra                  # what's provisioned now
 playground runs list                             # browse past operations
 playground runs show <run-id>                    # inspect events.jsonl timeline
-playground destroy generic-infra                 # tear down
+playground destroy generic-infra                 # tear down via tofu
+playground reset generic-infra                   # scrub-by-name when destroy fails
 playground tui                                   # Textual UI over everything above
 ```
 

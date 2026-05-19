@@ -13,6 +13,7 @@ import typer
 from playground.backend.local_libvirt import (
     execute_apply,
     execute_destroy,
+    execute_reset,
     fetch_vm_ips,
     query_status,
     render_inventory,
@@ -889,6 +890,74 @@ def destroy_command(
         return
 
     typer.echo(f"destroyed lab {lab!r}")
+    typer.echo(f"  run: {finished.run_id}")
+    typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
+
+
+@app.command("reset")
+def reset_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to scrub.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Scrub ``lab`` by name when tofu destroy isn't enough.
+
+    Cleanup path of last resort: enumerates lab YAML, force-removes
+    every matching libvirt domain / network / per-VM volume via virsh,
+    runs ``tofu destroy`` best-effort, then deletes the lab's per-lab
+    state files under ``.playground/state/``. Doesn't touch the shared
+    ``ubuntu-noble.qcow2`` base image or other labs' state.
+
+    Use this when ``playground destroy`` fails because tofu state got
+    out of sync with reality (corrupt state, manual virsh undefine, lab
+    YAML renamed). A second ``reset`` on a clean lab is a no-op.
+    """
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+
+    bus = EventBus()
+    finished, reset_diagnostics = execute_reset(
+        resolved=resolved,
+        state_dir=state_dir,
+        tofu_dir=tofu_dir,
+        bus=bus,
+    )
+
+    if finished.status == "failed":
+        _present_apply_failure(output, finished, reset_diagnostics, state_dir)
+        raise typer.Exit(code=1)
+
+    if output is OutputFormat.json:
+        payload = finished.model_dump(mode="json", exclude_none=True)
+        payload["diagnostics"] = [_diagnostic_to_dict(d) for d in reset_diagnostics]
+        _print_json(payload)
+        return
+
+    if reset_diagnostics:
+        _print_diagnostics(reset_diagnostics, err=True)
+    typer.echo(f"reset lab {lab!r}")
     typer.echo(f"  run: {finished.run_id}")
     typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
 
