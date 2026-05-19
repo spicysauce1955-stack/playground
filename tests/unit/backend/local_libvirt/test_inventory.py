@@ -73,6 +73,28 @@ def test_render_inventory_emits_pg_workloads_for_scheduled_host(
     assert "pg_workloads=" not in node_line
 
 
+def test_render_inventory_emits_pg_extra_hosts_when_set(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    # Pin extra_hosts on docker1 only.
+    docker = next(vm for vm in resolved_generic_infra.vms if vm.name == "docker1")
+    pinned = docker.model_copy(
+        update={"extra_hosts": ["10.0.10.99 db", "10.0.10.100 cache"]}
+    )
+    others = [vm for vm in resolved_generic_infra.vms if vm.name != "docker1"]
+    lab = resolved_generic_infra.model_copy(update={"vms": [*others, pinned]})
+
+    body, diagnostics = render_inventory(lab, lab_ips)
+
+    assert diagnostics == []
+    docker_line = next(line for line in body.splitlines() if line.startswith("docker1 "))
+    assert "pg_extra_hosts=" in docker_line
+    assert "10.0.10.99 db" in docker_line
+    # VMs without extra_hosts get no key.
+    node_line = next(line for line in body.splitlines() if line.startswith("node1 "))
+    assert "pg_extra_hosts" not in node_line
+
+
 def test_render_inventory_emits_swarm_groups_when_swarm_workload_present(
     resolved_generic_infra, lab_ips: dict[str, str]
 ) -> None:

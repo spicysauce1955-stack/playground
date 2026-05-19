@@ -1,0 +1,22 @@
+---
+# Append the lab's `vms[*].extra_hosts` lines to /etc/hosts on each VM.
+# Workaround for the missing lab-scoped DNS — gives cross-VM tests a
+# hostname for each peer without standing up a resolver.
+#
+# Idempotent: lineinfile only inserts a line when it isn't already
+# present, so re-running `playground apply` reports `changed=0`.
+
+- name: Parse pg_extra_hosts JSON payload
+  ansible.builtin.set_fact:
+    pg_extra_hosts_parsed: "{{ pg_extra_hosts | from_json }}"
+
+- name: Skip when no extra_hosts entries
+  ansible.builtin.meta: end_host
+  when: pg_extra_hosts_parsed | length == 0
+
+- name: Append extra_hosts entries to /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ item }}"
+    state: present
+  loop: "{{ pg_extra_hosts_parsed }}"

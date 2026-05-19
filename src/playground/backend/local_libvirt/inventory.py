@@ -227,6 +227,13 @@ def render_inventory(
         swarm_role = swarm_membership.get(vm.name, "none")
         if swarm_role != "none":
             host_vars.append(f"pg_swarm_role={swarm_role}")
+        if vm.extra_hosts:
+            # JSON-encoded list of /etc/hosts lines. Same shell-escape
+            # pattern as pg_workloads — embedded single quotes are
+            # rare but possible in hostnames-with-comments.
+            entries = json.dumps(list(vm.extra_hosts), separators=(",", ":"))
+            escaped = entries.replace("'", "'\\''")
+            host_vars.append(f"pg_extra_hosts='{escaped}'")
         workloads = schedule.get(vm.name, [])
         if workloads:
             # JSON-encoded list of workload dicts. Ansible reads it via

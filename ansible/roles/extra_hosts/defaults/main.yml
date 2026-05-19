@@ -1,0 +1,7 @@
+---
+# Default values for the extra_hosts role.
+#
+# pg_extra_hosts is JSON-encoded by `playground inventory render` from
+# the lab's `vms[*].extra_hosts`. Each entry is a literal /etc/hosts
+# line (e.g. "10.20.40.21 target"). Empty list => the role is a no-op.
+pg_extra_hosts: '[]'
