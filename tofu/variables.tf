@@ -33,6 +33,18 @@ variable "vm_network_ips" {
   default     = {}
 }
 
+variable "dns_domain" {
+  description = "Per-lab DNS domain. Every libvirt_network uses it as its `domain` attribute so dnsmasq serves <hostname>.<dns_domain> for every VM with a pinned IP. Set via `playground tofu render` from the lab's spec.dns_domain (default: <lab-name>.lab)."
+  type        = string
+  default     = "playground.lab"
+}
+
+variable "vm_dns_hosts" {
+  description = "Per-network DNS records to register with libvirt. Keyed by network name; each value is a list of {hostname, ip} maps. Populated from the lab's per-VM pinned IPs so cross-VM hostname resolution works without /etc/hosts."
+  type        = map(list(object({ hostname = string, ip = string })))
+  default     = {}
+}
+
 variable "vm_memory" {
   description = "Amount of RAM per VM in MB"
   type        = number

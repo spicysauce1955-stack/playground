@@ -799,6 +799,107 @@ def test_network_ip_not_a_valid_address(committed_load: LoadedConfig) -> None:
     assert "'nope'" in matching[0].message
 
 
+def test_dns_domain_silent_when_unset(committed_load: LoadedConfig) -> None:
+    """A lab without `spec.dns_domain` should not emit the diagnostic;
+    the resolver fills in `<lab>.lab` later."""
+    diagnostics = validate(committed_load)
+    matching = [d for d in diagnostics if d.id == "config.network.dns_domain_invalid"]
+    assert matching == []
+
+
+def test_dns_domain_accepts_valid_override(committed_load: LoadedConfig) -> None:
+    bad = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: valid-dns
+        spec:
+          backend: local-libvirt
+          dns_domain: my-lab.internal
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks: [net]
+        """
+    )
+    committed_load.labs[bad.metadata.name] = bad
+    diagnostics = validate(committed_load)
+    matching = [d for d in diagnostics if d.id == "config.network.dns_domain_invalid"]
+    assert matching == []
+
+
+@pytest.mark.parametrize(
+    "bad_domain",
+    [
+        ".leading-dot",
+        "double..dot",
+        "UPPER.case",
+        "has spaces.lab",
+        "has_underscore.lab",
+        "ends-dash-.lab",
+    ],
+)
+def test_dns_domain_rejects_malformed(committed_load: LoadedConfig, bad_domain: str) -> None:
+    bad = _yaml_to_lab(
+        f"""
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: bad-dns
+        spec:
+          backend: local-libvirt
+          dns_domain: "{bad_domain}"
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks: [net]
+        """
+    )
+    committed_load.labs[bad.metadata.name] = bad
+    diagnostics = validate(committed_load)
+    matching = [d for d in diagnostics if d.id == "config.network.dns_domain_invalid"]
+    assert len(matching) == 1
+    assert matching[0].key_path == "spec.dns_domain"
+    assert "bad-dns" in matching[0].message
+
+
+def test_dns_domain_rejects_overlong_label(committed_load: LoadedConfig) -> None:
+    overlong = "a" * 64 + ".lab"
+    bad = _yaml_to_lab(
+        f"""
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: overlong-label
+        spec:
+          backend: local-libvirt
+          dns_domain: "{overlong}"
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks: [net]
+        """
+    )
+    committed_load.labs[bad.metadata.name] = bad
+    diagnostics = validate(committed_load)
+    matching = [d for d in diagnostics if d.id == "config.network.dns_domain_invalid"]
+    assert len(matching) == 1
+    assert "label longer than 63" in matching[0].message
+
+
 def test_unknown_image_reference_against_artifact_sources(
     committed_load: LoadedConfig,
 ) -> None:

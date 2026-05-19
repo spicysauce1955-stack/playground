@@ -17,6 +17,15 @@ What gets emitted:
 - ``vm_network_ips`` — ``{vm_name: {net_name: ip}}`` derived from
   ``ResolvedVm.network_ips``. Pinned IPs become the interface's
   ``addresses``.
+- ``dns_domain`` — the lab's DNS domain (always populated;
+  resolver defaults to ``<lab_name>.lab``). Becomes each
+  ``libvirt_network``'s ``domain`` so dnsmasq serves
+  ``<vm>.<dns_domain>`` records.
+- ``vm_dns_hosts`` — ``{net_name: [{hostname, ip}, ...]}`` derived
+  from every (vm, network) pair where the lab pins an IP. Becomes
+  authoritative ``dns { hosts { ... } }`` blocks on the matching
+  ``libvirt_network`` so cross-VM hostname resolution works
+  without ``/etc/hosts`` entries.
 
 Per-VM resources (``memory_mb``, ``vcpu``, ``disk_gb``) are intentionally
 **not** emitted — today's ``tofu/main.tf`` accepts only global
@@ -50,6 +59,7 @@ def render_tfvars(resolved: ResolvedLab) -> dict[str, Any]:
     """
     payload: dict[str, Any] = {
         "vm_names": [vm.name for vm in resolved.vms],
+        "dns_domain": resolved.dns_domain,
     }
 
     if resolved.networks:
@@ -72,6 +82,15 @@ def render_tfvars(resolved: ResolvedLab) -> dict[str, Any]:
     }
     if vm_network_ips:
         payload["vm_network_ips"] = vm_network_ips
+
+    vm_dns_hosts: dict[str, list[dict[str, str]]] = {}
+    for vm in resolved.vms:
+        for net_name, ip in vm.network_ips.items():
+            vm_dns_hosts.setdefault(net_name, []).append(
+                {"hostname": vm.name, "ip": ip}
+            )
+    if vm_dns_hosts:
+        payload["vm_dns_hosts"] = vm_dns_hosts
 
     return payload
 

@@ -22,16 +22,12 @@ spec:
       networks:
         - name: deploy-net
           ip: 10.20.40.20
-      extra_hosts:
-        - "10.20.40.21 target"
 
     - name: target
       role: deployment-target
       networks:
         - name: deploy-net
           ip: 10.20.40.21
-      extra_hosts:
-        - "10.20.40.20 central"
 
   providers:
     local-libvirt:

@@ -148,6 +148,24 @@ def test_cross_vm_ship_and_deploy() -> None:
         assert sanity_target.returncode == 0, sanity_target.stderr
         assert "active" in sanity_target.stdout
 
+        # Spec gap closed: lab-scoped DNS replaces extra_hosts.
+        # `central` resolves `target` via libvirt's authoritative DNS
+        # records (and `target.<lab>.lab` via the network's `domain`
+        # attribute), and cloud-init makes `hostname` return the short
+        # name locally.
+        dns_short = _ssh(ips["central"], "ssh -o StrictHostKeyChecking=accept-new "
+                          "-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "
+                          "ubuntu@target hostname")
+        assert dns_short.returncode == 0, dns_short.stderr
+        assert dns_short.stdout.strip() == "target", (
+            f"hostname on target should be 'target', got {dns_short.stdout!r}"
+        )
+        dns_fqdn = _ssh(ips["central"], "getent hosts target.barak-deploy-cross-vm.lab")
+        assert dns_fqdn.returncode == 0, dns_fqdn.stderr
+        assert "10.20.40.21" in dns_fqdn.stdout, (
+            f"FQDN lookup did not resolve to pinned IP: {dns_fqdn.stdout!r}"
+        )
+
         # Trigger the ship-deploy flow.
         ship = _ssh(ips["central"], "/usr/local/bin/ship-deploy.sh")
         assert ship.returncode == 0, (

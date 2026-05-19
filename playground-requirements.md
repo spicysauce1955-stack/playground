@@ -30,7 +30,9 @@ test-runner workflow.
 | §3c | `ssh_keypair_receiver` ansible role | ✅ Shipped (platform-generic) |
 | §3d | `barak_deploy_staging` ansible role | ✅ Shipped |
 | §3e | `barak_deploy_agent` ansible role | ✅ Shipped |
-| §4 | Inter-VM hostname resolution via `extra_hosts` | ✅ Shipped — new generic `extra_hosts` role + `pg_extra_hosts` host var |
+| §4 | Inter-VM hostname resolution via `extra_hosts` | ✅ Shipped — initially via generic `extra_hosts` role + `pg_extra_hosts`; now redundantly covered by lab-scoped DNS (see §11 below) |
+| §11 (post-spec) | Lab-scoped DNS retires the per-lab `extra_hosts` workaround | ✅ Shipped — `LabSpec.dns_domain` + libvirt `dns { hosts }` + cloud-init `hostname/fqdn` |
+| §11 (post-spec) | `common` baseline ansible role (UTC tz + jq/curl/ca-certs) | ✅ Shipped |
 | §5 | Site playbook ordering (central → target) | ✅ Shipped via per-host-class plays in `ansible/site.yml` |
 | §6 (option A) | `playground exec --on <vm> <cmd>` CLI helper | ✅ Shipped — defaults `--lab` to the only configured lab; propagates remote exit code; 6 CLI tests |
 | §6 (option B) | pytest-style multi-VM integration test | ✅ Shipped — `tests/integration/multi_vm/test_cross_vm_deploy.py`, gated on `PLAYGROUND_LIVE_INFRA=1` |
@@ -53,11 +55,14 @@ actually work** — also done:
 
 **Deliberately not done** (with reasons):
 
-- The spec's example `provisioning: ansible_roles: [common, docker, ...]`
-  lists a `common` baseline role. **Skipped** — the playground's VmRoles
-  list only the roles that actually do work, and `docker` is inherited
-  via `extends: docker-host` rather than re-listed. A real baseline-
-  hardening role can land as its own feature if a use case appears.
+- ~~The spec's example `provisioning: ansible_roles: [common, docker, ...]`
+  lists a `common` baseline role.~~ — **shipped** as
+  `ansible/roles/common/` (UTC timezone via
+  `community.general.timezone`; minimal `jq curl ca-certificates`
+  package install with cache_valid_time so it's idempotent).
+  Wired into `site.yml` between the `extra_hosts` play and the
+  per-host-class roles; future VmRoles can opt in by listing
+  `common` first.
 - ~~`playground exec --on <vm> <cmd>` CLI subcommand~~ — **shipped**
   as a generic operator primitive. The harness still uses plain
   `subprocess` + `ssh` (no need to retrofit), but operators have a
@@ -673,8 +678,14 @@ The test passes iff all of:
 Items the playground may want to address; not blocking for this test.
 **Status as of implementation:**
 
-- ~~**No lab-scoped DNS.**~~ Workaround via `extra_hosts` is shipped (§4).
-  True lab-scoped DNS remains on the roadmap backlog.
+- ~~**No lab-scoped DNS.**~~ **Shipped.** `LabSpec.dns_domain`
+  (resolver defaults to `<lab>.lab`) flows through `render_tfvars`
+  into `libvirt_network.domain` plus authoritative
+  `dns { hosts { hostname, ip } }` records; cloud-init sets
+  `hostname` / `fqdn` on each VM. The cross-VM lab dropped its
+  `extra_hosts` workaround as a result, and the live test asserts
+  hostname-based ssh + `getent hosts <vm>.<lab>.lab` as a
+  closing cross-check.
 - ~~**No `ip:` per-network specification in the lab YAML schema.**~~
   Shipped — `LabVmNetwork` accepts an optional `ip:` and the tofu module
   now pins it via `network_interface.addresses`. Legacy `list[str]`

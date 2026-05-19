@@ -444,6 +444,49 @@ Slice 10h (done): Harness hardening against pass/fail criteria.
   explains why criterion 4's "source on central" check is
   unreachable after ship-deploy.sh's `trap` cleans up its tmpdir.
 
+## 11. Baseline `common` role + lab-scoped DNS (follow-ups)
+
+Status: done.
+
+Two small follow-ups that close residual gaps in the cross-VM
+slice. Each is independently reviewable.
+
+Slice 11a (done): `common` baseline ansible role.
+
+- New `ansible/roles/common/` with two tasks: UTC timezone via
+  `community.general.timezone` and a minimal package install
+  (`jq curl ca-certificates`). Idempotent on re-apply; uses
+  `cache_valid_time: 3600` so apt skips redundant fetches.
+- `site.yml` runs `common` on `[playground]` between the
+  `extra_hosts` play and `Configure Playground Guests`. Spec'd
+  VmRoles can now list `common` as their first ansible role and
+  inherit a consistent baseline regardless of higher-level roles.
+
+Slice 11b (done): Lab-scoped DNS — retires the `extra_hosts`
+per-lab workaround.
+
+- `LabSpec.dns_domain: str | None`; resolver defaults to
+  `<lab.metadata.name>.lab` so every `ResolvedLab` has a
+  populated `dns_domain` regardless of whether the YAML sets one.
+- New validator diagnostic `config.network.dns_domain_invalid`
+  rejects malformed overrides (uppercase, leading dot, spaces,
+  labels > 63 chars, total > 253 chars).
+- `render_tfvars` emits two new top-level keys: `dns_domain`
+  (always) and `vm_dns_hosts` (one record per (vm, network) pin).
+- `tofu/variables.tf` gains `var.dns_domain` and
+  `var.vm_dns_hosts`; `tofu/main.tf` consumes both: every
+  `libvirt_network` sets `domain = var.dns_domain` and renders a
+  `dns { hosts { hostname, ip } }` block per registered VM.
+- `tofu/cloud_init.cfg` sets `hostname: ${vm_name}` and
+  `fqdn: ${vm_name}.${dns_domain}` with `preserve_hostname:
+  false`, so each VM advertises the right name via DHCP and
+  `hostname` returns the short name locally.
+- `config/labs/barak-deploy-cross-vm.yaml` dropped its
+  `extra_hosts` entries — DNS now resolves `central` / `target`
+  end-to-end. The live cross-VM test asserts hostname-based ssh
+  and a `getent hosts <vm>.<dns_domain>` lookup as a closing
+  cross-check.
+
 Carried forward to a follow-up:
 
 - Pre-existing minor validator quirk: the `unknown_image` check
@@ -459,11 +502,12 @@ captured here so they aren't lost.
 - `TargetSelector.network` field — requirements §5.9 calls for
   selectors keyed on **network** in addition to name / role / tag.
   Today's `TargetSelector` has `role / vm / tag / any` only.
-- Lab-scoped DNS — Story 5.2 / §5.6 require DNS names scoped per
-  lab. Today `tofu/main.tf` hardcodes `domain = "playground.local"`
-  and the schema has no per-lab `dns_domain`. Worth landing
-  alongside the §6 apply slice so DNS shows up correctly the first
-  time real VMs come up.
+- ~~Lab-scoped DNS — Story 5.2 / §5.6 require DNS names scoped per
+  lab.~~ **Shipped.** `LabSpec.dns_domain` (resolver defaults to
+  `<lab>.lab`) flows through `render_tfvars` into
+  `libvirt_network.domain` plus authoritative `dns { hosts { ... } }`
+  records, and cloud-init sets `hostname` / `fqdn` on each VM. The
+  cross-VM lab dropped its `extra_hosts` workaround as a result.
 - Runtime overrides + promote — Story 2.3 / §5.2 require temporary
   CLI/TUI overrides on top of YAML, with an explicit "promote back
   to YAML" path. Schema slot `ResolvedLab.runtime_overrides:

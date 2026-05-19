@@ -38,18 +38,36 @@ locals {
 }
 
 # One libvirt_network per entry in var.networks. NAT mode, DHCP enabled.
-# Domain name defaults to <network_name>.lab so different labs don't
-# collide on the same libvirt host.
+# `domain` is the lab-scoped DNS domain so dnsmasq on EACH network
+# serves the same suffix, letting any VM in the lab resolve any other
+# by short name (search domain) or FQDN. Per-VM hostname records
+# come from var.vm_dns_hosts — see the dynamic `dns` block below.
 resource "libvirt_network" "lab" {
   for_each = { for n in var.networks : n.name => n }
 
   name      = each.value.name
   mode      = "nat"
-  domain    = "${each.value.name}.lab"
+  domain    = var.dns_domain
   addresses = [each.value.cidr]
 
   dhcp {
     enabled = true
+  }
+
+  # Authoritative DNS records — set when the lab pinned IPs for VMs
+  # on this network. Belt-and-braces with cloud-init's self-registered
+  # hostname (cloud_init.cfg sets hostname/fqdn from the same data).
+  dynamic "dns" {
+    for_each = length(lookup(var.vm_dns_hosts, each.key, [])) > 0 ? [1] : []
+    content {
+      dynamic "hosts" {
+        for_each = var.vm_dns_hosts[each.key]
+        content {
+          hostname = hosts.value.hostname
+          ip       = hosts.value.ip
+        }
+      }
+    }
   }
 }
 
@@ -78,6 +96,8 @@ resource "libvirt_cloudinit_disk" "commoninit" {
   pool  = "default"
   user_data = templatefile("${path.module}/cloud_init.cfg", {
     ssh_public_key = file(var.ssh_public_key_path)
+    vm_name        = local.effective_vm_names[count.index]
+    dns_domain     = var.dns_domain
   })
 }
 

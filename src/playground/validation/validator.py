@@ -28,13 +28,23 @@ Diagnostic IDs:
   network's CIDR)
 - ``config.network.duplicate_ip`` (two VMs pin the same IP on the same
   network)
+- ``config.network.dns_domain_invalid`` (``Lab.spec.dns_domain`` doesn't
+  look like an RFC-1035-ish domain name)
 """
 
 from __future__ import annotations
 
 import ipaddress
+import re
 from pathlib import Path
 from typing import Literal
+
+# Loose RFC-1035-ish check: lowercase alphanum + hyphens, dot-separated
+# labels, no leading/trailing dot, no consecutive dots. Strict
+# per-label-≤63-chars and total-≤253 are enforced separately so the
+# regex stays scannable.
+_DNS_LABEL = r"[a-z0-9]([a-z0-9-]*[a-z0-9])?"
+_DNS_DOMAIN_RE = re.compile(rf"^{_DNS_LABEL}(\.{_DNS_LABEL})*$")
 
 from playground.config.loader import LoadedConfig
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -302,8 +312,47 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_offline_artifacts(lab, loaded, source))
     diagnostics.extend(_check_backend_capability(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
+    diagnostics.extend(_check_dns_domain(lab, source))
 
     return diagnostics
+
+
+def _check_dns_domain(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
+    """Reject obviously-malformed ``Lab.spec.dns_domain`` overrides.
+
+    Only fires when the lab sets ``dns_domain`` explicitly; the
+    resolver's default (``<lab-name>.lab``) is always valid by
+    construction.
+    """
+    raw = lab.spec.dns_domain
+    if raw is None:
+        return []
+    issues: list[str] = []
+    if len(raw) > 253:
+        issues.append("longer than 253 characters")
+    if not _DNS_DOMAIN_RE.fullmatch(raw):
+        issues.append("not RFC-1035-ish (lowercase a-z, 0-9, hyphens, dots)")
+    if any(len(label) > 63 for label in raw.split(".")):
+        issues.append("contains a label longer than 63 characters")
+    if not issues:
+        return []
+    return [
+        Diagnostic(
+            id="config.network.dns_domain_invalid",
+            severity="error",
+            message=(
+                f"lab {lab.metadata.name!r} declares dns_domain "
+                f"{raw!r}: {', '.join(issues)}"
+            ),
+            source=source,
+            key_path="spec.dns_domain",
+            suggestion=(
+                "use a domain like `my-lab.lab` (lowercase alphanum + "
+                "hyphens, dot-separated labels) or remove the override "
+                f"to use the default `{lab.metadata.name}.lab`"
+            ),
+        )
+    ]
 
 
 def _check_network_ips(lab: Lab, source: SourceLocation) -> list[Diagnostic]:

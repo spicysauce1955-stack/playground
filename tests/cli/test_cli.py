@@ -961,13 +961,21 @@ def test_tofu_render_writes_tfvars_and_json_payload(tmp_path: Path) -> None:
     assert payload["lab"] == "generic-infra"
     assert payload["path"] == str(out_path)
     # generic-infra has 3 networks + per-VM network attachments, so the
-    # renderer emits more than just vm_names. No IPs pinned in this lab.
-    assert set(payload["vars"]) == {"vm_names", "networks", "vm_networks"}
+    # renderer emits more than just vm_names. No IPs pinned in this lab,
+    # so vm_dns_hosts is absent; dns_domain defaults to <lab>.lab.
+    assert set(payload["vars"]) == {
+        "vm_names",
+        "networks",
+        "vm_networks",
+        "dns_domain",
+    }
     on_disk = json.loads(out_path.read_text())
     assert on_disk["vm_names"] == ["node1", "docker1", "router1"]
     assert {"name": "edge", "cidr": "10.20.10.0/24"} in on_disk["networks"]
     assert on_disk["vm_networks"]["docker1"] == ["edge", "lab-private"]
+    assert on_disk["dns_domain"] == "generic-infra.lab"
     assert "vm_network_ips" not in on_disk
+    assert "vm_dns_hosts" not in on_disk
     # Backend-capability warning surfaces during validate, on stderr
     assert "config.backend.per_vm_resources_unsupported" in result.stderr
 

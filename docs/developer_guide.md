@@ -514,11 +514,31 @@ Constraints that show up in code:
 (2), `ssh_public_key_path` (`~/.ssh/id_rsa.pub`), `ubuntu_image_url`. Override
 through `terraform.tfvars` or `-var`; never hardcode secrets in `.tf` files.
 
+**Lab-scoped DNS.** Each `libvirt_network` sets
+`domain = var.dns_domain` and renders authoritative
+`dns { hosts { hostname, ip } }` records populated from
+`var.vm_dns_hosts` (keyed by network name). `tofu/cloud_init.cfg`
+sets `hostname: ${vm_name}` and
+`fqdn: ${vm_name}.${dns_domain}` with `preserve_hostname: false`
+so each VM advertises the right name via DHCP. `render_tfvars`
+emits both vars from `ResolvedLab.dns_domain` (defaults to
+`<lab>.lab`) and per-VM `network_ips` pins — labs no longer need
+`extra_hosts` for intra-lab hostname resolution.
+
 ---
 
 ## Ansible roles (`ansible/`)
 
-Two roles wired through `ansible/site.yml`:
+`ansible/site.yml` runs several plays in order; the highlights:
+
+1. `Apply lab-declared extra_hosts entries` (legacy workaround,
+   still useful for non-lab hostnames).
+2. `Baseline configuration` → `common` role (UTC timezone via
+   `community.general.timezone`; minimal `jq curl ca-certificates`
+   install). Idempotent on re-apply.
+3. `Configure Playground Guests` → `docker` then `redroid`.
+4. Per-host-class plays for cross-VM labs (`docker_tunneler`,
+   `ssh_keypair_*`, `barak_deploy_staging`, `barak_deploy_agent`).
 
 ### `docker`
 

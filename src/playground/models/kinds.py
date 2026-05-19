@@ -398,6 +398,12 @@ class LabSpec(BaseModel):
     backend: str = Field(min_length=1)
     offline: bool = False
     budget: Budget | None = None
+    dns_domain: str | None = None
+    """Per-lab DNS domain. When unset, the resolver derives
+    ``<lab.metadata.name>.lab``. Used by the local-libvirt adapter to
+    populate ``libvirt_network.domain`` and per-VM
+    ``dns { hosts { hostname, ip } }`` so cross-VM hostname resolution
+    works without ``extra_hosts``."""
     networks: list[LabNetwork] = Field(default_factory=list)
     vms: list[LabVm] = Field(default_factory=list)
     workloads: list[LabWorkload] = Field(default_factory=list)

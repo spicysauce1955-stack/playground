@@ -120,6 +120,9 @@ class ResolvedLab(StrictModel):
     backend: str
     offline: bool
     budget: Budget
+    dns_domain: str
+    """Per-lab DNS domain. Always populated — defaults to
+    ``<lab_name>.lab`` when the lab YAML omits ``spec.dns_domain``."""
     defaults: ResolvedDefaults
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     networks: list[ResolvedNetwork]

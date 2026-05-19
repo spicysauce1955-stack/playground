@@ -154,6 +154,21 @@ def test_lab_vm_networks_accepts_object_shape_with_ip() -> None:
     assert nets[1].name == "deploy-net" and nets[1].ip == "10.20.40.42"
 
 
+def test_lab_dns_domain_defaults_to_none_at_parse_time() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    lab = parse_resource(raw)
+    assert isinstance(lab, Lab)
+    assert lab.spec.dns_domain is None
+
+
+def test_lab_dns_domain_parses_when_set() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    raw["spec"]["dns_domain"] = "demo.internal"
+    lab = parse_resource(raw)
+    assert isinstance(lab, Lab)
+    assert lab.spec.dns_domain == "demo.internal"
+
+
 def test_lab_vm_extra_hosts_defaults_to_empty_list() -> None:
     raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
     lab = parse_resource(raw)
