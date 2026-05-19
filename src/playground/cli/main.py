@@ -465,7 +465,8 @@ def apply_command(
     # 2. tofu apply
     bus.publish(run.run_id, "step_started", {"step": "tofu-apply"})
     tofu_step, tofu_diagnostics = run_tofu_apply(
-        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-apply.log"
+        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-apply.log",
+        bus=bus, run_id=run.run_id,
     )
     steps.append(tofu_step)
     bus.publish(
@@ -521,6 +522,7 @@ def apply_command(
         inventory_path.resolve(),
         logs_dir / "ansible.log",
         cwd=ansible_dir.parent.resolve(),
+        bus=bus, run_id=run.run_id,
     )
     steps.append(ansible_step)
     bus.publish(
@@ -776,7 +778,8 @@ def destroy_command(
     steps: list[StepResult] = []
     bus.publish(run.run_id, "step_started", {"step": "tofu-destroy"})
     tofu_step, tofu_diagnostics = run_tofu_destroy(
-        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log"
+        tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log",
+        bus=bus, run_id=run.run_id,
     )
     steps.append(tofu_step)
     bus.publish(

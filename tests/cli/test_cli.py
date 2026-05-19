@@ -364,15 +364,20 @@ def test_apply_writes_events_jsonl(
     events_path = state_dir / "runs" / run_id / "events.jsonl"
     assert events_path.exists()
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
-    types = [e["type"] for e in events]
-    assert types == [
+    # Filter out streaming log_line events to assert on the lifecycle skeleton.
+    skeleton = [e["type"] for e in events if e["type"] != "log_line"]
+    assert skeleton == [
         "operation_started",
-        "step_started",  # tofu-apply
+        "step_started",   # tofu-apply
         "step_finished",
-        "step_started",  # ansible-playbook
+        "step_started",   # ansible-playbook
         "step_finished",
         "operation_finished",
     ]
+    # And the streamed lines are present in the same log file.
+    log_lines = [e["payload"]["line"] for e in events if e["type"] == "log_line"]
+    assert any("tofu apply ok" in line for line in log_lines)
+    assert any("ansible ran" in line for line in log_lines)
     assert events[-1]["payload"] == {"status": "succeeded"}
 
 

@@ -29,7 +29,21 @@ EventType = Literal[
     "step_started",
     "step_finished",
     "operation_finished",
+    "log_line",
 ]
+"""Event types emitted by the platform.
+
+- ``operation_started`` / ``operation_finished`` bracket every run.
+- ``step_started`` / ``step_finished`` bracket every subprocess
+  invocation; ``step_finished.payload['exit_code']`` carries the
+  process exit code.
+- ``log_line`` carries one line of streamed subprocess stdout/stderr
+  in ``payload['line']``. Producers (see
+  :func:`playground.backend.local_libvirt.apply.run_tofu_apply` etc.)
+  emit one ``log_line`` per line of captured output so consumers
+  (TUI live panes, future websocket bridges) can render progress
+  without waiting for the subprocess to exit.
+"""
 
 
 class OperationEvent(StrictModel):
