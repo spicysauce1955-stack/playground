@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 from pathlib import Path
 
@@ -515,6 +516,171 @@ def test_runs_show_reports_recorded_run(
     assert payload["run"]["status"] == "succeeded"
     assert payload["events_path"] is not None
     assert "logs" in payload["logs_dir"]
+
+
+def _write_ssh_shim(
+    tmp_path: Path, *, exit_code: int = 0, stdout: str = ""
+) -> Path:
+    """PATH-shimmed `ssh` that records its argv to a log file."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log_path = tmp_path / "ssh.log"
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" > {shlex.quote(str(log_path))}\n'
+        + (f'echo {shlex.quote(stdout)}\n' if stdout else "")
+        + f"exit {exit_code}\n"
+    )
+    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
+
+
+def test_exec_happy_path_invokes_ssh_with_resolved_ip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)  # provides `tofu output -json`
+    ssh_bin = _write_ssh_shim(tmp_path, exit_code=0, stdout="up 12 days")
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec",
+            "--lab", "generic-infra",
+            "--on", "docker1",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "uptime",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    # ssh got the resolved IP and the command at the tail.
+    ssh_log = (tmp_path / "ssh.log").read_text().splitlines()
+    assert "ubuntu@10.0.10.43" in ssh_log  # docker1's IP from the fake tofu shim
+    assert "uptime" in ssh_log
+
+
+def test_exec_propagates_remote_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    ssh_bin = _write_ssh_shim(tmp_path, exit_code=42)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec",
+            "--lab", "generic-infra",
+            "--on", "docker1",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "false",
+        ],
+    )
+
+    assert result.exit_code == 42
+
+
+def test_exec_unknown_vm_fails(tmp_path: Path) -> None:
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec",
+            "--lab", "generic-infra",
+            "--on", "ghost-vm",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "uptime",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.exec.unknown_vm" in result.stderr
+
+
+def test_exec_no_command_fails(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec",
+            "--lab", "generic-infra",
+            "--on", "docker1",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.exec.no_command" in result.stderr
+
+
+def test_exec_defaults_lab_when_only_one_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Isolated config dir with just one lab — exec should pick it up
+    # without an explicit --lab flag.
+    config_dir = tmp_path / "config"
+    import shutil as _shutil
+    _shutil.copytree(CONFIG_DIR, config_dir)
+    # Drop the second committed lab so the single-lab branch fires.
+    (config_dir / "labs" / "barak-deploy-cross-vm.yaml").unlink()
+    (config_dir / "roles" / "deployment-source.yaml").unlink()
+    (config_dir / "roles" / "deployment-target.yaml").unlink()
+
+    bin_dir = _write_apply_shims(tmp_path)
+    ssh_bin = _write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec",
+            "--on", "docker1",
+            "--config-dir", str(config_dir),
+            "--tofu-dir", str(tofu_dir),
+            "uptime",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+
+
+def test_exec_requires_lab_when_multiple_configured(tmp_path: Path) -> None:
+    # Committed config has TWO labs (generic-infra + barak-deploy-cross-vm).
+    # Without --lab, exec should refuse rather than guess.
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec",
+            "--on", "docker1",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "uptime",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "config.exec.lab_required" in result.stderr
 
 
 def test_status_reports_all_vms_provisioned(

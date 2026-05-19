@@ -32,7 +32,7 @@ test-runner workflow.
 | §3e | `barak_deploy_agent` ansible role | ✅ Shipped |
 | §4 | Inter-VM hostname resolution via `extra_hosts` | ✅ Shipped — new generic `extra_hosts` role + `pg_extra_hosts` host var |
 | §5 | Site playbook ordering (central → target) | ✅ Shipped via per-host-class plays in `ansible/site.yml` |
-| §6 (option A) | `playground exec --on <vm> <cmd>` CLI helper | ❌ Deferred — tracked in `docs/roadmap.md` backlog |
+| §6 (option A) | `playground exec --on <vm> <cmd>` CLI helper | ✅ Shipped — defaults `--lab` to the only configured lab; propagates remote exit code; 6 CLI tests |
 | §6 (option B) | pytest-style multi-VM integration test | ✅ Shipped — `tests/integration/multi_vm/test_cross_vm_deploy.py`, gated on `PLAYGROUND_LIVE_INFRA=1` |
 
 **Things this spec didn't list that were required to make `ip:`
@@ -58,9 +58,10 @@ actually work** — also done:
   list only the roles that actually do work, and `docker` is inherited
   via `extends: docker-host` rather than re-listed. A real baseline-
   hardening role can land as its own feature if a use case appears.
-- `playground exec --on <vm> <cmd>` CLI subcommand — the pytest harness
-  uses plain `subprocess` + `ssh`, which is enough for the smoke test.
-  Promoting it to a CLI command is in the backlog.
+- ~~`playground exec --on <vm> <cmd>` CLI subcommand~~ — **shipped**
+  as a generic operator primitive. The harness still uses plain
+  `subprocess` + `ssh` (no need to retrofit), but operators have a
+  clean per-VM exec path.
 - A file-transfer primitive between VMs — the spec explicitly notes
   it isn't needed for this test (the test exercises that path itself
   via `tunneler ship` + scp).
@@ -597,13 +598,15 @@ Either is a substantial enough additions that you may want to defer until
 after the first manual run proves the end-to-end flow works. The smoke-test
 commands below run fine with plain `ssh` for the first pass.
 
-> **Status:** Option B (pytest harness) shipped at
+> **Status:** Both shipped. Option B (pytest harness) lives at
 > `tests/integration/multi_vm/test_cross_vm_deploy.py`. Skipped by
 > default; runs against real libvirt when `PLAYGROUND_LIVE_INFRA=1`
-> is set in the environment. The harness asserts every one of the
-> six pass/fail criteria below. Option A (`playground exec --on
-> <vm> <cmd>` CLI subcommand) was **deferred** to the roadmap
-> backlog — the harness uses plain `subprocess` + `ssh` instead.
+> is set. The harness asserts every one of the six pass/fail criteria
+> below, including image-ID parity (criterion 1) and sha256 parity
+> between the manifest and the archived tar (criteria 4 + 5).
+> Option A (`playground exec --on <vm> <cmd>`) shipped as a generic
+> operator subcommand: lab resolution + tofu-state IP lookup +
+> ssh with sensible defaults, propagates remote exit code.
 
 ## Bringing up the test
 
@@ -676,9 +679,11 @@ Items the playground may want to address; not blocking for this test.
   Shipped — `LabVmNetwork` accepts an optional `ip:` and the tofu module
   now pins it via `network_interface.addresses`. Legacy `list[str]`
   shape still works.
-- **No multi-VM orchestration primitive.** Still no `playground exec
-  --on <vm> <cmd>` subcommand. The pytest harness uses plain
-  `subprocess` + `ssh` instead. Promoted to the roadmap backlog.
+- ~~**No multi-VM orchestration primitive.**~~ Shipped —
+  `playground exec --on <vm> <cmd>` resolves the lab, looks up the
+  VM's IP from tofu state, and SSHes in with sensible defaults
+  (`StrictHostKeyChecking=accept-new`, `LogLevel=ERROR`, user
+  `ubuntu`). Propagates the remote exit code unchanged.
 - ~~**No inter-VM SSH keypair distribution role.**~~ Shipped as
   platform-generic — `ssh_keypair_generator` + `ssh_keypair_receiver`
   live in `ansible/roles/` and consume the auto-emitted

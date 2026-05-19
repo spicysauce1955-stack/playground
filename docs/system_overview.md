@@ -392,6 +392,7 @@ categories:
 | `config.artifact.*` | validator | `offline_missing` |
 | `config.backend.*` | validator | `per_vm_resources_unsupported` |
 | `config.network.*` | validator | `ip_not_in_cidr`, `duplicate_ip` |
+| `config.exec.*` | CLI | `no_command`, `lab_required`, `unknown_vm`, `vm_ip_not_found` |
 | `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
 | `config.discovery.*` | CLI | `not_directory` |
 | `config.lab.*` | CLI | `unknown`, `resolve_failed` |
@@ -400,6 +401,7 @@ categories:
 | `config.workload.*` | planner | `no_target`, `source_missing`, `swarm_needs_docker_host` |
 | `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing` |
 | `runtime.tui.*` | CLI | `missing_dependency` |
+| `runtime.exec.*` | CLI | `ssh_binary_missing` |
 
 Diagnostic IDs are **stable public contract** — they show up in JSON output
 that downstream tools may grep. Don't rename without a deprecation plan.

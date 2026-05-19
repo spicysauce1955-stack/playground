@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -597,6 +598,145 @@ def runs_show_command(
     if events_path.exists():
         typer.echo(f"  events:    {events_path}")
     typer.echo(f"  logs:      {run_dir / 'logs'}")
+
+
+@app.command(
+    "exec",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    help=(
+        "Run a command on a lab VM over SSH. The remote exit code is "
+        "the playground's exit code. Stdout / stderr stream through."
+    ),
+)
+def exec_command(
+    ctx: typer.Context,
+    on: Annotated[str, typer.Option("--on", help="VM name within the lab.")],
+    lab: Annotated[
+        str | None,
+        typer.Option(
+            "--lab",
+            help=(
+                "Lab name. Defaults to the only configured lab; required "
+                "when multiple labs are configured."
+            ),
+        ),
+    ] = None,
+    user: Annotated[
+        str,
+        typer.Option("--user", help="SSH user (default: ubuntu)."),
+    ] = "ubuntu",
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+) -> None:
+    command = list(ctx.args)
+    if not command:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.exec.no_command",
+                severity="error",
+                message="no command given after --on; e.g. `playground exec --on central uptime`",
+                source=SourceLocation(path="<argv>"),
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    loaded, diagnostics = _load_config_or_exit(config_dir, OutputFormat.human)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, OutputFormat.human, json_errors=False)
+    _print_warnings(diagnostics)
+
+    # Lab defaulting: when --lab isn't given, accept the only configured
+    # lab. Multi-lab projects must be explicit.
+    if lab is None:
+        if len(loaded.labs) == 1:
+            lab = next(iter(loaded.labs))
+        else:
+            _exit_with_diagnostic(
+                Diagnostic(
+                    id="config.exec.lab_required",
+                    severity="error",
+                    message=(
+                        f"--lab required when {len(loaded.labs)} labs are "
+                        "configured; pass --lab <name>"
+                    ),
+                    source=SourceLocation(path=str(config_dir / "labs")),
+                    suggestion=(
+                        "run `playground lab list` and pass --lab <name>"
+                    ),
+                ),
+                OutputFormat.human,
+                json_errors=False,
+            )
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, OutputFormat.human)
+
+    vm_names = {vm.name for vm in resolved.vms}
+    if on not in vm_names:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.exec.unknown_vm",
+                severity="error",
+                message=(
+                    f"VM {on!r} is not declared in lab {lab!r} "
+                    f"(known VMs: {sorted(vm_names) or '<none>'})"
+                ),
+                source=SourceLocation(path=f"config/labs/{lab}.yaml"),
+                key_path="spec.vms",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    vm_ips, fetch_diagnostics = fetch_vm_ips(tofu_dir)
+    _exit_on_errors(fetch_diagnostics, OutputFormat.human, json_errors=False)
+
+    ip = vm_ips.get(on)
+    if ip is None:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.exec.vm_ip_not_found",
+                severity="error",
+                message=(
+                    f"VM {on!r} has no IP in tofu state — "
+                    "has the lab been applied?"
+                ),
+                source=SourceLocation(path=str(tofu_dir)),
+                suggestion=f"run `playground apply {lab}` first",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    ssh_argv = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "LogLevel=ERROR",
+        f"{user}@{ip}",
+        *command,
+    ]
+    try:
+        completed = subprocess.run(ssh_argv, check=False)  # noqa: S603
+    except FileNotFoundError as exc:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="runtime.exec.ssh_binary_missing",
+                severity="error",
+                message=f"failed to launch ssh: {exc}",
+                source=SourceLocation(path="ssh"),
+                suggestion="install openssh-client",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+    raise typer.Exit(code=completed.returncode)
 
 
 @app.command("status")

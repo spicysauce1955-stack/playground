@@ -423,11 +423,29 @@ Slice 10f (done): Multi-VM pytest harness + docs.
 - `docs/developer_guide.md` gains a "Multi-VM integration tests"
   section.
 
+Slice 10g (done): `playground exec --on <vm> <cmd>`
+
+- New CLI subcommand resolves a lab, looks up the VM's IP via
+  `fetch_vm_ips`, SSHes in with `-o StrictHostKeyChecking=accept-new
+  -o LogLevel=ERROR`, streams stdout/stderr, propagates the remote
+  exit code unchanged. Defaults `--lab` to the only configured lab
+  when exactly one exists.
+- New diagnostic IDs: `config.exec.no_command`,
+  `config.exec.lab_required`, `config.exec.unknown_vm`,
+  `config.exec.vm_ip_not_found`, `runtime.exec.ssh_binary_missing`.
+- Closes the spec's "no multi-VM orchestration primitive" gap.
+
+Slice 10h (done): Harness hardening against pass/fail criteria.
+
+- `tests/integration/multi_vm/test_cross_vm_deploy.py` now asserts
+  image-ID parity between central and target (criterion 1 cross-
+  check) and sha256 parity between the archived tar.gz and the
+  manifest's `tar_sha256` (criteria 4 + 5 cross-check). A comment
+  explains why criterion 4's "source on central" check is
+  unreachable after ship-deploy.sh's `trap` cleans up its tmpdir.
+
 Carried forward to a follow-up:
 
-- `playground exec --on <vm> <cmd>` test orchestration helper.
-  The harness today uses plain `ssh`; a CLI subcommand would tidy
-  the harness and become a generic operator primitive.
 - Pre-existing minor validator quirk: the `unknown_image` check
   runs once per lab, so an orphaned role surfaces N times when N
   labs are loaded. Move the check outside the per-lab loop when
