@@ -10,6 +10,7 @@ them the same way as config/validator diagnostics.
 from playground.preflight.doctor import (
     CheckResult,
     check_ansible_and_collections,
+    check_ansible_config,
     check_default_pool,
     check_iso_tool,
     check_libvirt_apparmor,
@@ -23,6 +24,7 @@ from playground.preflight.doctor import (
 __all__ = [
     "CheckResult",
     "check_ansible_and_collections",
+    "check_ansible_config",
     "check_default_pool",
     "check_iso_tool",
     "check_libvirt_apparmor",

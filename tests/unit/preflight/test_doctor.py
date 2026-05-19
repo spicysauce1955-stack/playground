@@ -452,6 +452,83 @@ def test_libvirt_apparmor_lists_at_most_three_orphans(
 
 
 # ---------------------------------------------------------------------------
+# check_ansible_config
+# ---------------------------------------------------------------------------
+
+
+_CANONICAL_ANSIBLE_CFG = (
+    "[defaults]\n"
+    "host_key_checking = False\n"
+    "interpreter_python = auto_silent\n"
+    "\n"
+    "[ssh_connection]\n"
+    "ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=accept-new\n"
+    "pipelining = True\n"
+)
+
+
+def test_ansible_config_missing_emits_warning(tmp_path: Path) -> None:
+    diagnostics = doctor.check_ansible_config(repo_root=tmp_path)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.ansible_cfg_missing"
+    assert diagnostics[0].severity == "warning"
+    assert "host_key_checking" in (diagnostics[0].suggestion or "")
+
+
+def test_ansible_config_complete_silences(tmp_path: Path) -> None:
+    (tmp_path / "ansible").mkdir()
+    (tmp_path / "ansible" / "ansible.cfg").write_text(_CANONICAL_ANSIBLE_CFG)
+    assert doctor.check_ansible_config(repo_root=tmp_path) == []
+
+
+def test_ansible_config_missing_host_key_checking(tmp_path: Path) -> None:
+    (tmp_path / "ansible").mkdir()
+    (tmp_path / "ansible" / "ansible.cfg").write_text(
+        _CANONICAL_ANSIBLE_CFG.replace(
+            "host_key_checking = False\n", ""
+        )
+    )
+    diagnostics = doctor.check_ansible_config(repo_root=tmp_path)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.ansible_cfg_misconfigured"
+    assert "host_key_checking" in diagnostics[0].message
+
+
+def test_ansible_config_missing_pipelining(tmp_path: Path) -> None:
+    (tmp_path / "ansible").mkdir()
+    (tmp_path / "ansible" / "ansible.cfg").write_text(
+        _CANONICAL_ANSIBLE_CFG.replace("pipelining = True\n", "")
+    )
+    diagnostics = doctor.check_ansible_config(repo_root=tmp_path)
+    assert len(diagnostics) == 1
+    assert "pipelining" in diagnostics[0].message
+
+
+def test_ansible_config_missing_controlmaster(tmp_path: Path) -> None:
+    (tmp_path / "ansible").mkdir()
+    (tmp_path / "ansible" / "ansible.cfg").write_text(
+        _CANONICAL_ANSIBLE_CFG.replace("ControlMaster=auto -o ", "")
+    )
+    diagnostics = doctor.check_ansible_config(repo_root=tmp_path)
+    assert len(diagnostics) == 1
+    assert "ControlMaster" in diagnostics[0].message
+
+
+def test_ansible_config_accepts_arbitrary_spacing(tmp_path: Path) -> None:
+    """Operators write `key=value` and `key  =  value` both — the
+    check should accept either."""
+    (tmp_path / "ansible").mkdir()
+    (tmp_path / "ansible" / "ansible.cfg").write_text(
+        "[defaults]\n"
+        "host_key_checking=False\n"   # no spaces
+        "[ssh_connection]\n"
+        "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
+        "pipelining  =  True\n"  # extra spaces
+    )
+    assert doctor.check_ansible_config(repo_root=tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
 # check_ansible_and_collections
 # ---------------------------------------------------------------------------
 

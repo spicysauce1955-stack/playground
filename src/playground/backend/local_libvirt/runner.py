@@ -169,6 +169,11 @@ def execute_apply(
         )
 
     # 5. ansible-playbook
+    # `ansible_cfg` is wired explicitly because cwd is the repo root,
+    # not ansible_dir — so Ansible's auto-discovery of `./ansible.cfg`
+    # would miss `ansible/ansible.cfg`. Passing None when the file is
+    # absent matches Ansible's default behavior (use built-in defaults).
+    ansible_cfg = ansible_dir / "ansible.cfg"
     bus.publish(run.run_id, "step_started", {"step": "ansible-playbook"})
     ansible_step, ansible_diagnostics = run_ansible_playbook(
         ansible_dir / "site.yml",
@@ -176,6 +181,7 @@ def execute_apply(
         logs_dir / "ansible.log",
         cwd=ansible_dir.parent.resolve(),
         bus=bus, run_id=run.run_id,
+        ansible_cfg=ansible_cfg if ansible_cfg.is_file() else None,
     )
     steps.append(ansible_step)
     bus.publish(

@@ -25,6 +25,7 @@ import grp
 import json
 import os
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -539,6 +540,91 @@ def _security_driver_disabled() -> bool:
     return False
 
 
+def check_ansible_config(repo_root: Path | None = None) -> list[Diagnostic]:
+    """Verify ``ansible/ansible.cfg`` exists with the settings that
+    keep `playground apply` from racing first-boot SSH/cloud-init.
+
+    Two failure modes get distinct diagnostics:
+
+    1. ``ansible_cfg_missing`` (warning) — file isn't there at all;
+       Ansible falls back to its defaults, which include
+       ``host_key_checking=True`` and no ControlMaster. A fresh apply
+       will hang on first-SSH host-key prompts or fail with confusing
+       "Permission denied" / sftp errors.
+    2. ``ansible_cfg_misconfigured`` (warning) — file exists but is
+       missing one of the load-bearing knobs
+       (``host_key_checking=False``, ``pipelining=True``, or
+       ``ControlMaster=auto`` in ``ssh_args``). Names the missing
+       keys so the fix is obvious.
+
+    The check is intentionally lenient about line formatting; it
+    does a simple substring scan rather than a strict INI parse.
+    """
+    root = repo_root if repo_root is not None else Path.cwd()
+    cfg_path = root / "ansible" / "ansible.cfg"
+    if not cfg_path.is_file():
+        return [
+            Diagnostic(
+                id="runtime.doctor.ansible_cfg_missing",
+                severity="warning",
+                message=(
+                    f"{cfg_path} is missing; Ansible will run with defaults "
+                    "(host_key_checking=True, no ControlMaster) which often "
+                    "breaks fresh `playground apply` runs"
+                ),
+                source=_host_source(str(cfg_path)),
+                suggestion=(
+                    "create ansible/ansible.cfg with host_key_checking=False, "
+                    "pipelining=True, and ControlMaster=auto in ssh_args"
+                ),
+            )
+        ]
+
+    try:
+        text = cfg_path.read_text()
+    except OSError as exc:
+        return [
+            Diagnostic(
+                id="runtime.doctor.ansible_cfg_missing",
+                severity="warning",
+                message=f"could not read {cfg_path}: {exc}",
+                source=_host_source(str(cfg_path)),
+            )
+        ]
+
+    missing: list[str] = []
+    lowered = text.lower()
+    if "host_key_checking" not in lowered or "host_key_checking = false" not in lowered.replace(" ", " "):
+        # Look for the directive with flexible spacing/casing.
+        if not re.search(r"(?im)^\s*host_key_checking\s*=\s*false\s*$", text):
+            missing.append("host_key_checking = False")
+    if not re.search(r"(?im)^\s*pipelining\s*=\s*true\s*$", text):
+        missing.append("pipelining = True")
+    if "controlmaster=auto" not in lowered.replace(" ", ""):
+        missing.append("ControlMaster=auto in ssh_args")
+
+    if not missing:
+        return []
+
+    return [
+        Diagnostic(
+            id="runtime.doctor.ansible_cfg_misconfigured",
+            severity="warning",
+            message=(
+                f"{cfg_path} is missing recommended setting(s): "
+                + "; ".join(missing)
+                + ". Fresh `playground apply` runs may hang on first-boot "
+                "SSH prompts or run slowly without pipelining"
+            ),
+            source=_host_source(str(cfg_path)),
+            suggestion=(
+                "see docs/developer_guide.md §'Ansible config' for the "
+                "canonical ansible.cfg contents"
+            ),
+        )
+    ]
+
+
 def check_ansible_and_collections() -> list[Diagnostic]:
     """ansible-playbook on PATH + the three collections playground roles need."""
     if shutil.which("ansible-playbook") is None:
@@ -663,4 +749,5 @@ def run_all_checks(*, ssh_key_path: Path | None = None) -> list[Diagnostic]:
     diagnostics.extend(check_ssh_public_key(ssh_key_path))
     diagnostics.extend(check_libvirt_apparmor())
     diagnostics.extend(check_ansible_and_collections())
+    diagnostics.extend(check_ansible_config())
     return diagnostics

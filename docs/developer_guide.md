@@ -529,6 +529,26 @@ emits both vars from `ResolvedLab.dns_domain` (defaults to
 
 ---
 
+## Ansible config (`ansible/ansible.cfg`)
+
+`playground apply` wires `ANSIBLE_CONFIG=ansible/ansible.cfg`
+into the `ansible-playbook` subprocess (the runner's cwd is the
+repo root, not `ansible/`, so Ansible's own auto-discovery would
+miss the file). The shipped settings exist to make fresh
+`playground apply` runs behave like warmed-up dev-box runs:
+
+| Setting | Why it's load-bearing |
+|---|---|
+| `host_key_checking = False` | First-SSH from controller to a new VM otherwise prompts "Are you sure you want to continue connecting?" — hangs the apply. Also tolerates IP reuse across destroy/apply cycles. |
+| `interpreter_python = auto_silent` | Ubuntu Noble has `python3` but no `/usr/bin/python`; this picks the right interpreter without spamming a deprecation warning on every host. |
+| `ssh_args` w/ `ControlMaster=auto` + `ControlPersist=60s` | Reuses one SSH session per host across tasks. Without it every task re-handshakes — minutes of cumulative overhead. |
+| `ssh_args` w/ `UserKnownHostsFile=/dev/null` + `StrictHostKeyChecking=accept-new` | Recreated VMs reuse IPs but have new host keys; without these ansible refuses to reconnect. |
+| `pipelining = True` | Runs the module body inline through the SSH session instead of upload-via-sftp-then-exec. Roughly halves task wall time. |
+
+`playground doctor` validates this file exists and lints the
+above settings via `runtime.doctor.ansible_cfg_missing` /
+`runtime.doctor.ansible_cfg_misconfigured`.
+
 ## Ansible roles (`ansible/`)
 
 `ansible/site.yml` runs several plays in order; the highlights:

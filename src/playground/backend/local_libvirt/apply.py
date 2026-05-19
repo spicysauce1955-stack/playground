@@ -16,6 +16,7 @@ and the on-disk log file always agree.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -92,8 +93,18 @@ def run_ansible_playbook(
     cwd: Path,
     bus: EventBus | None = None,
     run_id: str | None = None,
+    ansible_cfg: Path | None = None,
 ) -> tuple[StepResult, list[Diagnostic]]:
-    """Invoke ``ansible-playbook -i <inventory> <playbook>`` from ``cwd``."""
+    """Invoke ``ansible-playbook -i <inventory> <playbook>`` from ``cwd``.
+
+    When ``ansible_cfg`` is supplied, ``ANSIBLE_CONFIG`` is set in the
+    subprocess environment so Ansible uses that file instead of relying
+    on its own discovery (which only checks ``./ansible.cfg`` relative
+    to cwd — and our cwd is the repo root, not ``ansible/``).
+    """
+    env: dict[str, str] | None = None
+    if ansible_cfg is not None:
+        env = {**os.environ, "ANSIBLE_CONFIG": str(ansible_cfg)}
     return _run_step(
         name="ansible-playbook",
         command=["ansible-playbook", "-i", str(inventory), str(playbook)],
@@ -102,6 +113,7 @@ def run_ansible_playbook(
         missing_binary_id="runtime.apply.ansible_binary_missing",
         bus=bus,
         run_id=run_id,
+        env=env,
     )
 
 
@@ -113,6 +125,7 @@ def _run_step(
     missing_binary_id: str,
     bus: EventBus | None,
     run_id: str | None,
+    env: dict[str, str] | None = None,
 ) -> tuple[StepResult, list[Diagnostic]]:
     binary = command[0]
     if shutil.which(binary) is None:
@@ -132,7 +145,7 @@ def _run_step(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = _now_iso()
     exit_code = _spawn_and_stream(
-        command, cwd, log_path, bus=bus, run_id=run_id, step_name=name,
+        command, cwd, log_path, bus=bus, run_id=run_id, step_name=name, env=env,
     )
     finished = _now_iso()
     return (
@@ -156,6 +169,7 @@ def _spawn_and_stream(
     bus: EventBus | None,
     run_id: str | None,
     step_name: str,
+    env: dict[str, str] | None = None,
 ) -> int:
     """Run ``command``, tee each line to ``log_path`` and (optionally) the bus.
 
@@ -172,6 +186,7 @@ def _spawn_and_stream(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,  # line-buffered
+            env=env,
         ) as proc,
     ):
         assert proc.stdout is not None

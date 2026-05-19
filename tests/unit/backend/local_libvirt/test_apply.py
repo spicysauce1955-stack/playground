@@ -222,6 +222,76 @@ def test_run_ansible_playbook_succeeds(
     assert step.command[:2] == ["ansible-playbook", "-i"]
 
 
+def test_run_ansible_playbook_sets_ansible_config_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``ansible_cfg=`` is set the subprocess must see
+    ``ANSIBLE_CONFIG`` in its env — otherwise Ansible silently uses
+    its built-in defaults and the file we ship is dead weight.
+    The shim echoes the env var into the log so we can assert."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ansible-playbook"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo \"ANSIBLE_CONFIG=$ANSIBLE_CONFIG\"\n"
+        "exit 0\n"
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    playbook = tmp_path / "ansible" / "site.yml"
+    playbook.parent.mkdir(parents=True, exist_ok=True)
+    playbook.write_text("")
+    inventory = tmp_path / "inv.ini"
+    inventory.write_text("[playground]\n")
+    cfg = tmp_path / "ansible" / "ansible.cfg"
+    cfg.write_text("[defaults]\nhost_key_checking = False\n")
+    log_path = tmp_path / "logs" / "ansible.log"
+
+    step, _diagnostics = run_ansible_playbook(
+        playbook, inventory, log_path, cwd=tmp_path, ansible_cfg=cfg,
+    )
+    assert step.exit_code == 0
+    assert f"ANSIBLE_CONFIG={cfg}" in log_path.read_text()
+
+
+def test_run_ansible_playbook_without_ansible_cfg_unsets_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default invocation (no `ansible_cfg=` passed) must NOT inherit a
+    stray ANSIBLE_CONFIG from the parent shell. The wiring code only
+    sets the env var when we explicitly pass the path."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ansible-playbook"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo \"ANSIBLE_CONFIG=${ANSIBLE_CONFIG:-<unset>}\"\n"
+        "exit 0\n"
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    # Even if the parent shell has ANSIBLE_CONFIG set, the subprocess
+    # should inherit it normally when we don't pass ansible_cfg=.
+    monkeypatch.setenv("ANSIBLE_CONFIG", "/etc/ansible/from-parent.cfg")
+
+    playbook = tmp_path / "ansible" / "site.yml"
+    playbook.parent.mkdir(parents=True, exist_ok=True)
+    playbook.write_text("")
+    inventory = tmp_path / "inv.ini"
+    inventory.write_text("[playground]\n")
+    log_path = tmp_path / "logs" / "ansible.log"
+
+    step, _diagnostics = run_ansible_playbook(
+        playbook, inventory, log_path, cwd=tmp_path,
+    )
+    assert step.exit_code == 0
+    # The parent's env is inherited by default (we only override when
+    # ansible_cfg= is explicitly passed).
+    assert "ANSIBLE_CONFIG=/etc/ansible/from-parent.cfg" in log_path.read_text()
+
+
 def test_run_ansible_playbook_reports_missing_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

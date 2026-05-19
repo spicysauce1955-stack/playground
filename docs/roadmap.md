@@ -651,6 +651,51 @@ from running when a VM never comes up. Existing apply CLI tests
 auto-stub the wait via an `autouse` fixture so they don't probe
 fake IPs.
 
+## 15. Ship an `ansible.cfg` + wire `ANSIBLE_CONFIG`
+
+Status: done.
+
+Second fresh-vs-warm gap (after SSH-readiness): `playground apply`
+shelled out to `ansible-playbook` without a project-level
+`ansible.cfg`. On a warmed-up dev box this mostly worked because
+known_hosts was populated, ControlMaster sockets lingered in
+`/tmp` from earlier runs, and pipelining bugs had been worked
+around manually. On a fresh box, ansible's defaults
+(`host_key_checking=True`, no ControlMaster, no pipelining) made
+the first apply hang on the "Are you sure you want to continue
+connecting" prompt — looking like a stuck step rather than a
+config gap.
+
+Three things shipped together:
+
+1. **`ansible/ansible.cfg`** with the canonical settings: 
+   `host_key_checking = False`, `interpreter_python = auto_silent`,
+   `pipelining = True`, plus `ssh_args = -o ControlMaster=auto -o
+   ControlPersist=60s -o UserKnownHostsFile=/dev/null -o
+   StrictHostKeyChecking=accept-new`.
+2. **`ANSIBLE_CONFIG` env wiring** in `run_ansible_playbook`.
+   Without this, Ansible's auto-discovery looks for
+   `./ansible.cfg` relative to cwd — and the runner's cwd is the
+   repo root, not `ansible/`. The file we ship was about to be
+   silently ignored. The wiring is opt-in: when `ansible_cfg=` is
+   not passed, the subprocess inherits the parent env as before,
+   so test shims and ad-hoc `cd ansible && ansible-playbook`
+   invocations behave unchanged.
+3. **New doctor probe `check_ansible_config`** so the next gap
+   is loud. Two diagnostics:
+   - `runtime.doctor.ansible_cfg_missing` (warning) — file
+     absent entirely.
+   - `runtime.doctor.ansible_cfg_misconfigured` (warning) —
+     file exists but missing one of the load-bearing knobs
+     (`host_key_checking=False`, `pipelining=True`, or
+     `ControlMaster=auto` in ssh_args). Names the missing
+     setting so the fix is obvious.
+
+Tests: 6 unit tests for the doctor probe (missing, complete,
+each load-bearing knob removed in turn, flexible spacing) + 2
+unit tests for the env wiring (set when ansible_cfg passed,
+inherited otherwise). Total suite 310 passing, 3 skipped.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —
