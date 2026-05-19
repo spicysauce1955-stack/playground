@@ -17,6 +17,38 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
 
 
+@pytest.fixture(autouse=True)
+def _stub_wait_for_vms_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the apply tofu→ansible gate in CLI tests.
+
+    The real wait step does live TCP + SSH probes against whatever
+    IPs ``tofu output -json`` returns. In these tests those IPs come
+    from a shell shim and aren't real, so the wait would block until
+    the multi-minute default timeout. The wait code path itself is
+    covered comprehensively by
+    ``tests/unit/backend/local_libvirt/test_wait.py``; here we just
+    want the rest of the apply pipeline to behave as if VMs were
+    ready.
+    """
+    from playground.backend.local_libvirt import runner as runner_mod
+    from playground.runs import StepResult
+
+    def _stub(**_kwargs: object) -> tuple[StepResult, list[object]]:
+        return (
+            StepResult(
+                name="wait-for-vms-ready",
+                command=["wait-for-vms-ready", "stub"],
+                exit_code=0,
+                log_path="/tmp/stub-wait.log",
+                started_at="2026-05-19T00:00:00+00:00",
+                finished_at="2026-05-19T00:00:01+00:00",
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(runner_mod, "wait_for_vms_ready", _stub)
+
+
 def _write_fake_tofu(tmp_path: Path, payload: str) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -601,7 +633,11 @@ def test_apply_happy_path_writes_run_record(
     assert payload["status"] == "succeeded"
     assert payload["operation"] == "apply"
     assert payload["lab"] == "generic-infra"
-    assert [s["name"] for s in payload["steps"]] == ["tofu-apply", "ansible-playbook"]
+    assert [s["name"] for s in payload["steps"]] == [
+        "tofu-apply",
+        "wait-for-vms-ready",
+        "ansible-playbook",
+    ]
     assert all(s["exit_code"] == 0 for s in payload["steps"])
     # Run record on disk matches the printed payload.
     run_dir = state_dir / "runs" / payload["run_id"]
@@ -610,6 +646,92 @@ def test_apply_happy_path_writes_run_record(
     # Tofu vars + inventory written to standard locations.
     assert (state_dir / "state" / "tofu" / "generic-infra.tfvars.json").exists()
     assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
+
+
+def test_apply_wait_timeout_blocks_ansible_from_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait-for-vms-ready step must abort the apply before
+    ansible-playbook runs — otherwise the whole point of the gate
+    is lost. Override the autouse stub to return a wait failure."""
+    from playground.backend.local_libvirt import runner as runner_mod
+    from playground.models.diagnostic import Diagnostic
+    from playground.runs import StepResult
+
+    def _stub_wait_failure(**_kw: object) -> tuple[StepResult, list[Diagnostic]]:
+        return (
+            StepResult(
+                name="wait-for-vms-ready",
+                command=["wait-for-vms-ready", "stub"],
+                exit_code=1,
+                log_path="/tmp/stub.log",
+                started_at="2026-05-19T00:00:00+00:00",
+                finished_at="2026-05-19T00:05:00+00:00",
+            ),
+            [
+                Diagnostic(
+                    id="runtime.apply.wait_ssh_timeout",
+                    severity="error",
+                    message="VM 'node1' never accepted TCP connections",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(runner_mod, "wait_for_vms_ready", _stub_wait_failure)
+
+    bin_dir = _write_apply_shims(tmp_path)
+    # The ansible shim leaves a sentinel file when invoked; the wait
+    # gate should keep that file from ever appearing.
+    ansible_sentinel = tmp_path / "ansible-ran"
+    ansible_shim = bin_dir / "ansible-playbook"
+    ansible_shim.write_text(
+        "#!/usr/bin/env bash\n"
+        f"touch {ansible_sentinel}\n"
+        "exit 0\n"
+    )
+    ansible_shim.chmod(ansible_shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("- name: stub\n  hosts: playground\n")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--ansible-dir",
+            str(ansible_dir),
+            "--state-dir",
+            str(state_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    # Crucial: ansible-playbook was NEVER invoked.
+    assert not ansible_sentinel.exists()
+    # The wait diagnostic was surfaced to stderr.
+    assert "runtime.apply.wait_ssh_timeout" in result.stderr
+    # Find the failed run record and assert step ordering.
+    runs = list((state_dir / "runs").iterdir())
+    assert len(runs) == 1
+    record = json.loads((runs[0] / "run.json").read_text())
+    assert record["status"] == "failed"
+    # Two steps recorded: tofu-apply (success), wait-for-vms-ready (failed).
+    # No ansible-playbook step.
+    assert [s["name"] for s in record["steps"]] == [
+        "tofu-apply",
+        "wait-for-vms-ready",
+    ]
+    assert "did not come up in time" in record["summary"]
 
 
 def test_apply_tofu_failure_leaves_failed_run(
@@ -690,10 +812,16 @@ def test_apply_ansible_failure_after_tofu_success_records_partial_state(
     assert len(runs) == 1
     record = json.loads((runs[0] / "run.json").read_text())
     assert record["status"] == "failed"
-    # Both steps recorded; tofu succeeded, ansible failed.
-    assert [s["name"] for s in record["steps"]] == ["tofu-apply", "ansible-playbook"]
+    # All three steps recorded; tofu succeeded, wait succeeded (stub),
+    # ansible failed.
+    assert [s["name"] for s in record["steps"]] == [
+        "tofu-apply",
+        "wait-for-vms-ready",
+        "ansible-playbook",
+    ]
     assert record["steps"][0]["exit_code"] == 0
-    assert record["steps"][1]["exit_code"] == 2
+    assert record["steps"][1]["exit_code"] == 0
+    assert record["steps"][2]["exit_code"] == 2
     # Summary tells the operator the state is partial and what to do.
     assert "VMs were provisioned" in record["summary"]
     assert "tear down via destroy" in record["summary"]
@@ -743,6 +871,8 @@ def test_apply_writes_events_jsonl(
     assert skeleton == [
         "operation_started",
         "step_started",   # tofu-apply
+        "step_finished",
+        "step_started",   # wait-for-vms-ready
         "step_finished",
         "step_started",   # ansible-playbook
         "step_finished",

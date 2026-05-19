@@ -399,7 +399,7 @@ categories:
 | `config.runs.*` | CLI | `unknown` |
 | `config.tofu.*` | (retired — moved to `config.backend.*`) | — |
 | `config.workload.*` | planner | `no_target`, `source_missing`, `swarm_needs_docker_host` |
-| `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing` |
+| `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing`, `ssh_binary_missing`, `wait_ssh_timeout`, `wait_cloud_init_timeout`, `wait_cloud_init_failed`, `wait_unexpected` |
 | `runtime.tui.*` | CLI | `missing_dependency` |
 | `runtime.exec.*` | CLI | `ssh_binary_missing` |
 | `runtime.doctor.*` | preflight | `iso_tool_missing`, `virsh_missing`, `virsh_unreachable`, `libvirt_group_missing`, `libvirt_group_inactive`, `default_pool_missing`, `default_pool_inactive`, `default_pool_no_autostart`, `pool_path_unreadable`, `ssh_public_key_missing`, `apparmor_libvirt_unconfigured`, `apparmor_orphan_profiles`, `ansible_missing`, `ansible_collection_missing` |

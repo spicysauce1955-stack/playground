@@ -37,6 +37,7 @@ from playground.backend.local_libvirt.inventory import (
 )
 from playground.backend.local_libvirt.scrub import scrub_lab
 from playground.backend.local_libvirt.tfvars import render_tfvars
+from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic
 from playground.models.resolved import ResolvedLab
@@ -137,7 +138,37 @@ def execute_apply(
     inventory_path.parent.mkdir(parents=True, exist_ok=True)
     inventory_path.write_text(inventory_body)
 
-    # 4. ansible-playbook
+    # 4. wait-for-vms-ready: gate the handoff to ansible on SSH being
+    # up AND cloud-init being done. Without this, ansible races
+    # cloud-init's apt lock and hits "Connection refused" before sshd
+    # is listening — both manifest as confusing "ansible failed"
+    # errors that are actually timing races, not provisioning bugs.
+    ssh_by_vm = {vm.name: vm.ssh.user for vm in resolved.vms}
+    targets = [
+        VmTarget(name=name, ip=ip, ssh_user=ssh_by_vm.get(name, "ubuntu"))
+        for name, ip in vm_ips.items()
+    ]
+    bus.publish(run.run_id, "step_started", {"step": "wait-for-vms-ready"})
+    wait_step, wait_diagnostics = wait_for_vms_ready(
+        targets=targets,
+        log_path=logs_dir / "wait-for-vms-ready.log",
+        bus=bus,
+        run_id=run.run_id,
+    )
+    steps.append(wait_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "wait-for-vms-ready", "exit_code": wait_step.exit_code},
+    )
+    if wait_step.exit_code != 0:
+        return _finalize_failure(
+            run, run_dir, steps, bus, wait_diagnostics,
+            "VMs were provisioned but did not come up in time for ansible. "
+            "Inspect cloud-init on each VM via `virsh console <vm>` then "
+            "re-run apply.",
+        )
+
+    # 5. ansible-playbook
     bus.publish(run.run_id, "step_started", {"step": "ansible-playbook"})
     ansible_step, ansible_diagnostics = run_ansible_playbook(
         ansible_dir / "site.yml",

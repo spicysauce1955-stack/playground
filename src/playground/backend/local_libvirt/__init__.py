@@ -23,8 +23,10 @@ from playground.backend.local_libvirt.runner import (
 )
 from playground.backend.local_libvirt.status import query_status
 from playground.backend.local_libvirt.tfvars import render_tfvars
+from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
 
 __all__ = [
+    "VmTarget",
     "execute_apply",
     "execute_destroy",
     "execute_reset",
@@ -36,4 +38,5 @@ __all__ = [
     "run_tofu_apply",
     "run_tofu_destroy",
     "tail_log",
+    "wait_for_vms_ready",
 ]

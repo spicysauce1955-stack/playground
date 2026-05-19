@@ -608,6 +608,49 @@ tolerance + every fatal path) + 5 CLI tests (full pipeline,
 tofu failure, mocked execute_reset, failure surface, JSON
 shape).
 
+## 14. `wait-for-vms-ready` — gate apply's tofu→ansible handoff
+
+Status: done.
+
+Closes the well-known timing race in `playground apply`: tofu
+returns successfully (VMs created, network up, IPs pinned) and
+the CLI immediately fires `ansible-playbook` — but on Ubuntu
+Noble cloud-init takes 30-90 s between "VM boots" and "sshd
+accepts connections", and another 1-3 min before
+`package_upgrade` releases the apt lock. Ansible's gather-facts
+gets "Connection refused" on a port that just isn't listening
+yet, or the first `apt install` races cloud-init's own
+`apt update`. Both fail the apply as if a real provisioning
+step had failed.
+
+The new `wait-for-vms-ready` step in `execute_apply` (after
+inventory render, before `ansible-playbook`) gates the handoff
+on per-VM readiness, in parallel via `ThreadPoolExecutor`:
+
+1. **TCP probe** — `socket.create_connection((ip, 22))` with
+   exponential backoff up to 300 s. Fast, cheap signal of
+   "sshd is listening".
+2. **cloud-init wait** — `ssh user@ip "cloud-init status --wait"`
+   with a 600 s subprocess timeout. The remote command blocks
+   on the VM side until every cloud-init stage (including
+   `package_upgrade`) is finished, so the apt-lock race is
+   eliminated.
+
+Diagnostic IDs (`runtime.apply.*`): `ssh_binary_missing`,
+`wait_ssh_timeout`, `wait_cloud_init_timeout`,
+`wait_cloud_init_failed`, `wait_unexpected`. Each diagnostic
+names the failing VM and includes a console-into-the-VM
+suggestion since the operator's next step is typically
+`virsh console <vm>` for cloud-init logs.
+
+Module: `src/playground/backend/local_libvirt/wait.py`. Tests:
+11 unit tests (TCP backoff, cloud-init timeout/error/done,
+mixed-success VM fleet, log-order stability, SSH option hardening)
++ a new CLI test that proves the gate blocks `ansible-playbook`
+from running when a VM never comes up. Existing apply CLI tests
+auto-stub the wait via an `autouse` fixture so they don't probe
+fake IPs.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —
