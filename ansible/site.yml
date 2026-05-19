@@ -1,4 +1,14 @@
 ---
+- name: Bootstrap deployment sources (SSH keypair generation)
+  hosts: deployment_source
+  become: yes
+  roles:
+    # Runs before the receiver play so `ship_pubkey` host fact is
+    # available when `ssh_keypair_receiver` reads it later. Labs
+    # without a `deployment_source` inventory group skip this play
+    # (Ansible warns then continues).
+    - ssh_keypair_generator
+
 - name: Apply lab-declared extra_hosts entries
   hosts: playground
   become: yes
@@ -14,6 +24,22 @@
   roles:
     - docker
     - redroid
+
+- name: Install docker-tunneler on deployment hosts
+  hosts: deployment_source:deployment_target
+  become: yes
+  gather_facts: no
+  roles:
+    - docker_tunneler
+
+- name: Wire SSH key distribution to deployment targets
+  hosts: deployment_target
+  become: yes
+  gather_facts: no
+  roles:
+    # Reads hostvars[<source>].ship_pubkey set by ssh_keypair_generator
+    # in the bootstrap play. Runs late so the fact is populated.
+    - ssh_keypair_receiver
 
 - name: Deploy container workloads
   hosts: playground

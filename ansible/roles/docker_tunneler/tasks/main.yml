@@ -1,0 +1,24 @@
+---
+# Install docker-tunneler from PyPI on hosts that need it. The closed-
+# network rule that applies to deployed workloads doesn't apply to
+# provisioning — provisioning may reach the internet.
+#
+# `--break-system-packages` is required on Debian/Ubuntu since the
+# system Python is PEP 668 externally-managed. Acceptable in a lab
+# but flag this to a real-fleet provisioner.
+
+- name: Ensure pip3 is installed
+  ansible.builtin.apt:
+    name: python3-pip
+    state: present
+    update_cache: yes
+
+- name: Install docker-tunneler via pip
+  ansible.builtin.pip:
+    name: docker-tunneler
+    state: present
+    extra_args: "--break-system-packages"
+
+- name: Verify the tunneler binary is on PATH
+  ansible.builtin.command: tunneler --help
+  changed_when: false
