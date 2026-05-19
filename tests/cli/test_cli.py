@@ -328,6 +328,188 @@ def test_apply_ansible_failure_after_tofu_success_records_partial_state(
     assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
 
 
+def test_apply_writes_events_jsonl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--tofu-dir",
+            str(tofu_dir),
+            "--ansible-dir",
+            str(ansible_dir),
+            "--state-dir",
+            str(state_dir),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    run_id = json.loads(result.stdout)["run_id"]
+    events_path = state_dir / "runs" / run_id / "events.jsonl"
+    assert events_path.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    types = [e["type"] for e in events]
+    assert types == [
+        "operation_started",
+        "step_started",  # tofu-apply
+        "step_finished",
+        "step_started",  # ansible-playbook
+        "step_finished",
+        "operation_finished",
+    ]
+    assert events[-1]["payload"] == {"status": "succeeded"}
+
+
+def test_apply_failure_still_emits_operation_finished_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path, tofu_apply_exit=2)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply", "generic-infra",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--ansible-dir", str(ansible_dir),
+            "--state-dir", str(state_dir),
+        ],
+    )
+
+    assert result.exit_code == 1
+    [run_dir] = list((state_dir / "runs").iterdir())
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1]["type"] == "operation_finished"
+    assert events[-1]["payload"] == {"status": "failed"}
+
+
+def test_runs_list_shows_recent_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    # Run one apply so there's a run on disk.
+    CliRunner().invoke(
+        app,
+        [
+            "apply", "generic-infra",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--ansible-dir", str(ansible_dir),
+            "--state-dir", str(state_dir),
+        ],
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["runs", "list", "--state-dir", str(state_dir), "--output", "json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["operation"] == "apply"
+    assert payload["runs"][0]["status"] == "succeeded"
+
+
+def test_runs_list_empty_when_no_runs(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["runs", "list", "--state-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert "No operation runs recorded yet" in result.stdout
+
+
+def test_runs_show_unknown_run_fails(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["runs", "show", "20260101T000000Z-apply-ghost", "--state-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "config.runs.unknown" in result.stderr
+
+
+def test_runs_show_reports_recorded_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    apply_result = CliRunner().invoke(
+        app,
+        [
+            "apply", "generic-infra",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--ansible-dir", str(ansible_dir),
+            "--state-dir", str(state_dir),
+            "--output", "json",
+        ],
+    )
+    run_id = json.loads(apply_result.stdout)["run_id"]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "runs", "show", run_id,
+            "--state-dir", str(state_dir),
+            "--output", "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["run"]["run_id"] == run_id
+    assert payload["run"]["status"] == "succeeded"
+    assert payload["events_path"] is not None
+    assert "logs" in payload["logs_dir"]
+
+
 def test_status_reports_all_vms_provisioned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

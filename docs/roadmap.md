@@ -211,6 +211,33 @@ Slice 6c (done):
 - `TOFU_NO_STATE_DIAGNOSTIC_ID` exported from `inventory.py` so the
   status adapter doesn't depend on a magic string.
 
+## 7. Operation Runs + Events
+
+Status: in progress (first slice done).
+
+Slice 7a (done):
+
+- New module `src/playground/events/` with `OperationEvent`,
+  in-process `EventBus`, and a `JsonlWriter` subscriber that appends
+  one event per line to `.playground/runs/<id>/events.jsonl`.
+- `playground apply` and `playground destroy` now publish
+  `operation_started`, `step_started`, `step_finished`, and
+  `operation_finished` events around their tofu/ansible steps. The
+  `operation_finished` event fires even on failure so an event log
+  is always reconstructable.
+- New CLI: `playground runs list` (newest-first, with status + start/
+  end timestamps) and `playground runs show <run-id>` (renders the
+  recorded `run.json`, step results, events path, log dir).
+
+Carried forward to future work:
+
+- Live subprocess streaming as events (`log_line`-style). Today we
+  still capture combined stdout/stderr to per-step log files.
+- Retention enforcement (the `RetentionPolicy` model exists; the
+  cleanup pass doesn't).
+- Additional event consumers (TUI views, status caches) when those
+  arrive in §9.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

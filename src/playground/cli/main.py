@@ -21,6 +21,7 @@ from playground.backend.local_libvirt import (
 )
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
+from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
@@ -44,9 +45,11 @@ tofu_app = typer.Typer(
     no_args_is_help=True,
     help="Render OpenTofu input files from resolved labs.",
 )
+runs_app = typer.Typer(no_args_is_help=True, help="Inspect past operation runs.")
 app.add_typer(lab_app, name="lab")
 app.add_typer(inventory_app, name="inventory")
 app.add_typer(tofu_app, name="tofu")
+app.add_typer(runs_app, name="runs")
 
 
 @app.command("validate")
@@ -410,6 +413,10 @@ def apply_command(
     run, run_dir = start_run(runs_dir, "apply", lab)
     logs_dir = run_dir / "logs"
 
+    bus = EventBus()
+    bus.subscribe(JsonlWriter(run_dir))
+    bus.publish(run.run_id, "operation_started", {"operation": "apply", "lab": lab})
+
     tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
 
@@ -421,16 +428,22 @@ def apply_command(
     tfvars_path.write_text(json.dumps(tfvars, indent=2, sort_keys=True) + "\n")
 
     # 2. tofu apply
+    bus.publish(run.run_id, "step_started", {"step": "tofu-apply"})
     tofu_step, tofu_diagnostics = run_tofu_apply(
         tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-apply.log"
     )
     steps.append(tofu_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "tofu-apply", "exit_code": tofu_step.exit_code},
+    )
     if tofu_diagnostics or tofu_step.exit_code != 0:
         _fail_apply(
             output, run, run_dir, steps,
             diagnostics=tofu_diagnostics,
             summary="tofu apply failed; no VMs provisioned",
             log_path=tofu_step.log_path,
+            bus=bus,
         )
 
     # 3. Fetch vm_ips & render inventory.
@@ -447,6 +460,7 @@ def apply_command(
                 "`cd tofu && tofu destroy`."
             ),
             log_path=None,
+            bus=bus,
         )
 
     inventory_body, render_diagnostics = render_inventory(resolved, vm_ips)
@@ -460,11 +474,13 @@ def apply_command(
                 "tear down via `cd tofu && tofu destroy`."
             ),
             log_path=None,
+            bus=bus,
         )
     inventory_path.parent.mkdir(parents=True, exist_ok=True)
     inventory_path.write_text(inventory_body)
 
     # 4. ansible-playbook
+    bus.publish(run.run_id, "step_started", {"step": "ansible-playbook"})
     ansible_step, ansible_diagnostics = run_ansible_playbook(
         ansible_dir / "site.yml",
         inventory_path.resolve(),
@@ -472,6 +488,10 @@ def apply_command(
         cwd=ansible_dir.parent.resolve(),
     )
     steps.append(ansible_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "ansible-playbook", "exit_code": ansible_step.exit_code},
+    )
     if ansible_diagnostics or ansible_step.exit_code != 0:
         _fail_apply(
             output, run, run_dir, steps,
@@ -483,12 +503,14 @@ def apply_command(
                 "`cd tofu && tofu destroy`."
             ),
             log_path=ansible_step.log_path,
+            bus=bus,
         )
 
     finished = finish_run(
         run, run_dir, status="succeeded", steps=steps,
         summary=f"applied lab {lab!r} ({len(resolved.vms)} VMs)",
     )
+    bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
 
     if output is OutputFormat.json:
         _print_json(finished.model_dump(mode="json", exclude_none=True))
@@ -499,6 +521,122 @@ def apply_command(
     typer.echo(f"  record: {run_dir / 'run.json'}")
     for step in finished.steps:
         typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
+
+
+@runs_app.command("list")
+def runs_list_command(
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format."),
+    ] = OutputFormat.human,
+) -> None:
+    """List past operation runs (newest first)."""
+    runs_dir = state_dir / "runs"
+    records: list[dict[str, str | None]] = []
+    if runs_dir.is_dir():
+        for entry in sorted(runs_dir.iterdir(), reverse=True):
+            record_path = entry / "run.json"
+            if not record_path.is_file():
+                continue
+            try:
+                run = OperationRun.model_validate_json(record_path.read_text())
+            except (ValueError, OSError):
+                continue
+            records.append(
+                {
+                    "run_id": run.run_id,
+                    "operation": run.operation,
+                    "lab": run.lab,
+                    "status": run.status,
+                    "started_at": run.started_at,
+                    "finished_at": run.finished_at,
+                }
+            )
+
+    if output is OutputFormat.json:
+        _print_json({"runs": records})
+        return
+
+    if not records:
+        typer.echo("No operation runs recorded yet.")
+        return
+    for r in records:
+        finished = r["finished_at"] or "—"
+        typer.echo(
+            f"{r['run_id']}  {r['operation']:<7}  {r['status']:<9}  "
+            f"start={r['started_at']}  end={finished}"
+        )
+
+
+@runs_app.command("show")
+def runs_show_command(
+    run_id: Annotated[str, typer.Argument(help="Run id to inspect.")],
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format."),
+    ] = OutputFormat.human,
+) -> None:
+    """Show one run's record, step results, and event log path."""
+    run_dir = state_dir / "runs" / run_id
+    record_path = run_dir / "run.json"
+    if not record_path.is_file():
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.runs.unknown",
+                severity="error",
+                message=f"unknown run id {run_id!r}",
+                source=SourceLocation(path=str(run_dir)),
+                suggestion="run `playground runs list` to see recorded runs",
+            ),
+            output,
+            json_errors=False,
+        )
+
+    run = OperationRun.model_validate_json(record_path.read_text())
+    events_path = run_dir / "events.jsonl"
+
+    if output is OutputFormat.json:
+        _print_json(
+            {
+                "run": run.model_dump(mode="json", exclude_none=True),
+                "events_path": str(events_path) if events_path.exists() else None,
+                "logs_dir": str(run_dir / "logs"),
+            }
+        )
+        return
+
+    typer.echo(f"Run {run.run_id}")
+    typer.echo(f"  operation: {run.operation}")
+    typer.echo(f"  lab:       {run.lab}")
+    typer.echo(f"  status:    {run.status}")
+    typer.echo(f"  started:   {run.started_at}")
+    if run.finished_at:
+        typer.echo(f"  finished:  {run.finished_at}")
+    if run.summary:
+        typer.echo(f"  summary:   {run.summary}")
+    if run.steps:
+        typer.echo("  steps:")
+        for step in run.steps:
+            typer.echo(
+                f"    - {step.name}: exit {step.exit_code} (log {step.log_path})"
+            )
+    if events_path.exists():
+        typer.echo(f"  events:    {events_path}")
+    typer.echo(f"  logs:      {run_dir / 'logs'}")
 
 
 @app.command("status")
@@ -589,6 +727,10 @@ def destroy_command(
     run, run_dir = start_run(runs_dir, "destroy", lab)
     logs_dir = run_dir / "logs"
 
+    bus = EventBus()
+    bus.subscribe(JsonlWriter(run_dir))
+    bus.publish(run.run_id, "operation_started", {"operation": "destroy", "lab": lab})
+
     # Re-render the tfvars so tofu destroy sees the same var.vm_names
     # apply did — symmetric, deterministic, doesn't rely on stale state.
     tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
@@ -597,10 +739,15 @@ def destroy_command(
     tfvars_path.write_text(json.dumps(tfvars, indent=2, sort_keys=True) + "\n")
 
     steps: list[StepResult] = []
+    bus.publish(run.run_id, "step_started", {"step": "tofu-destroy"})
     tofu_step, tofu_diagnostics = run_tofu_destroy(
         tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log"
     )
     steps.append(tofu_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "tofu-destroy", "exit_code": tofu_step.exit_code},
+    )
     if tofu_diagnostics or tofu_step.exit_code != 0:
         _fail_apply(
             output, run, run_dir, steps,
@@ -610,12 +757,14 @@ def destroy_command(
                 "tofu state with `cd tofu && tofu state list` and retry."
             ),
             log_path=tofu_step.log_path,
+            bus=bus,
         )
 
     finished = finish_run(
         run, run_dir, status="succeeded", steps=steps,
         summary=f"destroyed lab {lab!r}",
     )
+    bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
 
     if output is OutputFormat.json:
         _print_json(finished.model_dump(mode="json", exclude_none=True))
@@ -635,13 +784,18 @@ def _fail_apply(
     diagnostics: list[Diagnostic],
     summary: str,
     log_path: str | None,
+    bus: EventBus | None = None,
 ) -> NoReturn:
     """Finalize ``run`` as failed, print diagnostics + log tail, exit nonzero.
 
     Single-call failure protocol: this is the only path that finalizes a
     failed run record, so the "running" state can't survive on disk.
+    Also publishes ``operation_finished`` (status=failed) so any
+    subscribed event log gets the final marker before we exit.
     """
     finish_run(run, run_dir, status="failed", steps=steps, summary=summary)
+    if bus is not None:
+        bus.publish(run.run_id, "operation_finished", {"status": "failed"})
     if diagnostics:
         _print_diagnostics(diagnostics, err=True)
     if log_path:
@@ -650,7 +804,7 @@ def _fail_apply(
             typer.echo(f"--- tail of {log_path} ---", err=True)
             typer.echo(tail, err=True)
     typer.echo(summary, err=True)
-    typer.echo(f"apply failed; run record at {run_dir / 'run.json'}", err=True)
+    typer.echo(f"{run.operation} failed; run record at {run_dir / 'run.json'}", err=True)
     raise typer.Exit(code=1)
 
 
