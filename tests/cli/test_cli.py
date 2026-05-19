@@ -149,6 +149,53 @@ def test_inventory_render_reports_missing_tofu(
     assert not (tmp_path / "out.ini").exists()
 
 
+def test_plan_renders_human_summary() -> None:
+    result = CliRunner().invoke(
+        app, ["plan", "generic-infra", "--config-dir", str(CONFIG_DIR)]
+    )
+
+    assert result.exit_code == 0
+    assert "Plan for lab 'generic-infra' (backend: local-libvirt)" in result.stdout
+    # Spot-checks across the three sections
+    assert "+ edge  nat network on 10.20.10.0/24" in result.stdout
+    assert "+ docker1  docker-host on ubuntu-noble" in result.stdout
+    assert "+ demo-compose  compose -> role:docker-host" in result.stdout
+    assert "fits: yes" in result.stdout
+    # Warning from validation surfaces on stderr via _print_warnings.
+    assert "config.backend.per_vm_resources_unsupported" in result.stderr
+
+
+def test_plan_renders_json_payload() -> None:
+    result = CliRunner().invoke(
+        app,
+        ["plan", "generic-infra", "--config-dir", str(CONFIG_DIR), "-o", "json"],
+    )
+
+    assert result.exit_code == 0
+    plan = json.loads(result.stdout)
+    assert plan["lab_name"] == "generic-infra"
+    assert plan["backend"] == "local-libvirt"
+    assert plan["offline"] is False
+    verbs = {a["verb"] for a in plan["actions"]}
+    assert verbs == {"create"}
+    types = {a["resource_type"] for a in plan["actions"]}
+    assert types == {"network", "vm", "workload"}
+    assert plan["budget"]["fits"] is True
+    # Warnings carried forward into the plan model for machine-readable
+    # consumption.
+    warning_ids = {w["id"] for w in plan["warnings"]}
+    assert "config.backend.per_vm_resources_unsupported" in warning_ids
+
+
+def test_plan_unknown_lab_fails() -> None:
+    result = CliRunner().invoke(
+        app, ["plan", "ghost-lab", "--config-dir", str(CONFIG_DIR)]
+    )
+
+    assert result.exit_code == 1
+    assert "config.lab.unknown" in result.stderr
+
+
 def test_tofu_render_unknown_lab(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         app,

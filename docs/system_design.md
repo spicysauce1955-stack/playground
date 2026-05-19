@@ -182,18 +182,31 @@ doctor, cache, command presets, and run inspection.
 
 ## Planner
 
-The planner is future work. It compares desired state from `ResolvedLab` with
-current `.playground/` state and backend-observed state.
+The first read-only slice has shipped: `playground plan <lab>` renders a
+backend-neutral `Plan` (`src/playground/planner/plan.py`) from a
+`ResolvedLab`. Today every action verb is `create` — state observation
+(comparison against `.playground/state/observed/` and what the backend
+reports) is a follow-up slice.
 
-Planner output should include:
+Today's planner emits:
 
-- create/update/delete/no-op actions
-- resource budget impact
-- warnings and validation blockers
-- rendered backend input previews where useful
-- human-readable and machine-readable plan formats
+- per-resource `create` actions (networks, VMs, workloads) with summaries
+  and detail bags
+- aggregated budget impact (totals + the lab's `Budget` limits + a `fits`
+  flag)
+- validator warnings carried forward into the plan as a snapshot
+- human and JSON output formats
 
-The planner should not execute backend commands.
+Future work:
+
+- state observation: read `.playground/state/observed/` and backend
+  reports, emit `update` / `delete` / `no_op` verbs
+- rendered backend input previews (tfvars body, inventory body) where
+  useful
+- promote `playground plan` to a subapp (`plan render`, `plan show
+  <run-id>`, `plan diff`) once operation runs land
+
+The planner does not execute backend commands.
 
 ## Operation Runner And Events
 

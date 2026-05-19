@@ -383,9 +383,9 @@ flowchart LR
     classDef done fill:#cfc,stroke:#383
     classDef next fill:#ffd,stroke:#cc0
     classDef queued fill:#eee,stroke:#888
-    class s1,s2,s3,s4a,s4b,s4c,s4d done
-    class s5 next
-    class s6,s7,s8,s9 queued
+    class s1,s2,s3,s4a,s4b,s4c,s4d,s5 done
+    class s6 next
+    class s7,s8,s9 queued
 ```
 
 Done is green; the two immediate follow-ups inside §4 are yellow. Everything

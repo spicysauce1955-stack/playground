@@ -133,3 +133,30 @@ Carried forward to future work:
 - CLI imports the concrete `playground.backend.local_libvirt` adapter
   directly. Introduce a small adapter protocol / registry only when a
   second backend appears.
+
+## 5. Plan Rendering
+
+Status: in progress (first slice done; state-observation slice queued).
+
+Slice 5a (done):
+
+- `playground plan <lab>` renders a backend-neutral `Plan` from a
+  `ResolvedLab`. Today every action verb is `create`; future verbs
+  (`update` / `delete` / `no_op`) are reserved in `ActionVerb` and
+  unlock when state observation lands.
+- `Plan` carries: per-resource actions (network/vm/workload),
+  aggregate budget (totals vs limits + `fits` flag), and validator
+  warnings carried forward as a snapshot.
+- New module `src/playground/planner/` — peer of `validation/`,
+  `config/`, `backend/`. Pure function `render_plan(resolved,
+  warnings=None) -> Plan`.
+- Human and JSON output modes.
+
+Slice 5b (queued):
+
+- State observation: read `.playground/state/observed/` and backend
+  reports (e.g. `tofu state list -json`, libvirt domain query).
+- Emit `update` / `delete` / `no_op` actions and `before`/`after`
+  details where applicable.
+- Promote `plan` to a subapp (`plan render`, `plan show <run-id>`,
+  `plan diff`) once operation runs land.

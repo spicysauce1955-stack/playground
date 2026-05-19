@@ -18,6 +18,7 @@ from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
+from playground.planner import Plan, PlanAction, render_plan
 from playground.validation import validate as validate_loaded_config
 
 
@@ -234,6 +235,76 @@ def render_inventory_command(
     typer.echo(f"  vms: {len(resolved.vms)}")
 
 
+@app.command("plan")
+def plan_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to plan.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format."),
+    ] = OutputFormat.human,
+) -> None:
+    """Render a backend-neutral plan for ``lab`` (read-only)."""
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    warnings = _warnings_in(diagnostics)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    plan = render_plan(resolved, warnings=warnings)
+
+    if output is OutputFormat.json:
+        _print_json(plan.model_dump(mode="json"))
+        return
+
+    _render_plan_human(plan)
+
+
+def _render_plan_human(plan: Plan) -> None:
+    typer.echo(f"Plan for lab {plan.lab_name!r} (backend: {plan.backend})")
+    if plan.offline:
+        typer.echo("  offline: true")
+    typer.echo("")
+
+    by_type: dict[str, list[PlanAction]] = {"network": [], "vm": [], "workload": []}
+    for action in plan.actions:
+        by_type[action.resource_type].append(action)
+
+    for resource_type, label in [
+        ("network", "Networks"),
+        ("vm", "VMs"),
+        ("workload", "Workloads"),
+    ]:
+        actions = by_type[resource_type]
+        if not actions:
+            continue
+        typer.echo(f"{label}:")
+        for action in actions:
+            typer.echo(f"  + {action.name}  {action.summary}")
+        typer.echo("")
+
+    budget = plan.budget
+    limits = budget.limits
+    typer.echo("Budget:")
+    typer.echo(
+        f"  totals: {budget.vms} VMs, {budget.vcpu} vCPU, "
+        f"{budget.memory_mb} MiB RAM, {budget.disk_gb} GiB disk, "
+        f"{budget.containers} workloads"
+    )
+    typer.echo(
+        f"  limits ({limits.mode}): "
+        f"{limits.max_vms} VMs / {limits.max_vcpu} vCPU / "
+        f"{limits.max_memory_mb} MiB / {limits.max_disk_gb} GiB / "
+        f"{limits.max_containers} workloads"
+    )
+    typer.echo(f"  fits: {'yes' if budget.fits else 'NO'}")
+
+
 @tofu_app.command("render")
 def render_tfvars_command(
     lab: Annotated[str, typer.Argument(help="Lab name to render tofu vars for.")],
@@ -396,8 +467,13 @@ def _diagnostic_to_dict(diagnostic: Diagnostic) -> dict[str, object]:
     return diagnostic.model_dump(mode="json", exclude_none=True)
 
 
+def _warnings_in(diagnostics: list[Diagnostic]) -> list[Diagnostic]:
+    """The single source of "what counts as a warning" used by the CLI."""
+    return [d for d in diagnostics if d.severity == "warning"]
+
+
 def _print_warnings(diagnostics: list[Diagnostic]) -> None:
-    warnings = [d for d in diagnostics if d.severity == "warning"]
+    warnings = _warnings_in(diagnostics)
     if warnings:
         _print_diagnostics(warnings, err=True)
 
