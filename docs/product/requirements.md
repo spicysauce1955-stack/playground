@@ -124,6 +124,13 @@ The primary user is the project owner/operator:
 - Docker Compose must be supported.
 - Docker Swarm must be supported with hybrid automatic/explicit manager-worker assignment.
 
+Compose and Swarm are high-priority product requirements. Their
+**execution** is sequenced after basic Docker readiness; see the
+"Current Interpretation" at the top of this document and
+`docs/product/mvp_scope.md`. The schema slots for `compose` and
+`swarm` workload types already exist so the model does not have to
+change when execution lands.
+
 ### 5.8 TUI And CLI
 
 - CLI and TUI must operate on the same config/state/operation model.
