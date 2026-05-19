@@ -21,14 +21,32 @@ locals {
     ? var.vm_names
     : [for i in range(var.vm_count) : "pg-node-${i + 1}"]
   )
+
+  # Per-VM list of {net, ip} interface descriptors. When a VM has no
+  # explicit vm_networks entry, default to attaching it to the first
+  # declared network (back-compat). When a network has no pinned IP for
+  # this VM, the empty string sentinel means "let libvirt assign via DHCP".
+  vm_interfaces = {
+    for vm in local.effective_vm_names :
+    vm => [
+      for net in lookup(var.vm_networks, vm, [var.networks[0].name]) : {
+        net = net
+        ip  = lookup(lookup(var.vm_network_ips, vm, {}), net, "")
+      }
+    ]
+  }
 }
 
-# Define the isolated playground network
-resource "libvirt_network" "playground_net" {
-  name      = "playground_net"
+# One libvirt_network per entry in var.networks. NAT mode, DHCP enabled.
+# Domain name defaults to <network_name>.lab so different labs don't
+# collide on the same libvirt host.
+resource "libvirt_network" "lab" {
+  for_each = { for n in var.networks : n.name => n }
+
+  name      = each.value.name
   mode      = "nat"
-  domain    = "playground.local"
-  addresses = ["10.0.10.0/24"]
+  domain    = "${each.value.name}.lab"
+  addresses = [each.value.cidr]
 
   dhcp {
     enabled = true
@@ -63,7 +81,9 @@ resource "libvirt_cloudinit_disk" "commoninit" {
   })
 }
 
-# Define the Guest VMs
+# Define the Guest VMs. Each VM gets one network_interface per entry in
+# var.vm_networks[vm_name], with addresses pinned when var.vm_network_ips
+# has an entry for (vm, network).
 resource "libvirt_domain" "playground_node" {
   count  = length(local.effective_vm_names)
   name   = local.effective_vm_names[count.index]
@@ -76,9 +96,13 @@ resource "libvirt_domain" "playground_node" {
     mode = "host-passthrough"
   }
 
-  network_interface {
-    network_id     = libvirt_network.playground_net.id
-    wait_for_lease = true
+  dynamic "network_interface" {
+    for_each = local.vm_interfaces[local.effective_vm_names[count.index]]
+    content {
+      network_id     = libvirt_network.lab[network_interface.value.net].id
+      addresses      = network_interface.value.ip != "" ? [network_interface.value.ip] : null
+      wait_for_lease = true
+    }
   }
 
   disk {

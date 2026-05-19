@@ -10,6 +10,29 @@ variable "vm_names" {
   default     = null
 }
 
+variable "networks" {
+  description = "Lab networks to create. Each entry becomes a `libvirt_network` resource. Defaults to a single NAT network on 10.0.10.0/24 so legacy single-network runs keep working without a var-file. Set via `playground tofu render` from the lab's `spec.networks`."
+  type = list(object({
+    name = string
+    cidr = string
+  }))
+  default = [
+    { name = "playground_net", cidr = "10.0.10.0/24" }
+  ]
+}
+
+variable "vm_networks" {
+  description = "Which networks each VM joins, keyed by VM name. Each VM gets one `network_interface` per entry. Defaults to the first network when unset for a given VM — back-compat with the legacy single-network behavior."
+  type        = map(list(string))
+  default     = {}
+}
+
+variable "vm_network_ips" {
+  description = "Per-VM static IP pins, keyed by VM name then by network name. Each pinned IP becomes the interface's `addresses` so libvirt assigns it deterministically. Networks without a pin fall back to DHCP."
+  type        = map(map(string))
+  default     = {}
+}
+
 variable "vm_memory" {
   description = "Amount of RAM per VM in MB"
   type        = number

@@ -789,15 +789,17 @@ def test_tofu_render_writes_tfvars_and_json_payload(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload == {
-        "ok": True,
-        "lab": "generic-infra",
-        "path": str(out_path),
-        "vars": ["vm_names"],
-    }
-    assert json.loads(out_path.read_text()) == {
-        "vm_names": ["node1", "docker1", "router1"]
-    }
+    assert payload["ok"] is True
+    assert payload["lab"] == "generic-infra"
+    assert payload["path"] == str(out_path)
+    # generic-infra has 3 networks + per-VM network attachments, so the
+    # renderer emits more than just vm_names. No IPs pinned in this lab.
+    assert set(payload["vars"]) == {"vm_names", "networks", "vm_networks"}
+    on_disk = json.loads(out_path.read_text())
+    assert on_disk["vm_names"] == ["node1", "docker1", "router1"]
+    assert {"name": "edge", "cidr": "10.20.10.0/24"} in on_disk["networks"]
+    assert on_disk["vm_networks"]["docker1"] == ["edge", "lab-private"]
+    assert "vm_network_ips" not in on_disk
     # Backend-capability warning surfaces during validate, on stderr
     assert "config.backend.per_vm_resources_unsupported" in result.stderr
 
@@ -813,9 +815,10 @@ def test_tofu_render_default_destination_and_apply_hint(tmp_path: Path) -> None:
         assert result.exit_code == 0
         default_path = Path(cwd) / ".playground" / "state" / "tofu" / "generic-infra.tfvars.json"
         assert default_path.exists()
-        assert json.loads(default_path.read_text()) == {
-            "vm_names": ["node1", "docker1", "router1"]
-        }
+        on_disk = json.loads(default_path.read_text())
+        assert on_disk["vm_names"] == ["node1", "docker1", "router1"]
+        assert "networks" in on_disk
+        assert "vm_networks" in on_disk
         # Apply hint must use the absolute resolved path so it works no
         # matter what cwd the operator runs `tofu` from.
         assert f"-var-file={default_path.resolve()}" in result.stdout
