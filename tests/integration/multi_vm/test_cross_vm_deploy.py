@@ -175,6 +175,21 @@ def test_cross_vm_ship_and_deploy() -> None:
         assert ps.returncode == 0, ps.stderr
         assert ps.stdout.startswith("Up "), f"hello container not up: {ps.stdout!r}"
 
+        # Spec criterion 1 (cross-check): the image bytes on target match
+        # what was `docker save`d on central. The spec asks for `docker
+        # images --digests` parity, but the demo image is a retag of
+        # alpine:3.19 — registry digests show `<none>` on both VMs. The
+        # proper "same bytes" check is image ID equality, which is what
+        # we assert here.
+        id_central = _ssh(ips["central"], "docker images hello:demo --format '{{.ID}}'")
+        id_target = _ssh(ips["target"], "docker images hello:demo --format '{{.ID}}'")
+        assert id_central.returncode == 0 and id_central.stdout.strip(), id_central.stderr
+        assert id_target.returncode == 0 and id_target.stdout.strip(), id_target.stderr
+        assert id_central.stdout.strip() == id_target.stdout.strip(), (
+            f"image ID mismatch — central={id_central.stdout!r}, "
+            f"target={id_target.stdout!r}"
+        )
+
         # Spec criterion 2: config file in place with templated greeting.
         conf = _ssh(ips["target"], "cat /etc/hello/hello.conf")
         assert conf.returncode == 0, conf.stderr
@@ -199,6 +214,23 @@ def test_cross_vm_ship_and_deploy() -> None:
         assert any("images/hello.tar" in f for f in files)
         assert any("configs/hello.conf" in f for f in files)
         assert "tar_sha256" in manifest_data
+
+        # Spec criteria 4 + 5 (cross-check): the archived tar.gz's bytes
+        # match the sha256 the manifest recorded. The spec also says
+        # criterion 4's tar should match "the sha256 of the source on
+        # central" — but ship-deploy.sh wraps its output in a mktemp dir
+        # and cleans up on EXIT, so there's no source tar to hash after
+        # the script returns. Asserting manifest <-> archive parity is
+        # the achievable form of "bytes-on-target == bytes-shipped".
+        archived_sha = _ssh(
+            ips["target"],
+            "sha256sum /var/spool/deploys/archive/ok/demo-app.tar.gz | awk '{print $1}'",
+        )
+        assert archived_sha.returncode == 0, archived_sha.stderr
+        assert archived_sha.stdout.strip() == manifest_data["tar_sha256"], (
+            f"manifest tar_sha256 ({manifest_data['tar_sha256']!r}) does not "
+            f"match the archived tar's sha256 ({archived_sha.stdout.strip()!r})"
+        )
 
         # Spec criterion 6: idempotency — second run reports skipped=true.
         ship_again = _ssh(ips["central"], "/usr/local/bin/ship-deploy.sh")
