@@ -18,22 +18,23 @@ CONFIG_DIR = REPO_ROOT / "config"
 
 
 @pytest.fixture(autouse=True)
-def _stub_wait_for_vms_ready(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Skip the apply tofu→ansible gate in CLI tests.
+def _stub_live_apply_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the wait-for-vms-ready and verify-lab steps in CLI tests.
 
-    The real wait step does live TCP + SSH probes against whatever
-    IPs ``tofu output -json`` returns. In these tests those IPs come
-    from a shell shim and aren't real, so the wait would block until
-    the multi-minute default timeout. The wait code path itself is
-    covered comprehensively by
-    ``tests/unit/backend/local_libvirt/test_wait.py``; here we just
-    want the rest of the apply pipeline to behave as if VMs were
-    ready.
+    Both steps do live TCP + SSH probes against whatever IPs
+    ``tofu output -json`` returns. In these tests those IPs come
+    from a shell shim and aren't real, so the steps would block
+    until their multi-minute default timeouts. The code paths
+    themselves are covered comprehensively by
+    ``tests/unit/backend/local_libvirt/test_wait.py`` and
+    ``tests/unit/backend/local_libvirt/test_verify.py``; here we
+    just want the rest of the apply pipeline to behave as if VMs
+    were ready and healthy.
     """
     from playground.backend.local_libvirt import runner as runner_mod
     from playground.runs import StepResult
 
-    def _stub(**_kwargs: object) -> tuple[StepResult, list[object]]:
+    def _stub_wait(**_kwargs: object) -> tuple[StepResult, list[object]]:
         return (
             StepResult(
                 name="wait-for-vms-ready",
@@ -46,7 +47,21 @@ def _stub_wait_for_vms_ready(monkeypatch: pytest.MonkeyPatch) -> None:
             [],
         )
 
-    monkeypatch.setattr(runner_mod, "wait_for_vms_ready", _stub)
+    def _stub_verify(**_kwargs: object) -> tuple[StepResult, list[object]]:
+        return (
+            StepResult(
+                name="verify-lab",
+                command=["verify-lab", "stub"],
+                exit_code=0,
+                log_path="/tmp/stub-verify.log",
+                started_at="2026-05-19T00:00:01+00:00",
+                finished_at="2026-05-19T00:00:02+00:00",
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(runner_mod, "wait_for_vms_ready", _stub_wait)
+    monkeypatch.setattr(runner_mod, "verify_lab", _stub_verify)
 
 
 def _write_fake_tofu(tmp_path: Path, payload: str) -> Path:
@@ -637,6 +652,7 @@ def test_apply_happy_path_writes_run_record(
         "tofu-apply",
         "wait-for-vms-ready",
         "ansible-playbook",
+        "verify-lab",
     ]
     assert all(s["exit_code"] == 0 for s in payload["steps"])
     # Run record on disk matches the printed payload.
@@ -875,6 +891,8 @@ def test_apply_writes_events_jsonl(
         "step_started",   # wait-for-vms-ready
         "step_finished",
         "step_started",   # ansible-playbook
+        "step_finished",
+        "step_started",   # verify-lab
         "step_finished",
         "operation_finished",
     ]

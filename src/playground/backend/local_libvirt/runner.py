@@ -37,6 +37,7 @@ from playground.backend.local_libvirt.inventory import (
 )
 from playground.backend.local_libvirt.scrub import scrub_lab
 from playground.backend.local_libvirt.tfvars import render_tfvars
+from playground.backend.local_libvirt.verify import verify_lab
 from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic
@@ -196,12 +197,40 @@ def execute_apply(
             "failure, or tear down via destroy.",
         )
 
+    # 6. verify-lab — post-apply sanity battery (WARNING-ONLY).
+    # Failures attach diagnostics to the run but the run still
+    # finishes status=succeeded. See docs/architecture/CONTRACTS.md
+    # → verify-lab for the contract. Promoting to hard-fail can
+    # come later if the warning signal proves too quiet.
+    bus.publish(run.run_id, "step_started", {"step": "verify-lab"})
+    verify_step, verify_diagnostics = verify_lab(
+        resolved=resolved,
+        vm_ips=vm_ips,
+        log_path=logs_dir / "verify-lab.log",
+        bus=bus,
+        run_id=run.run_id,
+    )
+    steps.append(verify_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "verify-lab", "exit_code": verify_step.exit_code},
+    )
+    # Downgrade any error-severity verify diagnostics to warning so
+    # the warning-only contract holds end-to-end. Step exit code
+    # still reflects what really happened (visible in run.json).
+    downgraded_verify: list[Diagnostic] = [
+        d.model_copy(update={"severity": "warning"})
+        if d.severity == "error"
+        else d
+        for d in verify_diagnostics
+    ]
+
     finished = finish_run(
         run, run_dir, status="succeeded", steps=steps,
         summary=f"applied lab {lab!r} ({len(resolved.vms)} VMs)",
     )
     bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
-    return finished, []
+    return finished, downgraded_verify
 
 
 def execute_destroy(
