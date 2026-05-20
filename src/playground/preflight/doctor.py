@@ -727,6 +727,281 @@ def _list_ansible_collections() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Move-2 follow-ups: three coverage gaps the strategic audit flagged.
+# Each one prevents a "next-bug" by surfacing it early. See
+# docs/architecture/CONTRACTS.md for the layer contracts these probes
+# defend.
+# ---------------------------------------------------------------------------
+
+
+_RECOGNIZED_IMAGE_PATTERNS = (
+    "ubuntu",
+    "debian",
+    "fedora",
+    "centos",
+    "rocky",
+    "alma",
+    "noble",
+    "jammy",
+    "focal",
+)
+"""Substrings in `var.ubuntu_image_url` that indicate a cloud image
+that ships with cloud-init pre-installed. Conservative: a URL not
+matching any of these triggers the warning, not an error — the
+operator may know the image has cloud-init even if the name is
+non-standard."""
+
+
+def check_cloud_init_on_image(
+    tofu_dir: Path | None = None,
+) -> list[Diagnostic]:
+    """Verify the image url tofu fetches looks like a cloud image.
+
+    The pipeline assumes cloud-init is present on the VM (it's how
+    the SSH key gets injected and how `wait-for-vms-ready`'s phase
+    2 blocks on `cloud-init status --wait`). If an operator points
+    `var.ubuntu_image_url` at a vanilla server ISO, apply silently
+    succeeds at tofu time but the wait step hangs forever on TCP
+    :22 because nothing ever provisioned sshd.
+
+    The check is lightweight: parse `tofu/variables.tf` for the
+    default value of `ubuntu_image_url` and assert it matches a
+    known cloud-image substring. Doesn't reach out to the network.
+    """
+    root = tofu_dir if tofu_dir is not None else (Path.cwd() / "tofu")
+    variables_tf = root / "variables.tf"
+    if not variables_tf.is_file():
+        # The tofu tree is missing — a different problem entirely.
+        # Don't double-report; the rest of doctor or apply will fail
+        # at a more useful spot.
+        return []
+
+    try:
+        text = variables_tf.read_text()
+    except OSError as exc:
+        return [
+            Diagnostic(
+                id="runtime.doctor.cloud_init_image_unverified",
+                severity="warning",
+                message=f"could not read {variables_tf}: {exc}",
+                source=_host_source(str(variables_tf)),
+            )
+        ]
+
+    # Extract the default = "..." line under variable "ubuntu_image_url".
+    match = re.search(
+        r'variable\s+"ubuntu_image_url"\s*\{[^}]*?default\s*=\s*"([^"]+)"',
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return [
+            Diagnostic(
+                id="runtime.doctor.cloud_init_image_unverified",
+                severity="warning",
+                message=(
+                    f"could not parse `default` for `ubuntu_image_url` in "
+                    f"{variables_tf}; cannot verify the image ships "
+                    "cloud-init"
+                ),
+                source=_host_source(str(variables_tf)),
+                suggestion=(
+                    "confirm the image at var.ubuntu_image_url has cloud-init "
+                    "installed; otherwise wait-for-vms-ready will hang"
+                ),
+            )
+        ]
+
+    url = match.group(1)
+    lowered = url.lower()
+    if any(needle in lowered for needle in _RECOGNIZED_IMAGE_PATTERNS):
+        return []
+
+    return [
+        Diagnostic(
+            id="runtime.doctor.cloud_init_image_unverified",
+            severity="warning",
+            message=(
+                f"`ubuntu_image_url` default ({url!r}) doesn't look like a "
+                "known cloud image (no ubuntu/debian/fedora/etc. in URL). "
+                "If the image ships cloud-init this is a false positive; if "
+                "not, wait-for-vms-ready will hang on TCP :22 forever"
+            ),
+            source=_host_source(str(variables_tf)),
+            suggestion=(
+                "either confirm the image has cloud-init installed (boot it "
+                "manually and run `cloud-init --version`), or point "
+                "var.ubuntu_image_url at a known cloud image like "
+                "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+            ),
+        )
+    ]
+
+
+def check_ansible_config_wired(
+    runner_path: Path | None = None,
+) -> list[Diagnostic]:
+    """Confirm runner.py actually wires ANSIBLE_CONFIG.
+
+    The `ansible/ansible.cfg` file is only useful if
+    `run_ansible_playbook` is called with `ansible_cfg=`. Ansible's
+    auto-discovery looks at `./ansible.cfg` relative to cwd (which
+    is the repo root, not `ansible/`), so without the explicit env
+    var the file is silently ignored. A future refactor could drop
+    the kwarg and nobody would notice until the next fresh apply
+    hangs on a host-key prompt.
+
+    Static check: grep the runner source for the wiring. If it's
+    missing the entire ansible.cfg → fresh-apply hardening is
+    unwired and we'd regress to the pre-roadmap-§15 state.
+    """
+    path = (
+        runner_path
+        if runner_path is not None
+        else (
+            Path.cwd()
+            / "src"
+            / "playground"
+            / "backend"
+            / "local_libvirt"
+            / "runner.py"
+        )
+    )
+    if not path.is_file():
+        # Standalone install where doctor runs without the source
+        # tree present — don't double-report.
+        return []
+
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        return [
+            Diagnostic(
+                id="runtime.doctor.ansible_config_not_wired",
+                severity="warning",
+                message=f"could not read {path}: {exc}",
+                source=_host_source(str(path)),
+            )
+        ]
+
+    if "ansible_cfg=" in text:
+        return []
+
+    return [
+        Diagnostic(
+            id="runtime.doctor.ansible_config_not_wired",
+            severity="warning",
+            message=(
+                f"{path} does not pass `ansible_cfg=` to "
+                "`run_ansible_playbook` — `ansible/ansible.cfg` will be "
+                "silently ignored and ansible will run with stock defaults "
+                "(host_key_checking=True, no ControlMaster, no pipelining), "
+                "which breaks fresh `playground apply` runs"
+            ),
+            source=_host_source(str(path)),
+            suggestion=(
+                "in execute_apply, call "
+                "`run_ansible_playbook(..., ansible_cfg=ansible_dir / "
+                '"ansible.cfg")`. See roadmap §15 and '
+                "docs/architecture/CONTRACTS.md → ansible-playbook"
+            ),
+        )
+    ]
+
+
+def check_tofu_state_alignment(
+    tofu_dir: Path | None = None,
+) -> list[Diagnostic]:
+    """When tofu state exists, confirm it lists playground domains.
+
+    Catches drift: an operator who ran `tofu apply` directly (not
+    through the playground CLI) and left a stale state that the
+    inventory renderer would silently mis-pair. Or a tofu state
+    that was partially destroyed and never cleaned up — the next
+    apply will refresh state and report "5 resources to add" when
+    the operator was expecting "no changes."
+
+    Best-effort: skipped when tofu isn't on PATH, when the tofu
+    dir doesn't exist, or when state is empty (no prior apply).
+    Warning-only because a stale state isn't always a bug — the
+    operator may have intended to recreate everything.
+    """
+    root = tofu_dir if tofu_dir is not None else (Path.cwd() / "tofu")
+    if not root.is_dir():
+        return []
+    if shutil.which("tofu") is None:
+        return []
+    # `tofu state list` is a no-op if no state file exists — exits 0
+    # with empty stdout, which is the right "skip" signal for us.
+    try:
+        result = subprocess.run(
+            ["tofu", "state", "list"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    if result.returncode != 0:
+        # State backend errors land here; surface them so the next
+        # apply doesn't crash mid-pipeline.
+        return [
+            Diagnostic(
+                id="runtime.doctor.tofu_state_drift",
+                severity="warning",
+                message=(
+                    f"`tofu state list` in {root} failed "
+                    f"(exit {result.returncode}): "
+                    f"{result.stderr.strip() or '(no stderr)'}"
+                ),
+                source=_host_source(str(root)),
+                suggestion=(
+                    "inspect manually: `cd tofu && tofu state list`. "
+                    "If the state is irrecoverable, `playground reset "
+                    "<lab>` scrubs by name without touching tofu state"
+                ),
+            )
+        ]
+
+    state_entries = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not state_entries:
+        # Empty state = no prior apply, perfectly fine.
+        return []
+
+    has_playground_domain = any(
+        entry.startswith("libvirt_domain.playground_node")
+        for entry in state_entries
+    )
+    if has_playground_domain:
+        return []
+
+    # State exists but holds nothing that looks like the playground
+    # tofu module. Either an unrelated user of the same tofu dir, or
+    # a misconfigured state file. Either way, the next `playground
+    # apply` would surprise the operator.
+    return [
+        Diagnostic(
+            id="runtime.doctor.tofu_state_drift",
+            severity="warning",
+            message=(
+                f"tofu state in {root} has {len(state_entries)} entries but "
+                "none match `libvirt_domain.playground_node`. The state "
+                "may belong to a different tofu module, or a previous "
+                "apply was interrupted"
+            ),
+            source=_host_source(str(root)),
+            suggestion=(
+                "inspect: `cd tofu && tofu state list`. To clear: "
+                "`playground reset <lab>` (or `cd tofu && tofu destroy`)"
+            ),
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -750,4 +1025,7 @@ def run_all_checks(*, ssh_key_path: Path | None = None) -> list[Diagnostic]:
     diagnostics.extend(check_libvirt_apparmor())
     diagnostics.extend(check_ansible_and_collections())
     diagnostics.extend(check_ansible_config())
+    diagnostics.extend(check_cloud_init_on_image())
+    diagnostics.extend(check_ansible_config_wired())
+    diagnostics.extend(check_tofu_state_alignment())
     return diagnostics

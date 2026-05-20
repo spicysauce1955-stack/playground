@@ -402,7 +402,7 @@ categories:
 | `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing`, `ssh_binary_missing`, `wait_ssh_timeout`, `wait_cloud_init_timeout`, `wait_cloud_init_failed`, `wait_unexpected` |
 | `runtime.tui.*` | CLI | `missing_dependency` |
 | `runtime.exec.*` | CLI | `ssh_binary_missing` |
-| `runtime.doctor.*` | preflight | `iso_tool_missing`, `virsh_missing`, `virsh_unreachable`, `libvirt_group_missing`, `libvirt_group_inactive`, `default_pool_missing`, `default_pool_inactive`, `default_pool_no_autostart`, `pool_path_unreadable`, `ssh_public_key_missing`, `apparmor_libvirt_unconfigured`, `apparmor_orphan_profiles`, `ansible_missing`, `ansible_collection_missing`, `ansible_cfg_missing`, `ansible_cfg_misconfigured` |
+| `runtime.doctor.*` | preflight | `iso_tool_missing`, `virsh_missing`, `virsh_unreachable`, `libvirt_group_missing`, `libvirt_group_inactive`, `default_pool_missing`, `default_pool_inactive`, `default_pool_no_autostart`, `pool_path_unreadable`, `ssh_public_key_missing`, `apparmor_libvirt_unconfigured`, `apparmor_orphan_profiles`, `ansible_missing`, `ansible_collection_missing`, `ansible_cfg_missing`, `ansible_cfg_misconfigured`, `cloud_init_image_unverified`, `ansible_config_not_wired`, `tofu_state_drift` |
 | `runtime.reset.*` | backend (scrub) | `virsh_missing`, `virsh_unreachable`, `pool_unreachable`, `scrub_failed`, `tofu_destroy_warning`, `state_cleanup_failed` |
 
 Diagnostic IDs are **stable public contract** — they show up in JSON output

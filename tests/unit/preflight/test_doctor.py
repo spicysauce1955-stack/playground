@@ -611,6 +611,185 @@ def test_ansible_collections_tabular_fallback(monkeypatch: pytest.MonkeyPatch) -
 
 
 # ---------------------------------------------------------------------------
+# check_cloud_init_on_image (Move 2)
+# ---------------------------------------------------------------------------
+
+
+_VARIABLES_TF_TEMPLATE = '''\
+variable "ubuntu_image_url" {{
+  description = "Source for the Ubuntu Cloud Image."
+  type        = string
+  default     = "{url}"
+}}
+'''
+
+
+def test_cloud_init_image_recognized_silences(tmp_path: Path) -> None:
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    (tofu_dir / "variables.tf").write_text(
+        _VARIABLES_TF_TEMPLATE.format(
+            url="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+        )
+    )
+    assert doctor.check_cloud_init_on_image(tofu_dir=tofu_dir) == []
+
+
+def test_cloud_init_image_unrecognized_warns(tmp_path: Path) -> None:
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    (tofu_dir / "variables.tf").write_text(
+        _VARIABLES_TF_TEMPLATE.format(
+            url="https://example.com/my-custom-vanilla-server.iso"
+        )
+    )
+    diagnostics = doctor.check_cloud_init_on_image(tofu_dir=tofu_dir)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.cloud_init_image_unverified"
+    assert diagnostics[0].severity == "warning"
+    assert "my-custom-vanilla-server.iso" in diagnostics[0].message
+
+
+def test_cloud_init_image_skipped_when_tofu_missing(tmp_path: Path) -> None:
+    # No tofu/ subdir → check returns empty silently.
+    assert doctor.check_cloud_init_on_image(tofu_dir=tmp_path / "absent") == []
+
+
+def test_cloud_init_image_warns_on_parse_failure(tmp_path: Path) -> None:
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    (tofu_dir / "variables.tf").write_text("# no variable block here\n")
+    diagnostics = doctor.check_cloud_init_on_image(tofu_dir=tofu_dir)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.cloud_init_image_unverified"
+    assert "could not parse" in diagnostics[0].message
+
+
+# ---------------------------------------------------------------------------
+# check_ansible_config_wired (Move 2)
+# ---------------------------------------------------------------------------
+
+
+def test_ansible_config_wired_silences_when_kwarg_present(tmp_path: Path) -> None:
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "from playground.backend.local_libvirt.apply import run_ansible_playbook\n"
+        "step, diag = run_ansible_playbook(playbook, inventory, log,\n"
+        "    cwd=cwd, bus=bus, ansible_cfg=cfg)\n"
+    )
+    assert doctor.check_ansible_config_wired(runner_path=runner) == []
+
+
+def test_ansible_config_wired_warns_when_kwarg_absent(tmp_path: Path) -> None:
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "from playground.backend.local_libvirt.apply import run_ansible_playbook\n"
+        "step, diag = run_ansible_playbook(playbook, inventory, log, cwd=cwd)\n"
+    )
+    diagnostics = doctor.check_ansible_config_wired(runner_path=runner)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.ansible_config_not_wired"
+    assert "ansible/ansible.cfg" in diagnostics[0].message
+
+
+def test_ansible_config_wired_skipped_when_runner_missing(tmp_path: Path) -> None:
+    assert doctor.check_ansible_config_wired(runner_path=tmp_path / "nope.py") == []
+
+
+# ---------------------------------------------------------------------------
+# check_tofu_state_alignment (Move 2)
+# ---------------------------------------------------------------------------
+
+
+def test_tofu_state_drift_skipped_when_tofu_dir_absent(tmp_path: Path) -> None:
+    assert doctor.check_tofu_state_alignment(tofu_dir=tmp_path / "absent") == []
+
+
+def test_tofu_state_drift_skipped_when_tofu_binary_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: None)
+    assert doctor.check_tofu_state_alignment(tofu_dir=tofu_dir) == []
+
+
+def test_tofu_state_drift_silent_on_empty_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Empty state list = no prior apply = no drift to report."""
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/tofu")
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_a, **_kw: _fake_completed(stdout="\n"),
+    )
+    assert doctor.check_tofu_state_alignment(tofu_dir=tofu_dir) == []
+
+
+def test_tofu_state_drift_silent_on_playground_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """State has the expected playground domain entries → no drift."""
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/tofu")
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_a, **_kw: _fake_completed(
+            stdout=(
+                "libvirt_network.lab[\"playground_net\"]\n"
+                "libvirt_volume.ubuntu_image\n"
+                "libvirt_domain.playground_node[0]\n"
+            )
+        ),
+    )
+    assert doctor.check_tofu_state_alignment(tofu_dir=tofu_dir) == []
+
+
+def test_tofu_state_drift_warns_when_no_playground_domain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """State has entries but none match playground's tofu module."""
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/tofu")
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_a, **_kw: _fake_completed(
+            stdout="random_resource.foo\nanother_resource.bar\n"
+        ),
+    )
+    diagnostics = doctor.check_tofu_state_alignment(tofu_dir=tofu_dir)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.tofu_state_drift"
+    assert "2 entries" in diagnostics[0].message
+
+
+def test_tofu_state_drift_warns_on_command_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/tofu")
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_a, **_kw: _fake_completed(
+            returncode=1, stderr="error: state backend unreachable"
+        ),
+    )
+    diagnostics = doctor.check_tofu_state_alignment(tofu_dir=tofu_dir)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.tofu_state_drift"
+    assert "state backend unreachable" in diagnostics[0].message
+
+
+# ---------------------------------------------------------------------------
 # run_all_checks orchestrator
 # ---------------------------------------------------------------------------
 
@@ -665,6 +844,26 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
         "check_ansible_and_collections",
         _make("ansible", "runtime.doctor.ansible_missing"),
     )
+    monkeypatch.setattr(
+        doctor,
+        "check_ansible_config",
+        _make("ansible-cfg", "runtime.doctor.ansible_cfg_missing"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "check_cloud_init_on_image",
+        _make("cloud-init", "runtime.doctor.cloud_init_image_unverified"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "check_ansible_config_wired",
+        _make("ansible-wired", "runtime.doctor.ansible_config_not_wired"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "check_tofu_state_alignment",
+        _make("tofu-drift", "runtime.doctor.tofu_state_drift"),
+    )
 
     diagnostics = doctor.run_all_checks()
     assert [d.message for d in diagnostics] == [
@@ -676,6 +875,10 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
         "ssh",
         "apparmor",
         "ansible",
+        "ansible-cfg",
+        "cloud-init",
+        "ansible-wired",
+        "tofu-drift",
     ]
     assert seen == [
         "iso",
@@ -686,4 +889,8 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
         "ssh",
         "apparmor",
         "ansible",
+        "ansible-cfg",
+        "cloud-init",
+        "ansible-wired",
+        "tofu-drift",
     ]
