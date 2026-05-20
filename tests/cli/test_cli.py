@@ -664,6 +664,164 @@ def test_apply_happy_path_writes_run_record(
     assert (state_dir / "state" / "inventory" / "generic-infra.ini").exists()
 
 
+def _write_apply_shims_with_recap(
+    tmp_path: Path, *, recap_changed: int = 0,
+) -> Path:
+    """Variant of _write_apply_shims that lets the test choose the
+    PLAY RECAP `changed=N` value. The --check-idempotent flag
+    parses the second-pass ansible.log for this exact field."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    default_ips = (
+        '{"vm_ips": {"sensitive": false, "type": ["map","string"], '
+        '"value": {"node1":"10.0.10.42","docker1":"10.0.10.43","router1":"10.0.10.44"}}}'
+    )
+    tofu = bin_dir / "tofu"
+    tofu.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  apply) echo 'tofu apply ok'; exit 0 ;;\n"
+        "  destroy) echo 'tofu destroy ok'; exit 0 ;;\n"
+        f"  output) cat <<'PAYLOAD'\n{default_ips}\nPAYLOAD\n   ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    # Emit a PLAY RECAP block with the desired `changed=N` per host.
+    ansible = bin_dir / "ansible-playbook"
+    ansible.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<'PG_EOF'\n"
+        "PLAY RECAP *********************************************************\n"
+        f"node1 : ok=5 changed={recap_changed} unreachable=0 failed=0 skipped=0\n"
+        f"docker1 : ok=8 changed={recap_changed} unreachable=0 failed=0 skipped=0\n"
+        f"router1 : ok=3 changed={recap_changed} unreachable=0 failed=0 skipped=0\n"
+        "PG_EOF\n"
+        "exit 0\n"
+    )
+    ansible.chmod(ansible.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
+
+
+def test_apply_check_idempotent_passes_when_second_run_changed_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims_with_recap(tmp_path, recap_changed=0)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("- name: stub\n  hosts: playground\n")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--ansible-dir", str(ansible_dir),
+            "--state-dir", str(state_dir),
+            "--check-idempotent",
+            "--output", "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # JSON payload carries both run records.
+    assert payload["status"] == "succeeded"
+    assert "second_apply" in payload
+    assert payload["second_apply"]["status"] == "succeeded"
+    # No idempotence diagnostic.
+    assert "diagnostics" not in payload or not any(
+        d["id"] == "runtime.apply.not_idempotent"
+        for d in payload.get("diagnostics", [])
+    )
+
+
+def test_apply_check_idempotent_fails_when_second_run_reports_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims_with_recap(tmp_path, recap_changed=2)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("- name: stub\n  hosts: playground\n")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--ansible-dir", str(ansible_dir),
+            "--state-dir", str(state_dir),
+            "--check-idempotent",
+            "--output", "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    diag_ids = [d["id"] for d in payload.get("diagnostics", [])]
+    assert "runtime.apply.not_idempotent" in diag_ids
+    not_idem = next(
+        d for d in payload["diagnostics"]
+        if d["id"] == "runtime.apply.not_idempotent"
+    )
+    # Diagnostic names the offending hosts.
+    assert "node1" in not_idem["message"]
+    assert "docker1" in not_idem["message"]
+
+
+def test_apply_without_check_idempotent_runs_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default behavior (no flag) must NOT trigger a second apply."""
+    bin_dir = _write_apply_shims_with_recap(tmp_path, recap_changed=99)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    state_dir = tmp_path / ".playground"
+    ansible_dir = tmp_path / "ansible"
+    ansible_dir.mkdir()
+    (ansible_dir / "site.yml").write_text("- name: stub\n  hosts: playground\n")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "generic-infra",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--ansible-dir", str(ansible_dir),
+            "--state-dir", str(state_dir),
+            "--output", "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # No second_apply key when the flag isn't set.
+    assert "second_apply" not in payload
+    # Only one apply run exists on disk.
+    apply_runs = [
+        p for p in (state_dir / "runs").iterdir() if "apply" in p.name
+    ]
+    assert len(apply_runs) == 1
+
+
 def test_apply_wait_timeout_blocks_ansible_from_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -75,13 +75,25 @@ def start_run(
     ``run.json`` plus a ``logs/`` directory the caller writes into.
     """
     now = datetime.now(UTC)
-    run_id = run_id or allocate_run_id(operation, lab, now=now)
-    run_dir = runs_dir / run_id
-    # exist_ok=False on the run-id directory itself surfaces a
-    # second-granularity collision loudly instead of silently merging
-    # two runs' logs into one record.
     runs_dir.mkdir(parents=True, exist_ok=True)
-    run_dir.mkdir(exist_ok=False)
+    # exist_ok=False on the run-id directory surfaces a same-second
+    # collision instead of silently merging two runs' logs. When the
+    # caller doesn't pin a run_id, we retry with an incrementing
+    # suffix — the back-to-back applies in `--check-idempotent` are
+    # the canonical case (sub-second wall time in tests with shimmed
+    # subprocesses; ~minutes in real use, but no reason to fail on
+    # the fast path).
+    base_run_id = run_id or allocate_run_id(operation, lab, now=now)
+    run_id = base_run_id
+    counter = 0
+    while True:
+        run_dir = runs_dir / run_id
+        try:
+            run_dir.mkdir(exist_ok=False)
+            break
+        except FileExistsError:
+            counter += 1
+            run_id = f"{base_run_id}-{counter}"
     (run_dir / "logs").mkdir()
     run = OperationRun(
         run_id=run_id,

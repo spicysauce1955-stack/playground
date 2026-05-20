@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -491,6 +492,17 @@ def apply_command(
         OutputFormat,
         typer.Option("--output", "-o", help="Output format for status reporting."),
     ] = OutputFormat.human,
+    check_idempotent: Annotated[
+        bool,
+        typer.Option(
+            "--check-idempotent",
+            help=(
+                "Run apply twice; fail if any role reports `changed` on "
+                "the second pass. Catches roles that mutate state on every "
+                "run. Default off — only opt in for CI / pre-release."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Apply ``lab``: render inputs, run tofu apply, render inventory, run Ansible."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
@@ -523,15 +535,114 @@ def apply_command(
         _present_apply_failure(output, finished, diagnostics, state_dir)
         raise typer.Exit(code=1)
 
+    # `--check-idempotent`: run apply again and parse the second
+    # ansible.log for the PLAY RECAP. Every host must report
+    # `changed=0` — otherwise some role is mutating state on every
+    # run. This is the regression signal the fresh-state E2E test
+    # uses internally; the flag makes it available to operators.
+    second_run = None
+    not_idempotent_diagnostic = None
+    if check_idempotent:
+        bus2 = EventBus()
+        second_run, second_diagnostics = execute_apply(
+            resolved=resolved,
+            state_dir=state_dir,
+            tofu_dir=tofu_dir,
+            ansible_dir=ansible_dir,
+            config_dir=config_dir,
+            bus=bus2,
+        )
+        if second_run is None or second_run.status == "failed":
+            # Second-pass failure is an apply failure; surface and exit 1.
+            if second_run is not None:
+                _present_apply_failure(output, second_run, second_diagnostics, state_dir)
+            else:
+                _print_diagnostics(second_diagnostics, err=True)
+            raise typer.Exit(code=1)
+        not_idempotent_diagnostic = _check_apply_idempotence(
+            second_run, state_dir,
+        )
+        if not_idempotent_diagnostic is not None:
+            diagnostics.append(not_idempotent_diagnostic)
+
     if output is OutputFormat.json:
-        _print_json(finished.model_dump(mode="json", exclude_none=True))
+        payload = finished.model_dump(mode="json", exclude_none=True)
+        if check_idempotent and second_run is not None:
+            payload["second_apply"] = second_run.model_dump(
+                mode="json", exclude_none=True
+            )
+        if diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in diagnostics]
+        _print_json(payload)
+        if not_idempotent_diagnostic is not None:
+            raise typer.Exit(code=1)
         return
 
+    if diagnostics:
+        _print_diagnostics(diagnostics, err=True)
     typer.echo(f"applied lab {lab!r}")
     typer.echo(f"  run: {finished.run_id}")
     typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
     for step in finished.steps:
         typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
+    if check_idempotent and second_run is not None:
+        typer.echo(f"  idempotence check: run {second_run.run_id}")
+        if not_idempotent_diagnostic is None:
+            typer.echo("  second apply: changed=0 on every host (idempotent)")
+        else:
+            raise typer.Exit(code=1)
+
+
+_ANSIBLE_RECAP_RE = re.compile(
+    r"^(?P<host>[A-Za-z0-9._-]+)\s*:\s*ok=\d+\s+changed=(?P<changed>\d+)",
+    re.MULTILINE,
+)
+
+
+def _check_apply_idempotence(
+    second_run: OperationRun, state_dir: Path,
+) -> Diagnostic | None:
+    """Parse the second apply's ansible.log PLAY RECAP and check
+    `changed=0` per host. Return a diagnostic if any host reports
+    `changed > 0`.
+    """
+    ansible_log_path = state_dir / "runs" / second_run.run_id / "logs" / "ansible.log"
+    if not ansible_log_path.is_file():
+        # No ansible.log = no ansible step ran (e.g. fully stubbed
+        # tests). Treat as idempotent — there's nothing to check.
+        return None
+    try:
+        text = ansible_log_path.read_text()
+    except OSError as exc:
+        return Diagnostic(
+            id="runtime.apply.not_idempotent",
+            severity="error",
+            message=f"could not read second-apply ansible.log: {exc}",
+            source=SourceLocation(path=str(ansible_log_path)),
+        )
+
+    changed_by_host: dict[str, int] = {}
+    for match in _ANSIBLE_RECAP_RE.finditer(text):
+        changed_by_host[match.group("host")] = int(match.group("changed"))
+    non_idempotent = {h: c for h, c in changed_by_host.items() if c > 0}
+    if not non_idempotent:
+        return None
+
+    summary = ", ".join(f"{h}=changed:{c}" for h, c in non_idempotent.items())
+    return Diagnostic(
+        id="runtime.apply.not_idempotent",
+        severity="error",
+        message=(
+            f"second-pass apply reported changed>0 on {len(non_idempotent)} "
+            f"host(s): {summary}. A role is mutating state on every run"
+        ),
+        source=SourceLocation(path=str(ansible_log_path)),
+        suggestion=(
+            f"inspect tasks reporting `changed` in {ansible_log_path}; "
+            "fix the role to be no-op when state already matches "
+            "(see Ansible idempotency conventions)"
+        ),
+    )
 
 
 @runs_app.command("list")
