@@ -9,6 +9,14 @@ An Infrastructure-as-Code playground that provisions KVM/libvirt VMs with OpenTo
 The highest-signal product intent lives in `docs/product/requirements.md`,
 followed by `docs/product/user_stories.md` and `docs/product/mvp_scope.md`.
 
+**Before adding a new step, lab type, or third-party tool to
+`execute_apply`**, read `docs/architecture/CONTRACTS.md`. It records the
+input/output contract of every pipeline layer and the cross-layer
+pitfalls that have already bitten us. The recurring bug shape in this
+codebase is "library default wrong for fresh state" or "implicit
+cross-layer dependency hidden by a hardcoded value" — that doc exists
+to catch those gaps up front.
+
 ## Two-stage deploy pipeline
 
 The stages are coupled by a manual handoff and must be run in order:
