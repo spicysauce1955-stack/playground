@@ -782,6 +782,45 @@ PYTHONPATH=src uv run --no-project --with pytest --with pydantic --with ruamel.y
 
 ---
 
+## Fresh-state E2E test (`tests/integration/fresh_apply/`)
+
+The single highest-leverage test in the suite. Destroys any prior
+state, applies `generic-infra` from scratch against real libvirt +
+cloud-init + ansible, asserts liveness + idempotence, then tears
+down. Five of the six bugs catalogued in
+`docs/architecture/CONTRACTS.md`'s "Cross-layer pitfalls" section
+would have surfaced here on first run.
+
+Skipped by default. Enable with:
+
+```bash
+PLAYGROUND_LIVE_INFRA=1 pytest tests/integration/fresh_apply -v
+```
+
+Requirements when enabled: real libvirt, libvirt group membership
+active in the current session, `~/.ssh/id_rsa`, ~6 GiB free RAM, ~60
+GiB pool free disk. `playground doctor` must exit 0 first (warnings
+are OK; errors block).
+
+What the test asserts, in order:
+
+1. `playground reset generic-infra` (idempotent on a clean host).
+2. `playground doctor` exits 0.
+3. `playground apply generic-infra --output json` exits 0 and
+   produces the three contract steps (tofu-apply,
+   wait-for-vms-ready, ansible-playbook).
+4. SSH into every VM; `cloud-init status` returns `done`.
+5. `playground status` reports IPs.
+6. **Idempotence**: second `playground apply` parses
+   `ansible.log`'s PLAY RECAP and asserts every host reports
+   `changed=0`. The most useful regression signal in the suite —
+   it catches roles that look idempotent in unit tests but mutate
+   state on every run.
+7. `playground destroy` cleans up.
+8. `playground reset` again confirms scrub-by-name is idempotent.
+
+`try/finally` ensures destroy runs even on assertion failure.
+
 ## Multi-VM integration tests
 
 `tests/integration/multi_vm/` houses tests that bring up real labs
