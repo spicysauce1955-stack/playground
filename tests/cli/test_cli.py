@@ -517,7 +517,6 @@ def test_lab_list_shows_committed_lab() -> None:
     assert result.exit_code == 0
     # Warnings land on stderr via _print_warnings; stdout stays clean.
     assert "generic-infra" in result.stdout.splitlines()
-    assert "barak-deploy-cross-vm" in result.stdout.splitlines()
     assert "config.backend.per_vm_resources_unsupported" in result.stderr
 
 
@@ -530,7 +529,7 @@ def test_lab_list_json_shows_committed_lab() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     names = {lab["name"] for lab in payload["labs"]}
-    assert names == {"generic-infra", "barak-deploy-cross-vm"}
+    assert names == {"generic-infra"}
     generic = next(lab for lab in payload["labs"] if lab["name"] == "generic-infra")
     assert generic == {
         "name": "generic-infra",
@@ -1308,15 +1307,10 @@ def test_exec_no_command_fails(tmp_path: Path) -> None:
 def test_exec_defaults_lab_when_only_one_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Isolated config dir with just one lab — exec should pick it up
-    # without an explicit --lab flag.
-    config_dir = tmp_path / "config"
-    import shutil as _shutil
-    _shutil.copytree(CONFIG_DIR, config_dir)
-    # Drop the second committed lab so the single-lab branch fires.
-    (config_dir / "labs" / "barak-deploy-cross-vm.yaml").unlink()
-    (config_dir / "roles" / "deployment-source.yaml").unlink()
-    (config_dir / "roles" / "deployment-target.yaml").unlink()
+    # The committed config has exactly one lab (generic-infra) since
+    # the cross-VM lab was retired — exec should pick it up without
+    # an explicit --lab flag.
+    config_dir = CONFIG_DIR
 
     bin_dir = _write_apply_shims(tmp_path)
     ssh_bin = _write_ssh_shim(tmp_path, exit_code=0)
@@ -1341,8 +1335,29 @@ def test_exec_defaults_lab_when_only_one_configured(
 
 
 def test_exec_requires_lab_when_multiple_configured(tmp_path: Path) -> None:
-    # Committed config has TWO labs (generic-infra + barak-deploy-cross-vm).
-    # Without --lab, exec should refuse rather than guess.
+    # Synthesize a config dir with TWO labs so exec must refuse to
+    # guess. The committed config only ships generic-infra after the
+    # cross-VM lab was retired, so we have to add a second one here.
+    import shutil as _shutil
+    config_dir = tmp_path / "config"
+    _shutil.copytree(CONFIG_DIR, config_dir)
+    (config_dir / "labs" / "second-lab.yaml").write_text(
+        "apiVersion: playground/v1\n"
+        "kind: Lab\n"
+        "metadata:\n"
+        "  name: second-lab\n"
+        "spec:\n"
+        "  backend: local-libvirt\n"
+        "  networks:\n"
+        "    - name: net\n"
+        "      profile: nat\n"
+        "      cidr: 10.99.0.0/24\n"
+        "  vms:\n"
+        "    - name: docker1\n"
+        "      role: docker-host\n"
+        "      networks: [net]\n"
+    )
+
     tofu_dir = tmp_path / "tofu"
     tofu_dir.mkdir()
     result = CliRunner().invoke(
@@ -1350,7 +1365,7 @@ def test_exec_requires_lab_when_multiple_configured(tmp_path: Path) -> None:
         [
             "exec",
             "--on", "docker1",
-            "--config-dir", str(CONFIG_DIR),
+            "--config-dir", str(config_dir),
             "--tofu-dir", str(tofu_dir),
             "uptime",
         ],

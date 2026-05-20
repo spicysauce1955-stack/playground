@@ -21,12 +21,10 @@ def test_load_committed_config_is_clean() -> None:
     assert set(loaded.providers) == {"local-libvirt"}
     assert set(loaded.networks) == {"nat", "isolated", "routed"}
     assert set(loaded.roles) == {
-        "generic-node", "docker-host", "router",
-        "deployment-source", "deployment-target",
-        "redroid-host",
+        "generic-node", "docker-host", "router", "redroid-host",
     }
     assert set(loaded.commands) == {"check-docker", "ping-network"}
-    assert set(loaded.labs) == {"generic-infra", "barak-deploy-cross-vm"}
+    assert set(loaded.labs) == {"generic-infra"}
 
 
 def test_load_tracks_resource_source_paths() -> None:

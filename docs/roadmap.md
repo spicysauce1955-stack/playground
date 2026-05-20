@@ -359,12 +359,26 @@ Slice 9c (done): runs viewer
   timeline (one line per event, ``log_line`` events show
   ``step: line``).
 
-## 10. Cross-VM lab support (barak-deploy)
+## 10. Cross-VM lab support (barak-deploy) — RETIRED
 
-Status: done.
+Status: done, then retired. The barak-deploy-cross-vm lab and
+its supporting roles (`deployment-source`, `deployment-target`,
+`docker_tunneler`, `ssh_keypair_*`, `barak_deploy_*`) were
+removed from the playground once barak-deploy moved its own
+integration test in-tree. The lab YAML now lives in
+barak-deploy's `examples/cross-vm/` and gets dropped into the
+playground's `config/labs/` only when barak-deploy's pytest
+harness needs to run. The only remaining coupling is the
+playground CLI surface (`apply` / `status` / `destroy` /
+`reset`) — exactly the integration contract a lab-platform
+should expose.
+
+The historical record below is preserved for the lessons it
+encoded; the implementation is gone.
 
 Built to host the cross-VM ship-and-deploy test described in
-`playground-requirements.md`. Six small slices on top of the existing
+the original `playground-requirements.md` spec (since deleted
+along with the lab). Six small slices on top of the existing
 §1-§9 platform. Each slice is reviewer-pass-ready independently.
 
 Slice 10a (done): Lab YAML schema for per-VM IPs + extra_hosts.
@@ -419,7 +433,7 @@ Slice 10f (done): Multi-VM pytest harness + docs.
 - `tests/integration/multi_vm/test_cross_vm_deploy.py` skipped by
   default; runs against real libvirt when
   `PLAYGROUND_LIVE_INFRA=1` is set. Asserts every pass/fail
-  criterion from `playground-requirements.md`.
+  criterion from the original cross-VM spec.
 - `docs/developer_guide.md` gains a "Multi-VM integration tests"
   section.
 

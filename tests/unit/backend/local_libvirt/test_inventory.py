@@ -215,61 +215,6 @@ def test_render_inventory_emits_needs_groups_from_provisioners(
     assert "[needs_redroid]" not in body
 
 
-def test_render_inventory_needs_groups_cross_vm_lab() -> None:
-    """The cross-VM lab's deployment-source / deployment-target VmRoles
-    each list multiple provisioners. Every VM should land in a
-    needs_<role> group for every role in its VmRole's provisioner
-    list — that's the contract site.yml dispatches on.
-    """
-    from pathlib import Path
-
-    from playground.config.loader import load_config
-    from playground.config.resolver import resolve_lab
-
-    REPO_ROOT = Path(__file__).resolve().parents[4]
-    loaded, diagnostics = load_config(REPO_ROOT / "config")
-    assert diagnostics == []
-    resolved = resolve_lab(loaded, "barak-deploy-cross-vm")
-
-    body, _ = render_inventory(
-        resolved, {"central": "10.20.40.20", "target": "10.20.40.21"}
-    )
-
-    # central is deployment-source: provisioners include docker (new!),
-    # docker_tunneler, ssh_keypair_generator, barak_deploy_staging.
-    central_needs = {
-        "needs_docker",
-        "needs_docker_tunneler",
-        "needs_ssh_keypair_generator",
-        "needs_barak_deploy_staging",
-    }
-    for group in central_needs:
-        section = body.split(f"[{group}]", 1)[1].split("\n[", 1)[0]
-        assert "central" in section, f"{group} missing central: {section}"
-
-    # target is deployment-target: docker + docker_tunneler +
-    # ssh_keypair_receiver + barak_deploy_agent.
-    target_needs = {
-        "needs_docker",
-        "needs_docker_tunneler",
-        "needs_ssh_keypair_receiver",
-        "needs_barak_deploy_agent",
-    }
-    for group in target_needs:
-        section = body.split(f"[{group}]", 1)[1].split("\n[", 1)[0]
-        assert "target" in section
-
-    # Cross-VM lab has no VM provisioning ssh_keypair_generator AND
-    # ssh_keypair_receiver — so the groups are disjoint.
-    sgen = body.split("[needs_ssh_keypair_generator]", 1)[1].split("\n[", 1)[0]
-    srecv = body.split("[needs_ssh_keypair_receiver]", 1)[1].split("\n[", 1)[0]
-    assert "central" in sgen and "target" not in sgen
-    assert "target" in srecv and "central" not in srecv
-
-    # Neither VM provisions redroid.
-    assert "[needs_redroid]" not in body
-
-
 def test_render_inventory_omits_role_group_when_vm_has_no_ip(
     resolved_generic_infra,
 ) -> None:

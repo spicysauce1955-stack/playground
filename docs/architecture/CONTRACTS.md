@@ -286,10 +286,13 @@ A child role's `provisioners: [foo]` does NOT inherit the
 parent's `provisioners: [bar]`. The resolver's
 `_deep_merge_spec` explicitly list-replaces this field. Any
 VmRole that extends another and needs the parent's
-provisioners must re-list them. `deployment-source` and
-`deployment-target` re-list `docker` for exactly this reason
-(history: implicit-via-hardcoded site.yml bit us when we
-removed the hardcode).
+provisioners must re-list them — e.g., a custom role
+extending `docker-host` must re-list `docker` itself or
+docker won't be installed. (History: a hardcoded
+`hosts: playground` play in site.yml used to install docker
+universally, hiding this; removing the hardcode surfaced the
+implicit dependency for VmRoles that extended `docker-host`
+without re-listing.)
 
 ### AppArmor on Ubuntu: stock files don't prove virt-aa-helper works
 
