@@ -553,6 +553,74 @@ def test_backend_capability_check_skipped_for_other_backends(
     ]
 
 
+def _override_lab_providers(
+    committed_load: LoadedConfig, lab_name: str, libvirt_overrides: dict,
+) -> None:
+    lab = committed_load.labs[lab_name]
+    new_providers = {
+        **lab.spec.providers,
+        "local-libvirt": {**lab.spec.providers.get("local-libvirt", {}), **libvirt_overrides},
+    }
+    committed_load.labs[lab_name] = lab.model_copy(
+        update={"spec": lab.spec.model_copy(update={"providers": new_providers})}
+    )
+
+
+def test_tcg_warning_silent_when_domain_type_unset_or_kvm(
+    committed_load: LoadedConfig,
+) -> None:
+    diagnostics = validate(committed_load)
+    assert not [d for d in diagnostics if d.id == "config.backend.tcg_mode_slow"]
+
+    _override_lab_providers(committed_load, "generic-infra", {"domain_type": "kvm"})
+    diagnostics = validate(committed_load)
+    assert not [d for d in diagnostics if d.id == "config.backend.tcg_mode_slow"]
+
+
+def test_tcg_warning_fires_for_domain_type_qemu(
+    committed_load: LoadedConfig,
+) -> None:
+    """Opting into TCG is unusual enough that the operator deserves a
+    visible warning — both `playground validate` and `playground apply`
+    surface validator diagnostics."""
+    _override_lab_providers(committed_load, "generic-infra", {"domain_type": "qemu"})
+
+    diagnostics = validate(committed_load)
+
+    matching = [d for d in diagnostics if d.id == "config.backend.tcg_mode_slow"]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+    assert "generic-infra" in matching[0].message
+    assert "TCG" in (matching[0].suggestion or "")
+    # No redroid role on generic-infra → no experimental caveat.
+    assert "Redroid" not in (matching[0].suggestion or "")
+
+
+def test_tcg_warning_flags_redroid_lab_as_experimental(
+    committed_load: LoadedConfig,
+) -> None:
+    """Redroid + TCG is unverified — the validator must flag the lab as
+    experimental rather than just warning about slowness."""
+    # Flip docker1's role to a redroid-ish name (the check matches by
+    # substring so any role containing "redroid" trips it).
+    lab = committed_load.labs["generic-infra"]
+    new_vms = [
+        vm.model_copy(update={"role": "redroid-host"}) if vm.name == "docker1" else vm
+        for vm in lab.spec.vms
+    ]
+    committed_load.labs["generic-infra"] = lab.model_copy(
+        update={"spec": lab.spec.model_copy(update={"vms": new_vms})}
+    )
+    _override_lab_providers(committed_load, "generic-infra", {"domain_type": "qemu"})
+
+    diagnostics = validate(committed_load)
+
+    matching = [d for d in diagnostics if d.id == "config.backend.tcg_mode_slow"]
+    assert len(matching) == 1
+    assert "Redroid" in (matching[0].suggestion or "")
+    assert "unverified" in (matching[0].suggestion or "")
+
+
 def test_offline_lab_errors_when_image_local_path_missing(
     committed_load: LoadedConfig,
 ) -> None:

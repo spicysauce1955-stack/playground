@@ -102,6 +102,40 @@ def render_tfvars(resolved: ResolvedLab) -> dict[str, Any]:
     if isinstance(cpu_mode, str) and cpu_mode:
         payload["cpu_mode"] = cpu_mode
 
+    # CPU feature disables — lab YAML's
+    # `spec.providers.local-libvirt.cpu_features_disable`. Each entry is a
+    # CPU flag name (e.g. "vmx") emitted as a `<feature policy='disable'
+    # name='X'/>` element in the libvirt domain XML via tofu's xslt escape
+    # hatch (provider v0.7.6 lacks a native cpu.feature schema). Use
+    # together with `cpu_mode: host-model` — leaving the default
+    # `host-passthrough` can leak the underlying flag despite the disable
+    # (Ubuntu bug #1830268).
+    raw_features = provider_cfg.get("cpu_features_disable")
+    if raw_features is not None:
+        if not isinstance(raw_features, list) or not all(
+            isinstance(item, str) and item for item in raw_features
+        ):
+            raise ValueError(
+                "spec.providers.local-libvirt.cpu_features_disable must be a "
+                "list of non-empty CPU flag names (e.g. ['vmx'])"
+            )
+        if raw_features:
+            payload["cpu_features_disable"] = list(raw_features)
+
+    # Domain type — `kvm` (default, hardware-accelerated) vs `qemu` (TCG
+    # software emulation, 10-100x slower but bypasses KVM entirely). The
+    # universal fallback when L0 won't permit nested VMX even with the
+    # cpu_mode / cpu_features_disable workarounds. Only emitted when set
+    # so tofu's default (kvm) applies.
+    domain_type = provider_cfg.get("domain_type")
+    if domain_type is not None:
+        if domain_type not in ("kvm", "qemu"):
+            raise ValueError(
+                "spec.providers.local-libvirt.domain_type must be 'kvm' or "
+                f"'qemu' (got {domain_type!r})"
+            )
+        payload["domain_type"] = domain_type
+
     return payload
 
 

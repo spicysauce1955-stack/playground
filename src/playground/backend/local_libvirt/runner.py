@@ -186,12 +186,16 @@ def execute_apply(
         VmTarget(name=name, ip=ip, ssh_user=ssh_by_vm.get(name, "ubuntu"))
         for name, ip in vm_ips.items()
     ]
+    # Provider can stretch the wait deadlines — TCG (domain_type=qemu)
+    # boots can take 10-30 min. Unset → defaults in wait.py apply.
+    wait_kwargs = _wait_timeout_kwargs(resolved)
     bus.publish(run.run_id, "step_started", {"step": "wait-for-vms-ready"})
     wait_step, wait_diagnostics = wait_for_vms_ready(
         targets=targets,
         log_path=logs_dir / "wait-for-vms-ready.log",
         bus=bus,
         run_id=run.run_id,
+        **wait_kwargs,
     )
     steps.append(wait_step)
     bus.publish(
@@ -516,6 +520,38 @@ def _clean_state_files(
         ),
         diagnostics,
     )
+
+
+def _wait_timeout_kwargs(resolved: ResolvedLab) -> dict[str, float]:
+    """Read the optional wait-timeout overrides from
+    ``spec.providers.local-libvirt`` and translate them into kwargs for
+    :func:`wait_for_vms_ready`.
+
+    Two keys, both optional positive numbers:
+      - ``wait_ssh_timeout_seconds`` → ``ssh_timeout``
+      - ``wait_cloud_init_timeout_seconds`` → ``cloud_init_timeout``
+
+    Operators raise these when opting into ``domain_type: qemu`` (TCG
+    is slow) or when running on weak hardware. Invalid values raise a
+    ``ValueError`` so the apply fails fast rather than wedging on a
+    nonsense timeout.
+    """
+    cfg = resolved.providers.get("local-libvirt", {}) or {}
+    out: dict[str, float] = {}
+    for key, kwarg in (
+        ("wait_ssh_timeout_seconds", "ssh_timeout"),
+        ("wait_cloud_init_timeout_seconds", "cloud_init_timeout"),
+    ):
+        raw = cfg.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, int | float) or isinstance(raw, bool) or raw <= 0:
+            raise ValueError(
+                f"spec.providers.local-libvirt.{key} must be a positive number "
+                f"(got {raw!r})"
+            )
+        out[kwarg] = float(raw)
+    return out
 
 
 def _finalize_failure(

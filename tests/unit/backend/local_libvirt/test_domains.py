@@ -51,10 +51,19 @@ def test_check_flags_paused_crashed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "central" in msg
     assert "paused (crashed)" in msg
     suggestion = diagnostics[0].suggestion or ""
-    # The suggestion must teach the operator both the diagnosis and the fix.
+    # The suggestion must teach the operator both the diagnosis and the
+    # full escalation ladder. Each rung is named.
     assert "kvm_intel" in suggestion
     assert "cpu_mode" in suggestion
     assert "host-model" in suggestion
+    # Rung 1: cpu_features_disable strips the offending flag.
+    assert "cpu_features_disable" in suggestion
+    assert "vmx" in suggestion
+    # Rung 2: TCG fallback for hosts where masking doesn't help.
+    assert "domain_type" in suggestion
+    assert "qemu" in suggestion
+    # Rung 3: the bare-metal escape hatch.
+    assert "kvm_intel.nested" in suggestion
     assert "playground reset barak-lab" in suggestion
 
 

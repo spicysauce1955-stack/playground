@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  XSLT 1.0 transform injected by tofu via the dmacvicar/libvirt provider's
+  `xml { xslt = ... }` escape hatch (provider PR #431) to add
+  `<feature policy='disable' name='X'/>` children inside the domain's
+  `<cpu>` block. Provider v0.7.6 does not expose a native `cpu.feature`
+  attribute; xslt is the supported workaround.
+
+  Templated from `tofu/main.tf` with one variable:
+    features : list(string) — CPU flag names to disable, e.g. ["vmx"].
+
+  This file is consumed by `templatefile()`, so `${ ... }` is OpenTofu
+  template syntax, not XSLT — the XSLT itself uses no `${...}` and the
+  output is plain XSLT.
+-->
+<xsl:stylesheet version="1.0"
+    xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+
+  <xsl:output method="xml" indent="yes"/>
+
+  <!-- Identity transform: copy every node unchanged by default. -->
+  <xsl:template match="@*|node()">
+    <xsl:copy>
+      <xsl:apply-templates select="@*|node()"/>
+    </xsl:copy>
+  </xsl:template>
+
+  <!-- Re-emit /domain/cpu with the disable-features appended. -->
+  <xsl:template match="/domain/cpu">
+    <xsl:copy>
+      <xsl:apply-templates select="@*|node()"/>
+%{ for feature in features ~}
+      <feature policy="disable" name="${feature}"/>
+%{ endfor ~}
+    </xsl:copy>
+  </xsl:template>
+
+</xsl:stylesheet>

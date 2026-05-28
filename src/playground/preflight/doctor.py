@@ -49,6 +49,12 @@ _APPARMOR_PROFILES_FILE = Path("/sys/kernel/security/apparmor/profiles")
 # Libvirt qemu daemon config — where security_driver lives.
 _QEMU_CONF = Path("/etc/libvirt/qemu.conf")
 
+# Where the kvm_intel / kvm_amd module exposes its nested-virt enable
+# flag. Reading "Y" or "1" means nested KVM is available; "N"/"0" or a
+# missing file means it isn't.
+_KVM_INTEL_NESTED = Path("/sys/module/kvm_intel/parameters/nested")
+_KVM_AMD_NESTED = Path("/sys/module/kvm_amd/parameters/nested")
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -180,6 +186,160 @@ def check_qemu_img() -> list[Diagnostic]:
             ),
             source=_host_source(),
             suggestion="sudo apt install -y qemu-utils  # only for the local-vbox backend",
+        )
+    ]
+
+
+def check_kvm_nested_enabled() -> list[Diagnostic]:
+    """`nested` flag on kvm_intel / kvm_amd is on.
+
+    Reads ``/sys/module/kvm_intel/parameters/nested`` (and the AMD
+    counterpart). When neither vendor module is loaded the host either
+    has no KVM at all (bare metal without virt extensions) or runs
+    KVM-as-the-only-vendor with nested off — both relevant to the
+    redroid-host lab, whose containers need nested-virt features.
+
+    Warning-only: this never blocks apply outright, because the user
+    may have legitimately chosen ``cpu_mode: host-model`` or
+    ``domain_type: qemu`` to side-step the nested requirement.
+    """
+    statuses = {
+        "kvm_intel": _read_nested(_KVM_INTEL_NESTED),
+        "kvm_amd": _read_nested(_KVM_AMD_NESTED),
+    }
+    # Any vendor module returning Y/1 means nested KVM is enabled — fine.
+    if any(state == "on" for state in statuses.values()):
+        return []
+    # All vendor modules missing → KVM isn't loaded; doctor already has
+    # virsh / pool / group checks that surface the bigger problem.
+    if all(state == "missing" for state in statuses.values()):
+        return []
+    # Some module exists but reports nested=off; surface it.
+    return [
+        Diagnostic(
+            id="runtime.doctor.nested_disabled",
+            severity="warning",
+            message=(
+                "KVM nested virtualization is disabled — kvm_intel "
+                f"({statuses['kvm_intel']}), kvm_amd ({statuses['kvm_amd']}). "
+                "Labs that require nested-virt features (e.g. redroid-host) "
+                "will fail to start their guest workloads."
+            ),
+            source=_host_source(),
+            suggestion=(
+                "Enable on Intel: `echo 'options kvm_intel nested=1' | "
+                "sudo tee /etc/modprobe.d/kvm.conf && sudo modprobe -r "
+                "kvm_intel && sudo modprobe kvm_intel`. AMD uses kvm_amd. "
+                "If your L0 hypervisor doesn't permit nested VMX you can't "
+                "fix this on the L1 — fall back to "
+                "`spec.providers.local-libvirt.cpu_features_disable: [vmx]`"
+                " or `domain_type: qemu`."
+            ),
+        )
+    ]
+
+
+def _read_nested(path: Path) -> str:
+    """Return ``"on"`` / ``"off"`` / ``"missing"`` based on the contents
+    of a kvm module's ``nested`` sysfs entry. Y / 1 → on, N / 0 → off,
+    everything else (missing file, IO error) → missing."""
+    try:
+        raw = path.read_text().strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return "missing"
+    return "on" if raw.upper() in {"Y", "1"} else "off"
+
+
+def check_no_recent_vmx_failures() -> list[Diagnostic]:
+    """Surface recent `kvm_intel: vmread/vmwrite failed` kernel
+    messages — the signature of L0 refusing nested VMX passthrough.
+
+    Reads the kernel ring buffer via ``journalctl --since 1 hour ago
+    -k``. If absent (no systemd, journal rate-limited) the check
+    fail-opens silently — doctor's other probes still cover the host.
+    """
+    if shutil.which("journalctl") is None:
+        return []
+    try:
+        result = subprocess.run(  # noqa: S603 — explicit args, no shell
+            [
+                "journalctl", "--since", "1 hour ago", "-k", "--no-pager",
+                "-q", "-g", "vmread|vmwrite",
+            ],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    # Take only the first match line — operators don't need a 500-line
+    # paste in their diagnostic; the suggestion tells them where to look.
+    first = result.stdout.strip().splitlines()[0][:240]
+    return [
+        Diagnostic(
+            id="runtime.doctor.kvm_intel_recent_failures",
+            severity="warning",
+            message=(
+                "Recent `vmread/vmwrite failed` kernel messages found — "
+                "the canonical signature of an L0 hypervisor refusing "
+                "VMX passthrough on a nested-virt host. Example: "
+                f"{first!r}"
+            ),
+            source=_host_source(),
+            suggestion=(
+                "Apply will most likely wedge with the libvirt domain in "
+                "`paused (unknown)`. Mitigations in "
+                "`spec.providers.local-libvirt`: "
+                "(1) `cpu_mode: host-model` + "
+                "`cpu_features_disable: [vmx]`, "
+                "(2) `domain_type: qemu` (TCG, ~10-100x slower), "
+                "(3) re-run on a host with proper nested VMX support."
+            ),
+        )
+    ]
+
+
+def check_running_inside_hypervisor() -> list[Diagnostic]:
+    """Report whether this host is itself virtualized.
+
+    Reuses ``systemd-detect-virt`` which is installed by default on
+    every modern Ubuntu. Reporting "we're inside a hypervisor" at
+    info severity (rendered as a non-blocking note) makes the L0/L1
+    topology explicit so operators don't have to guess why nested-virt
+    apply is hard.
+    """
+    if shutil.which("systemd-detect-virt") is None:
+        return []
+    try:
+        result = subprocess.run(  # noqa: S603 — explicit args, no shell
+            ["systemd-detect-virt"],
+            capture_output=True, text=True, check=False, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    # Exit 0 = virtualized; exit 1 + stdout "none" = bare metal.
+    virt = result.stdout.strip()
+    if not virt or virt == "none":
+        return []
+    return [
+        Diagnostic(
+            id="runtime.doctor.host_is_virtualized",
+            severity="info",
+            message=(
+                f"This host is itself running inside a {virt!r} guest "
+                "(L1 of a nested-virt topology). KVM/libvirt will run, "
+                "but anything inside the playground VMs that needs "
+                "nested-virt features depends on the L0 hypervisor "
+                "permitting VMX/SVM passthrough."
+            ),
+            source=_host_source(),
+            suggestion=(
+                "If apply fails with libvirt_domain_crashed or "
+                "kvm_intel vmread/vmwrite errors, the L0 is refusing "
+                "VMX. See "
+                "`docs/architecture/nested_virtualization.md` for the "
+                "full escalation ladder."
+            ),
         )
     ]
 
@@ -1113,4 +1273,7 @@ def run_all_checks(*, ssh_key_path: Path | None = None) -> list[Diagnostic]:
     diagnostics.extend(check_tofu_state_alignment())
     diagnostics.extend(check_vboxmanage())
     diagnostics.extend(check_qemu_img())
+    diagnostics.extend(check_kvm_nested_enabled())
+    diagnostics.extend(check_no_recent_vmx_failures())
+    diagnostics.extend(check_running_inside_hypervisor())
     return diagnostics

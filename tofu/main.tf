@@ -111,6 +111,7 @@ resource "libvirt_cloudinit_disk" "commoninit" {
 resource "libvirt_domain" "playground_node" {
   count  = length(local.effective_vm_names)
   name   = local.effective_vm_names[count.index]
+  type   = var.domain_type
   memory = var.vm_memory
   vcpu   = var.vm_vcpu
 
@@ -123,6 +124,22 @@ resource "libvirt_domain" "playground_node" {
   # to `host-model`.
   cpu {
     mode = var.cpu_mode
+  }
+
+  # Inject `<feature policy='disable' name='X'/>` children into the
+  # generated <cpu> block via the provider's xslt escape hatch. The block
+  # is emitted only when var.cpu_features_disable is non-empty so default
+  # operation is unchanged. Pair with `cpu_mode: host-model` for reliable
+  # masking — `host-passthrough` can leak the underlying flag despite the
+  # disable (Ubuntu bug #1830268).
+  dynamic "xml" {
+    for_each = length(var.cpu_features_disable) > 0 ? [1] : []
+    content {
+      xslt = templatefile(
+        "${path.module}/cpu_features_disable.xslt.tftpl",
+        { features = var.cpu_features_disable },
+      )
+    }
   }
 
   dynamic "network_interface" {

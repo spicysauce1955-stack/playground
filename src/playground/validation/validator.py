@@ -215,6 +215,8 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
             )
         )
 
+    diagnostics.extend(_check_local_libvirt_provider_overrides(lab, source))
+
     declared_network_names = {n.name for n in lab.spec.networks}
 
     for idx, net in enumerate(lab.spec.networks):
@@ -315,6 +317,54 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_dns_domain(lab, source))
 
     return diagnostics
+
+
+def _check_local_libvirt_provider_overrides(
+    lab: Lab, source: SourceLocation,
+) -> list[Diagnostic]:
+    """Surface advisory warnings for risky ``spec.providers.local-libvirt``
+    overrides.
+
+    Today there is one: opting into ``domain_type: qemu`` switches the
+    libvirt domain to TCG software emulation, which is 10-100x slower
+    than KVM and has not been verified against the redroid-host lab
+    (binderfs + Android runtime in a non-KVM guest). Operators choosing
+    this knob deserve a one-line nudge that confirms what they're
+    getting into.
+    """
+    libvirt_cfg = lab.spec.providers.get("local-libvirt") or {}
+    if libvirt_cfg.get("domain_type") != "qemu":
+        return []
+    is_redroid_lab = any(
+        "redroid" in (vm.role or "").lower() for vm in lab.spec.vms
+    )
+    suggestion = (
+        "TCG bypasses KVM entirely, so labs boot but each guest runs "
+        "10-100x slower. Expect long apply / package_upgrade times — "
+        "consider also raising "
+        "`spec.providers.local-libvirt.wait_ssh_timeout_seconds` and "
+        "`wait_cloud_init_timeout_seconds`."
+    )
+    if is_redroid_lab:
+        suggestion = (
+            "Redroid + TCG is unverified — binderfs may not behave the "
+            "same outside of KVM. Treat this lab as experimental under "
+            "domain_type=qemu. " + suggestion
+        )
+    return [
+        Diagnostic(
+            id="config.backend.tcg_mode_slow",
+            severity="warning",
+            message=(
+                f"lab {lab.metadata.name!r} opts into "
+                "`spec.providers.local-libvirt.domain_type: qemu` (TCG "
+                "software emulation)"
+            ),
+            source=source,
+            key_path="spec.providers.local-libvirt.domain_type",
+            suggestion=suggestion,
+        )
+    ]
 
 
 def _check_dns_domain(lab: Lab, source: SourceLocation) -> list[Diagnostic]:

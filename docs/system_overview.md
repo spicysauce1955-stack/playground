@@ -390,7 +390,7 @@ categories:
 | `config.role.*` | validator | `inheritance_cycle`, `unknown_extends` |
 | `config.budget.*` | validator | `exceeded` |
 | `config.artifact.*` | validator | `offline_missing` |
-| `config.backend.*` | validator | `per_vm_resources_unsupported` |
+| `config.backend.*` | validator | `per_vm_resources_unsupported`, `tcg_mode_slow` |
 | `config.network.*` | validator | `ip_not_in_cidr`, `duplicate_ip`, `dns_domain_invalid` |
 | `config.exec.*` | CLI | `no_command`, `lab_required`, `unknown_vm`, `vm_ip_not_found` |
 | `config.inventory.*` | backend | `tofu_binary_missing`, `tofu_command_failed`, `tofu_parse_failed`, `tofu_no_state`, `vm_ip_not_found` |
@@ -399,13 +399,13 @@ categories:
 | `config.runs.*` | CLI | `unknown` |
 | `config.tofu.*` | (retired — moved to `config.backend.*`) | — |
 | `config.workload.*` | planner | `no_target`, `source_missing`, `swarm_needs_docker_host` |
-| `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing`, `ssh_binary_missing`, `wait_ssh_timeout`, `wait_sshd_timeout`, `wait_cloud_init_timeout`, `wait_cloud_init_failed`, `wait_unexpected`, `verify_failed`, `verify_ssh_missing`, `not_idempotent` |
+| `runtime.apply.*` | apply adapter | `tofu_binary_missing`, `ansible_binary_missing`, `ssh_binary_missing`, `wait_ssh_timeout`, `wait_sshd_timeout`, `wait_cloud_init_timeout`, `wait_cloud_init_failed`, `wait_unexpected`, `verify_failed`, `verify_ssh_missing`, `not_idempotent`, `libvirt_domain_crashed` |
 | `runtime.tui.*` | CLI | `missing_dependency` |
 | `runtime.exec.*` | CLI | `ssh_binary_missing` |
 | `runtime.backend.*` | dispatch | `unsupported` |
 | `runtime.vbox.*` | vbox backend | `vboxmanage_missing`, `create_failed`, `reuse_no_port`, `no_free_ports`, `ssh_key_missing`, `iso_tool_missing`, `iso_build_failed`, `qemu_img_missing`, `image_unavailable_offline`, `image_convert_failed`, `image_download_failed`, `no_downloader` |
 | `runtime.status.*` | vbox backend | `vboxmanage_missing` |
-| `runtime.doctor.*` | preflight | `iso_tool_missing`, `virsh_missing`, `virsh_unreachable`, `libvirt_group_missing`, `libvirt_group_inactive`, `default_pool_missing`, `default_pool_inactive`, `default_pool_no_autostart`, `pool_path_unreadable`, `ssh_public_key_missing`, `apparmor_libvirt_unconfigured`, `apparmor_orphan_profiles`, `ansible_missing`, `ansible_collection_missing`, `ansible_cfg_missing`, `ansible_cfg_misconfigured`, `cloud_init_image_unverified`, `ansible_config_not_wired`, `tofu_state_drift`, `vboxmanage_missing`, `qemu_img_missing` |
+| `runtime.doctor.*` | preflight | `iso_tool_missing`, `virsh_missing`, `virsh_unreachable`, `libvirt_group_missing`, `libvirt_group_inactive`, `default_pool_missing`, `default_pool_inactive`, `default_pool_no_autostart`, `pool_path_unreadable`, `ssh_public_key_missing`, `apparmor_libvirt_unconfigured`, `apparmor_orphan_profiles`, `ansible_missing`, `ansible_collection_missing`, `ansible_cfg_missing`, `ansible_cfg_misconfigured`, `cloud_init_image_unverified`, `ansible_config_not_wired`, `tofu_state_drift`, `vboxmanage_missing`, `qemu_img_missing`, `nested_disabled`, `kvm_intel_recent_failures`, `host_is_virtualized` |
 | `runtime.reset.*` | backend (scrub) | `virsh_missing`, `virsh_unreachable`, `pool_unreachable`, `scrub_failed`, `tofu_destroy_warning`, `state_cleanup_failed`, `vboxmanage_missing` |
 
 Diagnostic IDs are **stable public contract** — they show up in JSON output

@@ -74,3 +74,19 @@ variable "cpu_mode" {
   type        = string
   default     = "host-passthrough"
 }
+
+variable "cpu_features_disable" {
+  description = "CPU feature flags to mark `policy='disable'` in the libvirt domain XML (e.g. [\"vmx\"]). Injected via an xslt transform on the generated XML because provider v0.7.6 has no native `cpu.feature` schema. Pair with `cpu_mode: host-model` for reliable masking — `host-passthrough` can leak the underlying flag despite the disable (Ubuntu bug #1830268). Set via `spec.providers.local-libvirt.cpu_features_disable` in the lab YAML; empty list = no transform applied."
+  type        = list(string)
+  default     = []
+}
+
+variable "domain_type" {
+  description = "libvirt domain type for every VM. 'kvm' (default) uses hardware-accelerated virtualization via /dev/kvm. 'qemu' falls back to TCG software emulation — 10-100x slower but bypasses kvm_intel entirely, so it runs on hosts where the L0 hypervisor refuses nested VMX. Use as the universal escape hatch when cpu_mode + cpu_features_disable still can't make the guest boot. Set via `spec.providers.local-libvirt.domain_type` in the lab YAML."
+  type        = string
+  default     = "kvm"
+  validation {
+    condition     = contains(["kvm", "qemu"], var.domain_type)
+    error_message = "domain_type must be either 'kvm' or 'qemu'."
+  }
+}

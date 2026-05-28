@@ -80,10 +80,17 @@ def check_domains_running(
                         "check `journalctl --since '5 minutes ago' "
                         "| grep -i kvm_intel` for `vmread/vmwrite failed` "
                         "(L0 hypervisor refusing VMX passthrough on a "
-                        "nested-virt host). Workaround: set "
-                        "`spec.providers.local-libvirt.cpu_mode: "
-                        f"host-model` in the lab YAML, then `playground "
-                        f"reset {lab}` and re-apply."
+                        "nested-virt host). Escalation ladder in "
+                        "`spec.providers.local-libvirt`: "
+                        "(1) `cpu_mode: host-model` + "
+                        "`cpu_features_disable: [vmx]` masks the flag "
+                        "from the guest; "
+                        "(2) `domain_type: qemu` falls back to TCG "
+                        "software emulation (10-100x slower, but "
+                        "bypasses KVM entirely); "
+                        "(3) re-run on a host with `kvm_intel.nested=1` "
+                        "enabled at L0. After any change, "
+                        f"`playground reset {lab}` and re-apply."
                     ),
                 )
             )

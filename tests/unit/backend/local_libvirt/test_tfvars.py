@@ -177,3 +177,99 @@ def test_render_tfvars_emits_cpu_mode_override(monkeypatch: pytest.MonkeyPatch) 
 
     payload = render_tfvars(resolved)
     assert payload["cpu_mode"] == "host-model"
+
+
+def _resolved_with_libvirt_overrides(overrides: dict) -> object:
+    """Helper: load generic-infra and overlay `spec.providers.local-libvirt`."""
+    loaded, _ = load_config(CONFIG_DIR)
+    resolved = resolve_lab(loaded, "generic-infra")
+    new_providers = {**resolved.providers}
+    libvirt_overrides = {**new_providers.get("local-libvirt", {}), **overrides}
+    new_providers["local-libvirt"] = libvirt_overrides
+    return resolved.model_copy(update={"providers": new_providers})
+
+
+def test_render_tfvars_omits_cpu_features_disable_when_lab_does_not_set_it(
+    resolved_generic_infra,
+) -> None:
+    # When the lab doesn't set `cpu_features_disable`, tfvars must not emit
+    # the key so tofu's default (empty list = no xslt) applies.
+    payload = render_tfvars(resolved_generic_infra)
+    assert "cpu_features_disable" not in payload
+
+
+def test_render_tfvars_emits_cpu_features_disable_when_lab_sets_it() -> None:
+    """Workaround for `kvm_intel: vmread/vmwrite failed` on nested hosts —
+    `spec.providers.local-libvirt.cpu_features_disable: [vmx]` strips the
+    flag from the libvirt CPU XML via xslt."""
+    resolved = _resolved_with_libvirt_overrides({"cpu_features_disable": ["vmx"]})
+    payload = render_tfvars(resolved)
+    assert payload["cpu_features_disable"] == ["vmx"]
+
+
+def test_render_tfvars_omits_cpu_features_disable_when_explicit_empty_list() -> None:
+    # An explicit empty list must be treated like "not set" — emitting
+    # an empty list would still trigger the dynamic xml block on the
+    # tofu side (length check is `> 0` so it's still safe, but
+    # belt-and-braces: omit so the payload stays clean).
+    resolved = _resolved_with_libvirt_overrides({"cpu_features_disable": []})
+    payload = render_tfvars(resolved)
+    assert "cpu_features_disable" not in payload
+
+
+def test_render_tfvars_rejects_non_list_cpu_features_disable() -> None:
+    resolved = _resolved_with_libvirt_overrides({"cpu_features_disable": "vmx"})
+    with pytest.raises(ValueError, match="cpu_features_disable"):
+        render_tfvars(resolved)
+
+
+def test_render_tfvars_rejects_non_string_entries_in_cpu_features_disable() -> None:
+    resolved = _resolved_with_libvirt_overrides(
+        {"cpu_features_disable": ["vmx", 42]},
+    )
+    with pytest.raises(ValueError, match="cpu_features_disable"):
+        render_tfvars(resolved)
+
+
+def test_render_tfvars_rejects_empty_string_in_cpu_features_disable() -> None:
+    # An empty CPU flag name makes no sense and would produce an
+    # invalid xslt template — surface fast at render time.
+    resolved = _resolved_with_libvirt_overrides({"cpu_features_disable": [""]})
+    with pytest.raises(ValueError, match="cpu_features_disable"):
+        render_tfvars(resolved)
+
+
+def test_render_tfvars_omits_domain_type_when_lab_does_not_set_it(
+    resolved_generic_infra,
+) -> None:
+    payload = render_tfvars(resolved_generic_infra)
+    assert "domain_type" not in payload
+
+
+def test_render_tfvars_emits_domain_type_kvm() -> None:
+    # Even when the operator explicitly sets the default value, emit it
+    # — the payload-omit policy elsewhere is "omit when not set", not
+    # "omit when value matches default."
+    resolved = _resolved_with_libvirt_overrides({"domain_type": "kvm"})
+    payload = render_tfvars(resolved)
+    assert payload["domain_type"] == "kvm"
+
+
+def test_render_tfvars_emits_domain_type_qemu() -> None:
+    """The TCG fallback — opting into software emulation when L0 won't
+    permit nested VMX."""
+    resolved = _resolved_with_libvirt_overrides({"domain_type": "qemu"})
+    payload = render_tfvars(resolved)
+    assert payload["domain_type"] == "qemu"
+
+
+def test_render_tfvars_rejects_invalid_domain_type() -> None:
+    resolved = _resolved_with_libvirt_overrides({"domain_type": "xen"})
+    with pytest.raises(ValueError, match="domain_type"):
+        render_tfvars(resolved)
+
+
+def test_render_tfvars_rejects_non_string_domain_type() -> None:
+    resolved = _resolved_with_libvirt_overrides({"domain_type": 42})
+    with pytest.raises(ValueError, match="domain_type"):
+        render_tfvars(resolved)

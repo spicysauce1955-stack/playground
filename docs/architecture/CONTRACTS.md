@@ -418,6 +418,20 @@ Generic VM + Docker labs are the supported vbox use case
 (`config/providers/local-vbox.yaml` records `nested_virtualization:
 false`).
 
+### libvirt: nested-virt fails when L0 refuses VMX passthrough
+
+When this L1 host is itself inside an L0 hypervisor that doesn't
+permit nested VMX, the playground guest starts and immediately pauses
+with `paused (unknown)` and `kvm_intel: vmread/vmwrite failed` in
+dmesg. The misleading top-level symptom is tofu's `wait_for_lease`
+timing out after 5 minutes. The escape hatches are
+`spec.providers.local-libvirt`'s `cpu_mode` + `cpu_features_disable`
+(rung 1) and `domain_type: qemu` (rung 2; TCG software emulation).
+
+See [`nested_virtualization.md`](nested_virtualization.md) for the
+escalation ladder, symptom → rung mapping, and how to verify each
+knob landed.
+
 ## When to update this doc
 
 - A new step is added to `execute_apply` (write its contract here).
