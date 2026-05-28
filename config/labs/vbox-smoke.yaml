@@ -1,0 +1,45 @@
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: vbox-smoke
+  description: |
+    Single-VM VirtualBox smoke lab. Provisions one docker-host VM on the
+    local-vbox backend: VBoxManage creates the VM from the Ubuntu Noble
+    cloud image, a NoCloud cloud-init seed injects the SSH key, and the
+    VM is reached over a NAT SSH port-forward. Exercises the full
+    create -> wait -> ansible -> verify -> destroy loop end to end.
+  tags: [vbox, smoke, local]
+
+spec:
+  backend: local-vbox
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 4
+    max_memory_mb: 8192
+    max_disk_gb: 60
+    max_vms: 2
+    max_containers: 10
+
+  networks:
+    - name: lab-net
+      profile: isolated
+      cidr: 10.50.0.0/24
+
+  vms:
+    - name: node1
+      role: docker-host
+      networks: [lab-net]
+      resources:
+        vcpu: 2
+        memory_mb: 4096
+        disk_gb: 20
+
+  commands:
+    enabled:
+      - check-docker
+
+  providers:
+    local-vbox:
+      ssh_public_key_path: ~/.ssh/id_rsa.pub

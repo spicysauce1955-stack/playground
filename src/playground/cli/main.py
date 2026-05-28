@@ -11,12 +11,16 @@ from typing import Annotated, NoReturn
 
 import typer
 
-from playground.backend.local_libvirt import (
+from playground.backend.dispatch import (
+    SUPPORTED_BACKENDS,
     execute_apply,
     execute_destroy,
     execute_reset,
-    fetch_vm_ips,
     query_status,
+    unsupported_backend_diagnostic,
+)
+from playground.backend.local_libvirt import (
+    fetch_vm_ips,
     render_inventory,
     render_tfvars,
     tail_log,
@@ -512,6 +516,7 @@ def apply_command(
     _print_warnings(diagnostics)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
 
     # JsonlWriter is attached inside execute_apply as soon as start_run
     # creates the run directory. The CLI only needs an empty bus.
@@ -902,7 +907,16 @@ def exec_command(
 
 @app.command("status")
 def status_command(
-    lab: Annotated[str, typer.Argument(help="Lab name to inspect.")],
+    lab: Annotated[
+        str | None,
+        typer.Argument(
+            help=(
+                "Lab name to inspect. Omit to list every configured lab's "
+                "status (useful for downstream tooling that needs to "
+                "discover labs and IPs in one call)."
+            ),
+        ),
+    ] = None,
     config_dir: Annotated[
         Path,
         typer.Option("--config-dir", "-c", help="Config directory to load."),
@@ -916,14 +930,46 @@ def status_command(
         typer.Option("--output", "-o", help="Output format."),
     ] = OutputFormat.human,
 ) -> None:
-    """Show observed state of ``lab`` (read-only)."""
+    """Show observed state of ``lab`` — or every lab when ``lab`` is omitted."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
         diagnostics.extend(validate_loaded_config(loaded))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
+    # Multi-lab listing path. We invoke query_status per lab and emit a
+    # single envelope, so callers (the barak-deploy cross-VM test among
+    # others) can discover labs + their VMs/IPs in one round trip.
+    if lab is None:
+        lab_names = sorted(loaded.labs)
+        entries: list[LabStatus] = []
+        any_diags: list[Diagnostic] = []
+        for name in lab_names:
+            resolved = _resolve_lab_or_exit(loaded, name, config_dir, output)
+            if resolved.backend not in SUPPORTED_BACKENDS:
+                # Skip labs whose backend has no adapter — surface as a
+                # warning rather than blocking the whole listing.
+                any_diags.append(unsupported_backend_diagnostic(resolved.backend))
+                continue
+            lab_status, lab_diags = query_status(resolved, tofu_dir)
+            entries.append(lab_status)
+            any_diags.extend(lab_diags)
+        if output is OutputFormat.json:
+            payload = {"labs": [s.model_dump(mode="json", exclude_none=True)
+                                for s in entries]}
+            if any_diags:
+                payload["diagnostics"] = [_diagnostic_to_dict(d) for d in any_diags]
+            _print_json(payload)
+            return
+        if any_diags:
+            _print_diagnostics(any_diags, err=True)
+        for s in entries:
+            _render_status_human(s)
+            typer.echo("")
+        return
+
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
     status, query_diagnostics = query_status(resolved, tofu_dir)
     _exit_on_errors(query_diagnostics, output, json_errors=False)
 
@@ -983,6 +1029,7 @@ def destroy_command(
     _print_warnings(diagnostics)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
 
     bus = EventBus()
     finished, diagnostics = execute_destroy(
@@ -1047,6 +1094,7 @@ def reset_command(
     _print_warnings(diagnostics)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
 
     bus = EventBus()
     finished, reset_diagnostics = execute_reset(
@@ -1141,6 +1189,22 @@ def _resolve_lab_or_exit(
                 message=str(exc),
                 source=SourceLocation(path=str(config_dir / "labs" / f"{name}.yaml")),
             ),
+            output,
+            json_errors=False,
+        )
+
+
+def _exit_if_unsupported_backend(
+    resolved: ResolvedLab, output: OutputFormat
+) -> None:
+    """Reject a lab whose backend has no implemented adapter.
+
+    The validator only guarantees the backend has a ProviderConfig; this
+    gate guarantees there's actually a backend adapter wired in dispatch
+    before any lifecycle command tries to run it."""
+    if resolved.backend not in SUPPORTED_BACKENDS:
+        _exit_on_errors(
+            [unsupported_backend_diagnostic(resolved.backend)],
             output,
             json_errors=False,
         )

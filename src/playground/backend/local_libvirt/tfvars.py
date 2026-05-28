@@ -92,6 +92,16 @@ def render_tfvars(resolved: ResolvedLab) -> dict[str, Any]:
     if vm_dns_hosts:
         payload["vm_dns_hosts"] = vm_dns_hosts
 
+    # CPU mode override — lab YAML's `spec.providers.local-libvirt.cpu_mode`.
+    # Omitted entirely when unset so tofu's default (`host-passthrough`)
+    # applies. Non-Redroid labs running on hosts where VMX passthrough
+    # fails can set `cpu_mode: host-model` to avoid the kvm_intel
+    # vmread/vmwrite startup crash.
+    provider_cfg = resolved.providers.get("local-libvirt", {}) or {}
+    cpu_mode = provider_cfg.get("cpu_mode")
+    if isinstance(cpu_mode, str) and cpu_mode:
+        payload["cpu_mode"] = cpu_mode
+
     return payload
 
 

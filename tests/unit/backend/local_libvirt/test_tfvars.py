@@ -150,3 +150,30 @@ def test_render_tfvars_is_pure_no_diagnostics_returned(
     # may or may not be present depending on the lab. Today's
     # generic-infra produces all three.
     assert "vm_names" in payload
+
+
+def test_render_tfvars_omits_cpu_mode_when_lab_does_not_override(
+    resolved_generic_infra,
+) -> None:
+    # When the lab's spec.providers.local-libvirt has no `cpu_mode`,
+    # tfvars must NOT emit it — the operator's tofu default
+    # (host-passthrough) then applies, matching the historic behavior.
+    payload = render_tfvars(resolved_generic_infra)
+
+    assert "cpu_mode" not in payload
+
+
+def test_render_tfvars_emits_cpu_mode_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue 1 (2026-05-28): non-Redroid labs on hosts where VMX
+    passthrough crashes guests must be able to opt out via
+    `spec.providers.local-libvirt.cpu_mode: host-model`."""
+    loaded, _ = load_config(CONFIG_DIR)
+    resolved = resolve_lab(loaded, "generic-infra")
+    # Inject the override via model_copy since ResolvedLab is frozen.
+    new_providers = {**resolved.providers}
+    libvirt_overrides = {**new_providers.get("local-libvirt", {}), "cpu_mode": "host-model"}
+    new_providers["local-libvirt"] = libvirt_overrides
+    resolved = resolved.model_copy(update={"providers": new_providers})
+
+    payload = render_tfvars(resolved)
+    assert payload["cpu_mode"] == "host-model"

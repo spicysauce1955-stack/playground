@@ -18,13 +18,17 @@ def test_load_committed_config_is_clean() -> None:
     assert diagnostics == [], f"expected no diagnostics, got: {diagnostics}"
     assert loaded.defaults is not None
     assert loaded.artifacts is not None
-    assert set(loaded.providers) == {"local-libvirt"}
     assert set(loaded.networks) == {"nat", "isolated", "routed"}
     assert set(loaded.roles) == {
         "generic-node", "docker-host", "router", "redroid-host",
     }
     assert set(loaded.commands) == {"check-docker", "ping-network"}
-    assert set(loaded.labs) == {"generic-infra"}
+    # Committed providers/labs are asserted as a *subset* rather than an
+    # exact set: config/labs/ may also hold untracked example/external
+    # labs an operator dropped in (e.g. to validate against the pytest
+    # harness), and those must not break the committed-config check.
+    assert {"local-libvirt", "local-vbox"} <= set(loaded.providers)
+    assert {"generic-infra", "vbox-smoke"} <= set(loaded.labs)
 
 
 def test_load_tracks_resource_source_paths() -> None:

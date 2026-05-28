@@ -165,6 +165,7 @@ def render_inventory(
     vm_ips: dict[str, str],
     *,
     staged_workloads: dict[str, dict[str, Path]] | None = None,
+    ssh_ports: dict[str, int] | None = None,
 ) -> tuple[str, list[Diagnostic]]:
     """Produce an ``ansible/inventory.ini`` body for ``resolved``.
 
@@ -220,6 +221,12 @@ def render_inventory(
             f"ansible_user={vm.ssh.user}",
             f"pg_role={vm.role}",
         ]
+        # Non-default SSH port (vbox NAT forwards to 127.0.0.1:<port>).
+        # Omitted entirely for port 22 so the libvirt inventory body is
+        # byte-for-byte unchanged.
+        ssh_port = (ssh_ports or {}).get(vm.name, 22)
+        if ssh_port != 22:
+            host_vars.insert(1, f"ansible_port={ssh_port}")
         if vm.networks:
             host_vars.append(f"pg_networks={','.join(vm.networks)}")
         if vm.tags:

@@ -114,10 +114,15 @@ resource "libvirt_domain" "playground_node" {
   memory = var.vm_memory
   vcpu   = var.vm_vcpu
 
-  # Enable nested virtualization by passing host CPU flags
-  # This is critical for running Docker/Redroid efficiently inside the VM
+  # CPU mode is configurable per lab (via spec.providers.local-libvirt.cpu_mode).
+  # Default `host-passthrough` is required for the redroid-host lab — Redroid
+  # containers need binderfs, which needs full CPU feature passthrough. On
+  # hosts where the L0 hypervisor doesn't tolerate VMX passthrough (symptom:
+  # QEMU pauses or crashes the guest right after `virsh start` and the kernel
+  # logs `kvm_intel: vmread/vmwrite failed`), a non-Redroid lab can override
+  # to `host-model`.
   cpu {
-    mode = "host-passthrough"
+    mode = var.cpu_mode
   }
 
   dynamic "network_interface" {

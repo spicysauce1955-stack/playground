@@ -52,11 +52,20 @@ SSH_PORT = 22
 
 @dataclass(frozen=True)
 class VmTarget:
-    """One VM to wait on."""
+    """One VM to wait on.
+
+    ``ip`` + ``ssh_port`` together name the SSH endpoint. For
+    local-libvirt that's the DHCP IP on port 22. For local-vbox it's
+    ``127.0.0.1`` on a per-VM NAT port-forward, so ``ssh_port`` varies.
+    ``console_hint`` lets a backend override the libvirt-flavored
+    "console into the VM" suggestion in timeout diagnostics.
+    """
 
     name: str
     ip: str
     ssh_user: str
+    ssh_port: int = SSH_PORT
+    console_hint: str | None = None
 
 
 @dataclass
@@ -90,7 +99,7 @@ def wait_for_vms_ready(
     network probes are attempted in that case.
     """
     started_at = _iso_now()
-    command = ["wait-for-vms-ready", *(f"{t.name}={t.ip}" for t in targets)]
+    command = ["wait-for-vms-ready", *(_endpoint_label(t) for t in targets)]
 
     log_lines: list[str] = [
         f"# wait-for-vms-ready: {len(targets)} VM(s)",
@@ -195,25 +204,27 @@ def _wait_one(
     """Run both phases for one VM. Always returns; never raises."""
     outcome = _Outcome(name=target.name)
 
+    endpoint = f"{target.ip}:{target.ssh_port}"
     bus.publish(
         run_id, "log_line",
-        {"step": "wait-for-vms-ready", "line": f"{target.name}: waiting for SSH on {target.ip}:{SSH_PORT}"},
+        {"step": "wait-for-vms-ready",
+         "line": f"{target.name}: waiting for SSH on {endpoint}"},
     )
-    tcp_ok, tcp_elapsed = _wait_tcp(target.ip, SSH_PORT, ssh_timeout)
+    tcp_ok, tcp_elapsed = _wait_tcp(target.ip, target.ssh_port, ssh_timeout)
     if not tcp_ok:
         outcome.log_lines.append(
-            f"{target.name}: TIMEOUT waiting for {target.ip}:{SSH_PORT} after {ssh_timeout:.0f}s"
+            f"{target.name}: TIMEOUT waiting for {endpoint} after {ssh_timeout:.0f}s"
         )
         outcome.diagnostics.append(
             Diagnostic(
                 id="runtime.apply.wait_ssh_timeout",
                 severity="error",
                 message=(
-                    f"VM {target.name!r} ({target.ip}:{SSH_PORT}) never accepted "
+                    f"VM {target.name!r} ({target.ip}:{target.ssh_port}) never accepted "
                     f"TCP connections within {ssh_timeout:.0f}s"
                 ),
                 source=SourceLocation(path=target.ip),
-                suggestion=(
+                suggestion=target.console_hint or (
                     f"console into the VM via `virsh console {target.name}` and "
                     "inspect cloud-init: `journalctl -u cloud-init` / "
                     "`systemctl status ssh`"
@@ -223,7 +234,43 @@ def _wait_one(
         return outcome
 
     outcome.log_lines.append(
-        f"{target.name}: SSH reachable on {target.ip}:{SSH_PORT} after {tcp_elapsed:.1f}s"
+        f"{target.name}: TCP {endpoint} open after {tcp_elapsed:.1f}s"
+    )
+
+    # TCP-open does NOT imply sshd is answering. With a VirtualBox NAT
+    # port-forward the host port accepts connections the instant the VM
+    # is defined — long before the guest's sshd is up — so the TCP probe
+    # above returns ~instantly and is a false "ready". Poll an actual SSH
+    # auth round-trip (`ssh ... true`) until it succeeds; transport
+    # errors (connection refused, exit 255 "banner exchange", our own
+    # attempt timeout) just mean "not up yet, retry". This is the real
+    # readiness gate, and it's also correct for libvirt (where it
+    # succeeds on the first try right after TCP opens).
+    auth_ok, auth_elapsed = _wait_ssh_auth(target=target, timeout=ssh_timeout)
+    if not auth_ok:
+        outcome.log_lines.append(
+            f"{target.name}: TIMEOUT waiting for sshd to answer on {endpoint} "
+            f"after {ssh_timeout:.0f}s"
+        )
+        outcome.diagnostics.append(
+            Diagnostic(
+                id="runtime.apply.wait_sshd_timeout",
+                severity="error",
+                message=(
+                    f"VM {target.name!r} ({endpoint}): TCP was open but sshd "
+                    f"did not complete an SSH handshake within {ssh_timeout:.0f}s"
+                ),
+                source=SourceLocation(path=target.ip),
+                suggestion=target.console_hint or (
+                    f"console into the VM via `virsh console {target.name}` and "
+                    "check `systemctl status ssh` / `journalctl -u cloud-init`"
+                ),
+            )
+        )
+        return outcome
+
+    outcome.log_lines.append(
+        f"{target.name}: sshd answering after {auth_elapsed:.1f}s"
     )
     bus.publish(
         run_id, "log_line",
@@ -238,6 +285,7 @@ def _wait_one(
         ip=target.ip,
         user=target.ssh_user,
         timeout=cloud_init_timeout,
+        port=target.ssh_port,
     )
     if ci_result.timed_out:
         outcome.log_lines.append(
@@ -252,7 +300,7 @@ def _wait_one(
                     f"complete within {cloud_init_timeout:.0f}s"
                 ),
                 source=SourceLocation(path=target.ip),
-                suggestion=(
+                suggestion=target.console_hint or (
                     f"console into the VM: `virsh console {target.name}` and run "
                     "`cloud-init status --long` to see which stage is hung"
                 ),
@@ -276,7 +324,7 @@ def _wait_one(
                 ),
                 source=SourceLocation(path=target.ip),
                 suggestion=(
-                    f"`ssh {target.ssh_user}@{target.ip} cloud-init status --long` "
+                    f"`{_ssh_hint(target)} cloud-init status --long` "
                     "for the failed stage; check /var/log/cloud-init-output.log "
                     "on the VM"
                 ),
@@ -306,13 +354,58 @@ def _wait_tcp(ip: str, port: int, timeout: float) -> tuple[bool, float]:
         try:
             with socket.create_connection((ip, port), timeout=5.0):
                 return True, time.monotonic() - start
-        except (OSError, socket.timeout):
+        except (TimeoutError, OSError):
             pass
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False, time.monotonic() - start
         time.sleep(min(delay, max(0.5, remaining)))
         delay = min(delay * 1.5, 5.0)
+
+
+def _wait_ssh_auth(*, target: VmTarget, timeout: float) -> tuple[bool, float]:
+    """Poll a real SSH auth round-trip until it succeeds or times out.
+
+    Returns ``(success, elapsed_seconds)``. Each attempt runs
+    ``ssh ... true``; a zero exit means sshd is up and the key is
+    accepted. Any non-zero exit (transport failure, banner-exchange
+    timeout, our per-attempt timeout) is treated as "not ready yet" and
+    retried with exponential backoff until ``timeout`` elapses.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    delay = 2.0
+    while True:
+        if _ssh_probe(target) == 0:
+            return True, time.monotonic() - start
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, time.monotonic() - start
+        time.sleep(min(delay, max(0.5, remaining)))
+        delay = min(delay * 1.5, 10.0)
+
+
+def _ssh_probe(target: VmTarget, *, attempt_timeout: float = 15.0) -> int:
+    """One ``ssh ... true`` attempt. Returns the process exit code
+    (255 on transport failure; 124 if our per-attempt timeout fires)."""
+    cmd = [
+        "ssh",
+        *(["-p", str(target.ssh_port)] if target.ssh_port != SSH_PORT else []),
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        f"{target.ssh_user}@{target.ip}",
+        "true",
+    ]
+    try:
+        return subprocess.run(  # noqa: S603 — explicit args, no shell
+            cmd, capture_output=True, text=True, check=False,
+            timeout=attempt_timeout,
+        ).returncode
+    except subprocess.TimeoutExpired:
+        return 124
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +421,19 @@ class _CloudInitResult:
     timed_out: bool = False
 
 
-def _wait_cloud_init(*, ip: str, user: str, timeout: float) -> _CloudInitResult:
+def _wait_cloud_init(
+    *, ip: str, user: str, timeout: float, port: int = SSH_PORT,
+) -> _CloudInitResult:
     """SSH in and block on ``cloud-init status --wait``.
 
     The remote command itself blocks until cloud-init is done, so our
     subprocess timeout is the effective overall budget for this phase.
+    ``-p <port>`` is added only for non-default ports (vbox NAT
+    forwards) so the libvirt command line is byte-for-byte unchanged.
     """
     cmd = [
         "ssh",
+        *(["-p", str(port)] if port != SSH_PORT else []),
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "LogLevel=ERROR",
@@ -362,6 +460,21 @@ def _wait_cloud_init(*, ip: str, user: str, timeout: float) -> _CloudInitResult:
 # ---------------------------------------------------------------------------
 # Log + StepResult plumbing
 # ---------------------------------------------------------------------------
+
+
+def _endpoint_label(target: VmTarget) -> str:
+    """Stable per-VM label for the step command summary. Includes the
+    port only for non-default ports so libvirt's summary is unchanged."""
+    if target.ssh_port == SSH_PORT:
+        return f"{target.name}={target.ip}"
+    return f"{target.name}={target.ip}:{target.ssh_port}"
+
+
+def _ssh_hint(target: VmTarget) -> str:
+    """An ``ssh ...`` prefix an operator can paste, port-aware."""
+    if target.ssh_port == SSH_PORT:
+        return f"ssh {target.ssh_user}@{target.ip}"
+    return f"ssh -p {target.ssh_port} {target.ssh_user}@{target.ip}"
 
 
 def _write_log(log_path: Path, lines: list[str]) -> None:

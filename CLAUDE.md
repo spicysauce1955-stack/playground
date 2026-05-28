@@ -30,6 +30,16 @@ Teardown: `cd tofu && tofu destroy -auto-approve`.
 
 ## Architecture notes that aren't obvious from a single file
 
+- **Two backends, selected by `spec.backend`.** `local-libvirt` (default,
+  OpenTofu + libvirt) and `local-vbox` (VirtualBox via the `VBoxManage`
+  CLI). The CLI/TUI never import a backend directly — they go through
+  `src/playground/backend/dispatch.py`, which routes on
+  `ResolvedLab.backend`. The configure half (`wait-for-vms-ready` →
+  `ansible-playbook` → `verify-lab`) is shared, backend-neutral code (it
+  lives under `backend/local_libvirt/` but takes an `ssh_port`); only the
+  create/destroy half differs. `local-vbox` reaches VMs over a NAT SSH
+  port-forward (`127.0.0.1:<port>`) and needs `qemu-img` + `VBoxManage`.
+  See `docs/architecture/CONTRACTS.md` → "Backend: local-vbox".
 - **The real OpenTofu root is `tofu/`.** Edit `tofu/main.tf` for infrastructure resources. Do not recreate the retired repo-root `main.tf` stub.
 - **Nested virtualization is load-bearing.** `cpu { mode = "host-passthrough" }` in `tofu/main.tf` is required so Redroid containers inside the guest can access the binder/ashmem kernel features. Do not change it to a generic CPU mode.
 - **Cloud-init wires SSH access.** `tofu/cloud_init.cfg` is a `templatefile` that injects `var.ssh_public_key_path` (default `~/.ssh/id_rsa.pub`) for the `ubuntu` user. SSH password auth is disabled — losing the key means recreating the VM.

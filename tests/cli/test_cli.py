@@ -529,7 +529,10 @@ def test_lab_list_json_shows_committed_lab() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     names = {lab["name"] for lab in payload["labs"]}
-    assert names == {"generic-infra"}
+    # Subset, not exact: the committed labs are generic-infra (libvirt)
+    # and vbox-smoke (vbox); config/labs/ may also hold untracked
+    # example labs that must not break this check.
+    assert {"generic-infra", "vbox-smoke"} <= names
     generic = next(lab for lab in payload["labs"] if lab["name"] == "generic-infra")
     assert generic == {
         "name": "generic-infra",
@@ -1307,10 +1310,16 @@ def test_exec_no_command_fails(tmp_path: Path) -> None:
 def test_exec_defaults_lab_when_only_one_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The committed config has exactly one lab (generic-infra) since
-    # the cross-VM lab was retired — exec should pick it up without
-    # an explicit --lab flag.
-    config_dir = CONFIG_DIR
+    # The committed config now ships more than one lab (generic-infra +
+    # vbox-smoke), so synthesize a single-lab config dir to exercise the
+    # "default to the only lab" path. Keep generic-infra (it has a
+    # docker1 VM); drop the rest.
+    import shutil as _shutil
+    config_dir = tmp_path / "config"
+    _shutil.copytree(CONFIG_DIR, config_dir)
+    for lab_file in (config_dir / "labs").glob("*.yaml"):
+        if lab_file.stem != "generic-infra":
+            lab_file.unlink()
 
     bin_dir = _write_apply_shims(tmp_path)
     ssh_bin = _write_ssh_shim(tmp_path, exit_code=0)
@@ -1471,6 +1480,57 @@ def test_status_does_not_create_a_run_record(
     assert not (state_dir / "runs").exists()
 
 
+def test_status_no_lab_lists_every_lab_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 3 (2026-05-28): downstream tooling (e.g. the barak-deploy
+    cross_vm integration test) calls `playground status --output json`
+    with NO lab argument to discover both the lab set and per-lab IPs in
+    one round trip. Must not require LAB; must return an envelope
+    listing every configured lab's status."""
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "status",
+            "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tofu_dir),
+            "--output", "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "labs" in payload
+    names = {entry["lab"] for entry in payload["labs"]}
+    # Committed labs (generic-infra + vbox-smoke) must always appear;
+    # extra untracked example labs in config/labs/ may be present too.
+    assert {"generic-infra", "vbox-smoke"} <= names
+
+
+def test_status_no_lab_lists_every_lab_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = _write_apply_shims(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        ["status", "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    # Human output mentions each committed lab on its own header line.
+    assert "Lab 'generic-infra'" in result.stdout
+    assert "Lab 'vbox-smoke'" in result.stdout
+
+
 def test_destroy_happy_path_writes_run_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1539,6 +1599,10 @@ def test_destroy_tofu_failure_leaves_failed_run(
     assert record["operation"] == "destroy"
     assert record["steps"][0]["exit_code"] == 1
     assert "tofu destroy failed" in record["summary"]
+    # Issue 2 (2026-05-28): the recovery path is `playground reset
+    # <lab>`, not manual tofu fiddling. The failure summary must say
+    # so — operators previously couldn't find it.
+    assert "playground reset generic-infra" in record["summary"]
 
 
 def test_apply_unknown_lab_fails_before_running_tofu(tmp_path: Path) -> None:

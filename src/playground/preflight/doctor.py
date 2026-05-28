@@ -73,6 +73,26 @@ def _host_source(path: str = "host") -> SourceLocation:
     return SourceLocation(path=path)
 
 
+def _playground_repo_root() -> Path | None:
+    """Best-effort path to the playground repo root from this module's
+    on-disk location: ``<root>/src/playground/preflight/doctor.py``.
+
+    Returns ``None`` when the layout doesn't match (e.g., this module is
+    installed somewhere that isn't a dev checkout — wheel without the
+    repo's ``ansible/`` tree alongside). Callers must fall back gracefully.
+    """
+    here = Path(__file__).resolve()
+    # parents[0]=preflight, [1]=playground, [2]=src, [3]=repo root
+    try:
+        candidate = here.parents[3]
+    except IndexError:
+        return None
+    # Light sanity check: the repo should have at least src/playground/.
+    if not (candidate / "src" / "playground").is_dir():
+        return None
+    return candidate
+
+
 def _binary_missing(
     binary: str,
     *,
@@ -118,6 +138,48 @@ def check_iso_tool() -> list[Diagnostic]:
             ),
             source=_host_source(),
             suggestion="sudo apt install -y genisoimage  # or `cdrtools` on Fedora/Arch",
+        )
+    ]
+
+
+def check_vboxmanage() -> list[Diagnostic]:
+    """`VBoxManage` on PATH — needed only for ``local-vbox`` labs.
+
+    Warning-only: libvirt is the default backend, so a missing
+    VirtualBox must not block a libvirt-only operator. It surfaces so
+    someone using the vbox backend gets a clear early signal."""
+    if shutil.which("VBoxManage"):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.doctor.vboxmanage_missing",
+            severity="warning",
+            message=(
+                "`VBoxManage` is not on PATH; required only for "
+                "`local-vbox` labs (libvirt labs are unaffected)"
+            ),
+            source=_host_source(),
+            suggestion="sudo apt install -y virtualbox  # only for the local-vbox backend",
+        )
+    ]
+
+
+def check_qemu_img() -> list[Diagnostic]:
+    """`qemu-img` on PATH — ``local-vbox`` converts the Ubuntu cloud
+    image (qcow2) to a VirtualBox VDI. Warning-only for the same reason
+    as :func:`check_vboxmanage`."""
+    if shutil.which("qemu-img"):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.doctor.qemu_img_missing",
+            severity="warning",
+            message=(
+                "`qemu-img` is not on PATH; `local-vbox` needs it to "
+                "convert the Ubuntu cloud image (qcow2) to a VDI"
+            ),
+            source=_host_source(),
+            suggestion="sudo apt install -y qemu-utils  # only for the local-vbox backend",
         )
     ]
 
@@ -559,8 +621,29 @@ def check_ansible_config(repo_root: Path | None = None) -> list[Diagnostic]:
 
     The check is intentionally lenient about line formatting; it
     does a simple substring scan rather than a strict INI parse.
+
+    When ``repo_root`` is not provided, resolve the playground repo
+    root from this module's location (``<root>/src/playground/preflight``)
+    instead of CWD. The CWD fallback was a false-positive source for
+    operators running ``playground doctor`` from a *downstream* project
+    that uses playground as a black-box infra tool: they'd see a
+    warning about ``<their-project>/ansible/ansible.cfg`` even though
+    the file that matters is the playground's own.
     """
-    root = repo_root if repo_root is not None else Path.cwd()
+    if repo_root is not None:
+        root = repo_root
+    else:
+        root = _playground_repo_root()
+        if root is None or not (root / "ansible" / "ansible.cfg").is_file():
+            # Dev-checkout path didn't yield a usable ansible.cfg
+            # (installed wheel without ansible/ tree, or shadowed). Fall
+            # back to CWD only if it actually looks like a playground
+            # tree (has src/playground/), otherwise skip silently.
+            cwd = Path.cwd()
+            if (cwd / "src" / "playground").is_dir():
+                root = cwd
+            else:
+                return []
     cfg_path = root / "ansible" / "ansible.cfg"
     if not cfg_path.is_file():
         return [
@@ -1028,4 +1111,6 @@ def run_all_checks(*, ssh_key_path: Path | None = None) -> list[Diagnostic]:
     diagnostics.extend(check_cloud_init_on_image())
     diagnostics.extend(check_ansible_config_wired())
     diagnostics.extend(check_tofu_state_alignment())
+    diagnostics.extend(check_vboxmanage())
+    diagnostics.extend(check_qemu_img())
     return diagnostics

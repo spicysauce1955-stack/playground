@@ -228,6 +228,65 @@ finishes `status=succeeded`.
 - `runtime.doctor.*` namespace. IDs are public contract.
 - Severity: `error` blocks apply; `warning` doesn't.
 
+## Backend: local-vbox
+
+A second backend (`spec.backend: local-vbox`) provisions VirtualBox VMs
+with the `VBoxManage` CLI instead of OpenTofu + libvirt. The CLI/TUI
+route to it through `playground.backend.dispatch`, which selects on
+`ResolvedLab.backend`. The **configure half is shared verbatim** with
+libvirt — `wait-for-vms-ready`, `ansible-playbook`, and `verify-lab` are
+backend-neutral (they live under `backend/local_libvirt/` for historical
+reasons but take an `ssh_port`, so vbox reuses them). Only the front half
+differs.
+
+### vbox apply pipeline
+
+```
+ResolvedLab (backend=local-vbox)
+        |
+        v
+  build_vbox_plan (plan.py)   # pure: per-VM NICs, MACs, static IPs
+        |
+        v
+================ execute_apply (runner.py) ================
+| vbox-create        ensure base VDI (image.py: download qcow2 +
+|                    qemu-img convert), then per VM: clonemedium,
+|                    modifyvm (NAT NIC1 + --natpf1 ssh; intnet NIC
+|                    per lab network), attach disk + NoCloud seed
+|                    ISO (cloudinit.py), startvm --headless
+| wait-for-vms-ready  (SHARED) 127.0.0.1:<host_port> per VM
+| ansible-playbook    (SHARED) inventory has ansible_port=<host_port>
+| verify-lab          (SHARED, warning-only)
+==========================================================
+```
+
+### vbox-create contract (`backend/local_vbox`)
+
+**Input**: `VboxPlan` from `build_vbox_plan`.
+
+**Output**: N running VirtualBox VMs named `<lab>-<vm>`; returns
+`vm_ips` (every VM → `127.0.0.1`) and `ssh_ports` (per-VM NAT host
+port). On any failure, partially-created VMs are rolled back
+(`unregistervm --delete`).
+
+**Contract**:
+- Base disk: the `ubuntu-noble` artifact (qcow2) is downloaded once and
+  converted to a VDI with `qemu-img`, cached under
+  `.playground/cache/artifacts/vm-images/...`. Per-VM disks are
+  `clonemedium` copies, resized to the lab's `disk_gb`.
+- NIC1 is **NAT** with `--natpf1 ssh,tcp,127.0.0.1,<host_port>,,22`.
+  That is the SSH/management plane. Host ports are picked free at apply
+  time (not in the plan).
+- Each lab network adds an **internal-network** NIC (`--intnet<i>
+  <lab>-<net>`) with a static IP set via the NoCloud `network-config`,
+  matched by MAC. VirtualBox internal networks have no DHCP, hence
+  static.
+- cloud-init `user-data` mirrors `tofu/cloud_init.cfg` (hostname/fqdn,
+  SSH key for `ssh.user`, package update/upgrade, no password auth).
+- `playground reset` for vbox = `scrub-vbox` (delete every VM whose name
+  starts with `<lab>-`) + `clean-state-files`. Never touches the cached
+  base image.
+
 ## Cross-layer pitfalls (things future-you will hit)
 
 These are the gotchas we've already paid for. Each one cost
@@ -321,6 +380,43 @@ apply <lab-B>` after a previous `apply <lab-A>` overwrites the
 state to match lab-B. Concurrent labs on one host don't work
 today. `playground reset` is the recovery path for state that
 gets out of sync with reality.
+
+### vbox: VirtualBox can't boot the qcow2 cloud image directly
+
+The Ubuntu cloud image ships as qcow2, which VirtualBox doesn't read.
+The vbox backend converts it to a VDI with `qemu-img convert` and clones
+per-VM copies. `qemu-img` (apt: `qemu-utils`) is therefore a hard
+dependency of the vbox path — `playground doctor` warns
+(`runtime.doctor.qemu_img_missing`) when it's absent. The conversion is
+cached, so it only happens on the first apply.
+
+### vbox: reachability is 127.0.0.1:<port>, not a routable VM IP
+
+With NAT + port-forward, every VM's SSH endpoint is `127.0.0.1` on a
+distinct host port. The shared `wait`/`verify`/`inventory` code carries
+an `ssh_port` (defaulting to 22, so libvirt is unaffected). `playground
+status` shows `127.0.0.1` for vbox VMs — that's expected, not a bug.
+VM-to-VM traffic does **not** go over NAT; it uses the per-network
+intnet NICs with static IPs.
+
+### vbox: a NoCloud network-config replaces the image default entirely
+
+If the seed ISO contains a `network-config`, it fully supersedes the
+cloud image's default netplan — so it must list **every** NIC (the NAT
+NIC as DHCP included), or an omitted NIC comes up unconfigured. The
+backend therefore omits `network-config` for NAT-only VMs (letting the
+image default DHCP all NICs) and only emits it when there's an intnet
+NIC needing a static IP. NICs are matched by MAC (no `set-name`) to
+avoid depending on guest interface enumeration.
+
+### vbox: no nested virt → Redroid won't work there
+
+The libvirt path uses `cpu { mode = "host-passthrough" }` so guests get
+binderfs for Redroid. VirtualBox doesn't pass that through, so a
+`redroid-host` lab on `local-vbox` will fail the binder assertion.
+Generic VM + Docker labs are the supported vbox use case
+(`config/providers/local-vbox.yaml` records `nested_virtualization:
+false`).
 
 ## When to update this doc
 

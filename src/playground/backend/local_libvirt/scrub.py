@@ -266,7 +266,7 @@ def _list_volumes(
             ),
             source=SourceLocation(path="host"),
             suggestion=(
-                f"create the pool or pass a different `--pool` flag; "
+                "create the pool or pass a different `--pool` flag; "
                 "running `playground doctor` will diagnose."
             ),
         )

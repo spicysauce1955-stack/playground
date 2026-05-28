@@ -71,8 +71,11 @@ def test_happy_path_two_vms_in_parallel(
     monkeypatch.setattr(wait_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
     monkeypatch.setattr(wait_mod, "_wait_tcp", lambda ip, port, timeout: (True, 0.1))
     monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (True, 0.1)
+    )
+    monkeypatch.setattr(
         wait_mod, "_wait_cloud_init",
-        lambda *, ip, user, timeout: wait_mod._CloudInitResult(
+        lambda *, ip, user, timeout, port=22: wait_mod._CloudInitResult(
             exit_code=0, stdout_summary="status: done", stderr_summary=""
         ),
     )
@@ -88,8 +91,8 @@ def test_happy_path_two_vms_in_parallel(
     assert step.exit_code == 0
     assert diagnostics == []
     log = (tmp_path / "wait.log").read_text()
-    assert "vm-a: SSH reachable" in log
-    assert "vm-b: SSH reachable" in log
+    assert "vm-a: sshd answering" in log
+    assert "vm-b: sshd answering" in log
     assert "vm-a: cloud-init done" in log
     assert "vm-b: cloud-init done" in log
 
@@ -109,8 +112,11 @@ def test_ssh_timeout_emits_per_vm_diagnostic(
 
     monkeypatch.setattr(wait_mod, "_wait_tcp", _tcp)
     monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (True, 0.1)
+    )
+    monkeypatch.setattr(
         wait_mod, "_wait_cloud_init",
-        lambda *, ip, user, timeout: wait_mod._CloudInitResult(
+        lambda *, ip, user, timeout, port=22: wait_mod._CloudInitResult(
             exit_code=0, stdout_summary="", stderr_summary=""
         ),
     )
@@ -136,8 +142,11 @@ def test_cloud_init_timeout_emits_specific_diagnostic(
     monkeypatch.setattr(wait_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
     monkeypatch.setattr(wait_mod, "_wait_tcp", lambda *_a, **_k: (True, 0.1))
     monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (True, 0.1)
+    )
+    monkeypatch.setattr(
         wait_mod, "_wait_cloud_init",
-        lambda *, ip, user, timeout: wait_mod._CloudInitResult(
+        lambda *, ip, user, timeout, port=22: wait_mod._CloudInitResult(
             exit_code=-1, stdout_summary="", stderr_summary="", timed_out=True,
         ),
     )
@@ -157,8 +166,11 @@ def test_cloud_init_error_emits_failed_diagnostic(
     monkeypatch.setattr(wait_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
     monkeypatch.setattr(wait_mod, "_wait_tcp", lambda *_a, **_k: (True, 0.1))
     monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (True, 0.1)
+    )
+    monkeypatch.setattr(
         wait_mod, "_wait_cloud_init",
-        lambda *, ip, user, timeout: wait_mod._CloudInitResult(
+        lambda *, ip, user, timeout, port=22: wait_mod._CloudInitResult(
             exit_code=1, stdout_summary="status: error", stderr_summary="",
         ),
     )
@@ -191,8 +203,11 @@ def test_log_order_matches_target_declaration_order(
 
     monkeypatch.setattr(wait_mod, "_wait_tcp", _tcp)
     monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (True, 0.1)
+    )
+    monkeypatch.setattr(
         wait_mod, "_wait_cloud_init",
-        lambda *, ip, user, timeout: wait_mod._CloudInitResult(
+        lambda *, ip, user, timeout, port=22: wait_mod._CloudInitResult(
             exit_code=0, stdout_summary="", stderr_summary=""
         ),
     )
@@ -206,8 +221,8 @@ def test_log_order_matches_target_declaration_order(
         run_id="r1",
     )
     log = (tmp_path / "wait.log").read_text()
-    a_idx = log.find("vm-a: SSH reachable")
-    b_idx = log.find("vm-b: SSH reachable")
+    a_idx = log.find("vm-a: sshd answering")
+    b_idx = log.find("vm-b: sshd answering")
     assert 0 < a_idx < b_idx, log
 
 
@@ -290,3 +305,69 @@ def test_wait_cloud_init_passes_ssh_options(
     assert "StrictHostKeyChecking=accept-new" in captured["args"]
     assert "root@10.0.0.10" in captured["args"]
     assert "cloud-init status --wait" in captured["args"]
+
+
+# ---------------------------------------------------------------------------
+# SSH auth readiness gate (the vbox NAT-port-forward fix)
+# ---------------------------------------------------------------------------
+
+
+def test_wait_ssh_auth_retries_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TCP-open is a false positive for vbox NAT forwards, so the auth
+    gate must keep retrying through transport failures until sshd
+    actually answers."""
+    target = VmTarget(name="vm", ip="127.0.0.1", ssh_user="ubuntu", ssh_port=2222)
+    rcs = iter([255, 255, 0])  # not-up, not-up, then ready
+    monkeypatch.setattr(wait_mod, "_ssh_probe", lambda *_a, **_k: next(rcs))
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: None)
+    ok, _elapsed = wait_mod._wait_ssh_auth(target=target, timeout=60.0)
+    assert ok is True
+
+
+def test_wait_ssh_auth_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = VmTarget(name="vm", ip="127.0.0.1", ssh_user="ubuntu", ssh_port=2222)
+    monkeypatch.setattr(wait_mod, "_ssh_probe", lambda *_a, **_k: 255)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: None)
+    clock = {"n": 0}
+
+    def _monotonic() -> float:
+        clock["n"] += 1
+        return 0.0 if clock["n"] == 1 else 100.0  # past the 1s deadline
+
+    monkeypatch.setattr(wait_mod.time, "monotonic", _monotonic)
+    ok, _elapsed = wait_mod._wait_ssh_auth(target=target, timeout=1.0)
+    assert ok is False
+
+
+def test_ssh_probe_adds_port_for_nonstandard(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def _stub(args: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(wait_mod.subprocess, "run", _stub)
+    target = VmTarget(name="vm", ip="127.0.0.1", ssh_user="ubuntu", ssh_port=2222)
+    rc = wait_mod._ssh_probe(target)
+    assert rc == 0
+    assert "-p" in captured["args"]
+    assert "2222" in captured["args"]
+    assert "ubuntu@127.0.0.1" in captured["args"]
+    assert "true" in captured["args"]
+
+
+def test_ssh_probe_omits_port_for_default() -> None:
+    # Port 22 must not add -p (keeps the libvirt command line unchanged).
+    target = VmTarget(name="vm", ip="10.0.0.10", ssh_user="ubuntu")
+    captured: dict[str, list[str]] = {}
+    import playground.backend.local_libvirt.wait as w
+
+    orig = w.subprocess.run
+    try:
+        w.subprocess.run = lambda args, **_k: (  # type: ignore[assignment]
+            captured.__setitem__("args", args), _completed(returncode=0))[1]
+        rc = w._ssh_probe(target)
+    finally:
+        w.subprocess.run = orig
+    assert rc == 0
+    assert "-p" not in captured["args"]

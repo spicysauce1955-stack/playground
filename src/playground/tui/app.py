@@ -35,7 +35,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
-from playground.backend.local_libvirt import (
+from playground.backend.dispatch import (
     execute_apply,
     execute_destroy,
     query_status,

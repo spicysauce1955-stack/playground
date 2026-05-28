@@ -64,6 +64,9 @@ class VmTarget:
     has_docker: bool
     """Whether the VM's VmRole provisions docker. Drives whether
     we run the docker-ps sub-check on it."""
+    ssh_port: int = 22
+    """SSH endpoint port. 22 for libvirt (DHCP IP); a per-VM NAT
+    port-forward for vbox (``ip`` is then ``127.0.0.1``)."""
 
 
 @dataclass
@@ -83,6 +86,7 @@ def verify_lab(
     bus: EventBus,
     run_id: str,
     per_check_timeout: float = DEFAULT_PER_CHECK_TIMEOUT_SECONDS,
+    ssh_ports: dict[str, int] | None = None,
 ) -> tuple[StepResult, list[Diagnostic]]:
     """Run the verify battery against the live lab.
 
@@ -122,7 +126,7 @@ def verify_lab(
             [diagnostic],
         )
 
-    targets = _build_targets(resolved, vm_ips)
+    targets = _build_targets(resolved, vm_ips, ssh_ports or {})
     any_commands = _commands_targeting_any(resolved)
 
     outcomes: list[_Outcome] = []
@@ -184,7 +188,7 @@ def verify_lab(
 
 
 def _build_targets(
-    resolved: ResolvedLab, vm_ips: dict[str, str]
+    resolved: ResolvedLab, vm_ips: dict[str, str], ssh_ports: dict[str, int]
 ) -> list[VmTarget]:
     """Pair lab VMs with their IPs + flag docker-needing ones.
 
@@ -207,6 +211,7 @@ def _build_targets(
                 ip=ip,
                 ssh_user=vm.ssh.user,
                 has_docker=has_docker,
+                ssh_port=ssh_ports.get(vm.name, 22),
             )
         )
     _ = by_name  # quiet unused-locals lint; kept for future per-name lookups
@@ -339,6 +344,7 @@ def _ssh(
     """
     cmd = [
         "ssh",
+        *(["-p", str(target.ssh_port)] if target.ssh_port != 22 else []),
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "LogLevel=ERROR",

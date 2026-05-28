@@ -31,6 +31,7 @@ from playground.backend.local_libvirt.apply import (
     run_tofu_apply,
     run_tofu_destroy,
 )
+from playground.backend.local_libvirt.domains import check_domains_running
 from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
@@ -110,10 +111,46 @@ def execute_apply(
         run.run_id, "step_finished",
         {"step": "tofu-apply", "exit_code": tofu_step.exit_code},
     )
+    # Probe libvirt domain states whether tofu succeeded or failed.
+    # When tofu fails, this gives a far more actionable diagnostic than
+    # "tofu apply failed" — the canonical failure mode is QEMU pausing /
+    # killing the guest at startup (VMX passthrough on nested-virt
+    # hosts), which tofu sees as a `wait_for_lease` timeout but is
+    # actually a guest-side crash. When tofu succeeds, the same check
+    # catches a guest that booted, ran for a moment, then died — which
+    # would otherwise burn the full ~5-min SSH timeout downstream.
+    crash_diagnostics = check_domains_running(
+        [vm.name for vm in resolved.vms], lab=lab,
+    )
+
     if tofu_diagnostics or tofu_step.exit_code != 0:
+        # Crash diagnostics, when present, replace the generic
+        # "tofu apply failed" summary: they explain the real cause
+        # and link to the cpu_mode workaround.
+        if crash_diagnostics:
+            return _finalize_failure(
+                run, run_dir, steps, bus,
+                list(tofu_diagnostics) + crash_diagnostics,
+                (
+                    f"libvirt domains are not running post-apply — "
+                    f"see the libvirt_domain_crashed diagnostic for "
+                    f"the cpu_mode workaround, then `playground reset "
+                    f"{lab}` and re-apply."
+                ),
+            )
         return _finalize_failure(
             run, run_dir, steps, bus, tofu_diagnostics,
             "tofu apply failed; no VMs provisioned",
+        )
+
+    if crash_diagnostics:
+        return _finalize_failure(
+            run, run_dir, steps, bus, crash_diagnostics,
+            (
+                f"libvirt domains crashed at startup; recover with "
+                f"`playground reset {lab}` after applying the cpu_mode "
+                "workaround in the diagnostic above."
+            ),
         )
 
     # 3. fetch IPs + render inventory
@@ -267,8 +304,13 @@ def execute_destroy(
     if tofu_diagnostics or tofu_step.exit_code != 0:
         finished, _ = _finalize_failure(
             run, run_dir, steps, bus, tofu_diagnostics,
-            "tofu destroy failed; some resources may remain. Inspect "
-            "tofu state with `cd tofu && tofu state list` and retry.",
+            (
+                f"tofu destroy failed; some resources may remain. "
+                f"Recovery: `playground reset {lab}` scrubs the lab's "
+                f"libvirt domains, networks, and per-VM volumes by name "
+                f"(no tofu state dependency) and is safe to re-run. To "
+                f"inspect first, `cd tofu && tofu state list`."
+            ),
         )
         return finished, tofu_diagnostics
 

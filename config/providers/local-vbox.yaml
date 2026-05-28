@@ -1,0 +1,33 @@
+apiVersion: playground/v1
+kind: ProviderConfig
+metadata:
+  name: local-vbox
+  description: Local VirtualBox provider driven directly by the VBoxManage CLI.
+
+spec:
+  driver: local-vbox
+
+  # Public key injected into every VM via the NoCloud cloud-init seed.
+  # Defaults to ~/.ssh/id_rsa.pub when unset; a lab may override per
+  # backend via spec.providers.local-vbox.ssh_public_key_path.
+  ssh_public_key_path: ~/.ssh/id_rsa.pub
+
+  # Base image is taken from config/artifacts/sources.yaml (ubuntu-noble):
+  # downloaded once as qcow2, converted to a VDI with qemu-img, then
+  # cloned per VM.
+  vm:
+    cloud_init: true
+    firmware: bios
+
+  network:
+    # NIC1 is NAT with a per-VM SSH port-forward (127.0.0.1:<port> -> :22);
+    # each lab network adds an internal-network NIC with a static IP set
+    # by cloud-init.
+    ssh_via: nat-port-forward
+
+  capabilities:
+    # VirtualBox does not expose KVM nested-virt to guests the way the
+    # libvirt host-passthrough path does, so Redroid (binderfs) is not
+    # expected to work here. Generic VM + Docker labs do.
+    nested_virtualization: false
+    privileged_containers: true

@@ -475,6 +475,28 @@ def test_ansible_config_missing_emits_warning(tmp_path: Path) -> None:
     assert "host_key_checking" in (diagnostics[0].suggestion or "")
 
 
+def test_ansible_config_no_arg_resolves_to_playground_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Issue 4 (2026-05-28): when called with no repo_root, the check
+    must resolve to the PLAYGROUND install dir — not CWD. Otherwise
+    running `playground doctor` from a downstream project (one that
+    uses playground as a black-box infra tool) emits a misleading
+    warning about ``<cwd>/ansible/ansible.cfg``."""
+    # Simulate being inside a downstream project: CWD has no
+    # ansible.cfg and no src/playground/ marker.
+    monkeypatch.chdir(tmp_path)
+    # Without repo_root: should use the playground repo's ansible.cfg
+    # (this test runs *from* a playground checkout, so __file__ walks
+    # back to it). That file ships in the repo and is well-formed, so
+    # we expect zero diagnostics — no false positive.
+    diagnostics = doctor.check_ansible_config()
+    assert diagnostics == [], (
+        f"expected no false-positive warning from non-playground CWD; got: "
+        f"{[(d.id, d.message) for d in diagnostics]}"
+    )
+
+
 def test_ansible_config_complete_silences(tmp_path: Path) -> None:
     (tmp_path / "ansible").mkdir()
     (tmp_path / "ansible" / "ansible.cfg").write_text(_CANONICAL_ANSIBLE_CFG)
