@@ -186,6 +186,63 @@ def test_cloud_init_error_emits_failed_diagnostic(
     assert "status: error" in failed[0].message
 
 
+def test_cloud_init_advisory_downgrades_failure_to_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``cloud_init_advisory=True`` a cloud-init failure becomes a
+    warning and the step still succeeds (Ansible is the real gate). The
+    SSH phases already proved reachability. This is the DigitalOcean
+    vendor-script case; local backends leave the flag off and stay strict.
+    """
+    monkeypatch.setattr(wait_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(wait_mod, "_wait_tcp", lambda *_a, **_k: (True, 0.1))
+    monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (True, 0.1)
+    )
+    monkeypatch.setattr(
+        wait_mod, "_wait_cloud_init",
+        lambda *, ip, user, timeout, port=22: wait_mod._CloudInitResult(
+            exit_code=1, stdout_summary="status: error", stderr_summary="",
+        ),
+    )
+    step, diagnostics = wait_for_vms_ready(
+        targets=[VmTarget(name="vm-a", ip="10.0.0.10", ssh_user="ubuntu")],
+        log_path=tmp_path / "wait.log",
+        bus=EventBus(),
+        run_id="r1",
+        cloud_init_advisory=True,
+    )
+    assert step.exit_code == 0  # advisory: step succeeds despite cloud-init
+    failed = [d for d in diagnostics if d.id == "runtime.apply.wait_cloud_init_failed"]
+    assert len(failed) == 1
+    assert failed[0].severity == "warning"
+
+
+def test_cloud_init_advisory_keeps_ssh_timeout_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Advisory mode must NOT excuse SSH unreachability — only cloud-init
+    status. A VM that never accepts SSH still fails the step.
+    """
+    monkeypatch.setattr(wait_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(wait_mod, "_wait_tcp", lambda *_a, **_k: (True, 0.1))
+    monkeypatch.setattr(
+        wait_mod, "_wait_ssh_auth", lambda *, target, timeout: (False, 1.0)
+    )
+    step, diagnostics = wait_for_vms_ready(
+        targets=[VmTarget(name="vm-a", ip="10.0.0.10", ssh_user="ubuntu")],
+        log_path=tmp_path / "wait.log",
+        bus=EventBus(),
+        run_id="r1",
+        cloud_init_advisory=True,
+    )
+    assert step.exit_code == 1
+    assert any(
+        d.id == "runtime.apply.wait_sshd_timeout" and d.severity == "error"
+        for d in diagnostics
+    )
+
+
 def test_log_order_matches_target_declaration_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

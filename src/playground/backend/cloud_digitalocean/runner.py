@@ -432,6 +432,11 @@ def _provision(
         log_path=logs_dir / "wait-for-vms-ready.log",
         bus=bus,
         run_id=run.run_id,
+        # DigitalOcean's vendor first-boot script can mark `cloud-init
+        # status` as error even when the guest is fully provisioned and
+        # reachable; don't let that benign failure block the lab. SSH
+        # reachability stays fatal; Ansible is the real readiness gate.
+        cloud_init_advisory=True,
     )
     steps.append(wait_step)
     bus.publish(

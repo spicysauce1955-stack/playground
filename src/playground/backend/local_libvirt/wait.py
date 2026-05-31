@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -85,6 +86,7 @@ def wait_for_vms_ready(
     run_id: str,
     ssh_timeout: float = DEFAULT_SSH_TIMEOUT_SECONDS,
     cloud_init_timeout: float = DEFAULT_CLOUD_INIT_TIMEOUT_SECONDS,
+    cloud_init_advisory: bool = False,
 ) -> tuple[StepResult, list[Diagnostic]]:
     """Block until every target has SSH listening AND cloud-init done.
 
@@ -93,6 +95,15 @@ def wait_for_vms_ready(
     success/failure plumbing. ``StepResult.exit_code`` is 0 when
     every target passed both phases; non-zero (1) on any timeout or
     cloud-init failure.
+
+    ``cloud_init_advisory`` (default off) downgrades a cloud-init
+    timeout/failure from a fatal error to a warning and lets the step
+    succeed anyway — Ansible then becomes the real readiness gate. It
+    exists for cloud images (e.g. DigitalOcean) whose vendor first-boot
+    scripts can mark ``cloud-init status`` as ``error`` even though the
+    guest is fully provisioned and reachable. The SSH-reachability
+    phases stay fatal regardless. local-libvirt/local-vbox leave it off
+    and keep the strict gate.
 
     The ``ssh`` binary is checked up front; if missing the entire
     step fails with ``runtime.apply.ssh_binary_missing``. No
@@ -142,6 +153,7 @@ def wait_for_vms_ready(
                 run_id=run_id,
                 ssh_timeout=ssh_timeout,
                 cloud_init_timeout=cloud_init_timeout,
+                cloud_init_advisory=cloud_init_advisory,
             ): t
             for t in targets
         }
@@ -200,6 +212,7 @@ def _wait_one(
     run_id: str,
     ssh_timeout: float,
     cloud_init_timeout: float,
+    cloud_init_advisory: bool = False,
 ) -> _Outcome:
     """Run both phases for one VM. Always returns; never raises."""
     outcome = _Outcome(name=target.name)
@@ -287,52 +300,63 @@ def _wait_one(
         timeout=cloud_init_timeout,
         port=target.ssh_port,
     )
+    # A cloud-init timeout or non-zero status is fatal by default, but
+    # advisory for backends that opt in (see ``cloud_init_advisory``):
+    # the SSH phases already proved the guest is reachable, so we warn
+    # and let Ansible be the real readiness gate.
+    ci_severity: Literal["error", "warning"] = (
+        "warning" if cloud_init_advisory else "error"
+    )
+    ci_diag: Diagnostic | None = None
     if ci_result.timed_out:
         outcome.log_lines.append(
             f"{target.name}: TIMEOUT waiting for cloud-init after {cloud_init_timeout:.0f}s"
         )
-        outcome.diagnostics.append(
-            Diagnostic(
-                id="runtime.apply.wait_cloud_init_timeout",
-                severity="error",
-                message=(
-                    f"VM {target.name!r}: `cloud-init status --wait` did not "
-                    f"complete within {cloud_init_timeout:.0f}s"
-                ),
-                source=SourceLocation(path=target.ip),
-                suggestion=target.console_hint or (
-                    f"console into the VM: `virsh console {target.name}` and run "
-                    "`cloud-init status --long` to see which stage is hung"
-                ),
-            )
+        ci_diag = Diagnostic(
+            id="runtime.apply.wait_cloud_init_timeout",
+            severity=ci_severity,
+            message=(
+                f"VM {target.name!r}: `cloud-init status --wait` did not "
+                f"complete within {cloud_init_timeout:.0f}s"
+            ),
+            source=SourceLocation(path=target.ip),
+            suggestion=target.console_hint or (
+                f"console into the VM: `virsh console {target.name}` and run "
+                "`cloud-init status --long` to see which stage is hung"
+            ),
         )
-        return outcome
-
-    if ci_result.exit_code != 0:
+    elif ci_result.exit_code != 0:
         outcome.log_lines.append(
             f"{target.name}: cloud-init failed (exit {ci_result.exit_code}): "
             f"{ci_result.stdout_summary or '(no stdout)'}"
         )
-        outcome.diagnostics.append(
-            Diagnostic(
-                id="runtime.apply.wait_cloud_init_failed",
-                severity="error",
-                message=(
-                    f"VM {target.name!r}: cloud-init reported error/degraded "
-                    f"(exit {ci_result.exit_code}): "
-                    f"{ci_result.stdout_summary or ci_result.stderr_summary or '(no output)'}"
-                ),
-                source=SourceLocation(path=target.ip),
-                suggestion=(
-                    f"`{_ssh_hint(target)} cloud-init status --long` "
-                    "for the failed stage; check /var/log/cloud-init-output.log "
-                    "on the VM"
-                ),
-            )
+        ci_diag = Diagnostic(
+            id="runtime.apply.wait_cloud_init_failed",
+            severity=ci_severity,
+            message=(
+                f"VM {target.name!r}: cloud-init reported error/degraded "
+                f"(exit {ci_result.exit_code}): "
+                f"{ci_result.stdout_summary or ci_result.stderr_summary or '(no output)'}"
+            ),
+            source=SourceLocation(path=target.ip),
+            suggestion=(
+                f"`{_ssh_hint(target)} cloud-init status --long` "
+                "for the failed stage; check /var/log/cloud-init-output.log "
+                "on the VM"
+            ),
         )
-        return outcome
 
-    outcome.log_lines.append(f"{target.name}: cloud-init done")
+    if ci_diag is not None:
+        outcome.diagnostics.append(ci_diag)
+        if not cloud_init_advisory:
+            return outcome
+        outcome.log_lines.append(
+            f"{target.name}: cloud-init not clean, but advisory mode is on "
+            "for this backend -- proceeding (Ansible is the real gate)"
+        )
+    else:
+        outcome.log_lines.append(f"{target.name}: cloud-init done")
+
     bus.publish(
         run_id, "log_line",
         {"step": "wait-for-vms-ready", "line": f"{target.name}: ready"},

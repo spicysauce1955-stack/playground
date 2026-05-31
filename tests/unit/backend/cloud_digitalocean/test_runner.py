@@ -180,7 +180,9 @@ def _install_shims(
             body += f"{name} ansible_host={ip}\n"
         return body, []
 
-    def fake_wait_for_vms_ready(*, targets, log_path, bus, run_id):
+    def fake_wait_for_vms_ready(
+        *, targets, log_path, bus, run_id, cloud_init_advisory=False
+    ):
         steps_called.append("wait-for-vms-ready")
         if wait_ok:
             step = _ok_step("wait-for-vms-ready", Path(log_path))
@@ -357,6 +359,45 @@ def test_apply_passes_absolute_var_file_to_tofu(
         "-var-file must be absolute so tofu (cwd=per-lab dir) can find it; "
         f"got {captured['var_file']!r}"
     )
+
+
+def test_apply_uses_advisory_cloud_init_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """The cloud backend must call wait-for-vms-ready with the advisory
+    cloud-init gate, so DigitalOcean's benign vendor first-boot script
+    failure (cloud-init status=error on a fully-provisioned box) does not
+    block the lab. SSH reachability stays fatal; Ansible is the real gate.
+    """
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims(monkeypatch)
+
+    captured: dict[str, object] = {}
+
+    def capturing_wait(*, targets, log_path, bus, run_id, cloud_init_advisory=False):
+        captured["cloud_init_advisory"] = cloud_init_advisory
+        return _ok_step("wait-for-vms-ready", Path(log_path)), []
+
+    monkeypatch.setattr(
+        "playground.backend.cloud_digitalocean.runner.wait_for_vms_ready",
+        capturing_wait,
+    )
+
+    run, _ = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+    assert run is not None and run.status == "succeeded"
+    assert captured.get("cloud_init_advisory") is True
 
 
 # ===========================================================================
