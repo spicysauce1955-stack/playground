@@ -28,6 +28,9 @@ class VmStatus(StrictModel):
     role: str
     ip: str | None = None
     state: VmState
+    provider_id: str | None = None
+    """Cloud provider resource ID (e.g. DigitalOcean Droplet ID as a string).
+    ``None`` for local backends (libvirt, vbox) that have no external resource ID."""
 
 
 class LabStatus(StrictModel):

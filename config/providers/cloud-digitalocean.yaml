@@ -1,0 +1,25 @@
+apiVersion: playground/v1
+kind: ProviderConfig
+metadata:
+  name: cloud-digitalocean
+  description: DigitalOcean cloud backend — short-lived Droplets via OpenTofu.
+
+spec:
+  driver: cloud-digitalocean
+
+  region: nyc3                        # committed default; override per lab
+  image: ubuntu-24-04-x64
+  size: s-1vcpu-1gb                   # cheap smoke default
+
+  # token_env is the NAME of an environment variable that holds the
+  # DigitalOcean API token — never put the token value here.
+  token_env: DIGITALOCEAN_TOKEN
+
+  ssh_public_key_path: ~/.ssh/id_rsa.pub
+
+  firewall:
+    ssh_cidrs: []                     # empty → warn (SSH open to all)
+
+  capabilities:
+    nested_virtualization: false
+    privileged_containers: true

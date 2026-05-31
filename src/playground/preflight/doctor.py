@@ -190,6 +190,42 @@ def check_qemu_img() -> list[Diagnostic]:
     ]
 
 
+def check_xsltproc() -> list[Diagnostic]:
+    """`xsltproc` on PATH — the dmacvicar/libvirt provider's ``xml {
+    xslt = ... }`` escape hatch shells out to xsltproc (libxslt CLI)
+    to apply the transform. Needed by labs that use the rung-1
+    workaround ``spec.providers.local-libvirt.cpu_features_disable``;
+    apply fails at domain creation with "exec: xsltproc: executable
+    file not found in $PATH" if the binary isn't installed.
+
+    Warning-only: labs without ``cpu_features_disable`` don't touch
+    xsltproc at all, so a missing binary mustn't block doctor's exit
+    code for libvirt-only operators who never reach for rung 1.
+    """
+    if shutil.which("xsltproc"):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.doctor.xsltproc_missing",
+            severity="warning",
+            message=(
+                "`xsltproc` is not on PATH; needed only for labs that use "
+                "`spec.providers.local-libvirt.cpu_features_disable` "
+                "(rung 1 of the nested-virt escalation ladder — the "
+                "libvirt provider's xslt escape hatch shells out to "
+                "xsltproc to inject the disable elements). Apply will "
+                "otherwise fail at domain creation with `exec: "
+                "\"xsltproc\": executable file not found in $PATH`."
+            ),
+            source=_host_source(),
+            suggestion=(
+                "sudo apt install -y xsltproc  # only when using the "
+                "cpu_features_disable knob"
+            ),
+        )
+    ]
+
+
 def check_kvm_nested_enabled() -> list[Diagnostic]:
     """`nested` flag on kvm_intel / kvm_amd is on.
 
@@ -251,39 +287,38 @@ def _read_nested(path: Path) -> str:
 
 
 def check_no_recent_vmx_failures() -> list[Diagnostic]:
-    """Surface recent `kvm_intel: vmread/vmwrite failed` kernel
-    messages — the signature of L0 refusing nested VMX passthrough.
+    """Surface recent `vmread/vmwrite failed` kernel messages — the
+    kernel-side signature of nested-VMX going wrong, whether because
+    L0 refuses passthrough (this host is L1) or because L0's
+    kernel/hardware combo can't handle some nested VMX ops cleanly.
 
-    Reads the kernel ring buffer via ``journalctl --since 1 hour ago
-    -k``. If absent (no systemd, journal rate-limited) the check
-    fail-opens silently — doctor's other probes still cover the host.
+    Reads the kernel log over the last 24 hours. The window is wide
+    on purpose: failures often happen at apply time, then the operator
+    investigates / fixes things hours later and runs ``doctor`` — a
+    1-hour window misses the cause of the very thing they're
+    diagnosing (bob-lnx 2026-05-28).
+
+    Tries ``dmesg`` first (no journal-rotation issues) and falls back
+    to ``journalctl -k`` when dmesg is restricted (Ubuntu sets
+    ``kernel.dmesg_restrict=1`` by default). Both probes fail-open
+    silently when their tool is unavailable — doctor's other checks
+    still cover the host.
     """
-    if shutil.which("journalctl") is None:
+    matches = _read_kernel_vmx_failures()
+    if not matches:
         return []
-    try:
-        result = subprocess.run(  # noqa: S603 — explicit args, no shell
-            [
-                "journalctl", "--since", "1 hour ago", "-k", "--no-pager",
-                "-q", "-g", "vmread|vmwrite",
-            ],
-            capture_output=True, text=True, check=False, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return []
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
-    # Take only the first match line — operators don't need a 500-line
-    # paste in their diagnostic; the suggestion tells them where to look.
-    first = result.stdout.strip().splitlines()[0][:240]
+    first = matches[0][:240]
     return [
         Diagnostic(
             id="runtime.doctor.kvm_intel_recent_failures",
             severity="warning",
             message=(
                 "Recent `vmread/vmwrite failed` kernel messages found — "
-                "the canonical signature of an L0 hypervisor refusing "
-                "VMX passthrough on a nested-virt host. Example: "
-                f"{first!r}"
+                "nested-VMX KVM operations are crashing on this host "
+                "(either L0 refuses passthrough to an L1 guest, OR L0 "
+                "itself can't handle some nested VMX ops on this "
+                "CPU/kernel). Either way, playground VMs that need "
+                f"nested-virt features will be unreliable. Example: {first!r}"
             ),
             source=_host_source(),
             suggestion=(
@@ -296,6 +331,53 @@ def check_no_recent_vmx_failures() -> list[Diagnostic]:
                 "(3) re-run on a host with proper nested VMX support."
             ),
         )
+    ]
+
+
+def _read_kernel_vmx_failures() -> list[str]:
+    """Return kernel log lines matching ``vmread`` / ``vmwrite`` over
+    the last 24 hours, or an empty list when neither dmesg nor
+    journalctl can read the log on this host."""
+    # Try dmesg first. On Ubuntu kernel.dmesg_restrict=1 by default, so
+    # dmesg returns rc=1 with "Operation not permitted" — fall through
+    # to journalctl in that case. -kT prints kernel-only with human
+    # timestamps so the truncated example in the diagnostic is readable.
+    if shutil.which("dmesg") is not None:
+        try:
+            result = subprocess.run(  # noqa: S603 — explicit args, no shell
+                ["dmesg", "-kT"],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            result = None
+        if result is not None and result.returncode == 0:
+            matches = [
+                ln for ln in result.stdout.splitlines()
+                if "vmread" in ln.lower() or "vmwrite" in ln.lower()
+            ]
+            if matches:
+                return matches
+    # Fall back to journalctl. The 24-hour window is wide enough that
+    # apply-time failures discovered hours later still surface, but
+    # short enough that long-resolved issues don't clutter the report
+    # forever. Use plain grep rather than -g for portability.
+    if shutil.which("journalctl") is None:
+        return []
+    try:
+        result = subprocess.run(  # noqa: S603 — explicit args, no shell
+            [
+                "journalctl", "--since", "24 hours ago", "-k", "--no-pager",
+                "-q",
+            ],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    return [
+        ln for ln in result.stdout.splitlines()
+        if "vmread" in ln.lower() or "vmwrite" in ln.lower()
     ]
 
 
@@ -1245,20 +1327,315 @@ def check_tofu_state_alignment(
 
 
 # ---------------------------------------------------------------------------
+# Cloud DigitalOcean checks
+# ---------------------------------------------------------------------------
+
+
+def check_cloud_do_token(token_env: str = "DIGITALOCEAN_TOKEN") -> list[Diagnostic]:
+    """DigitalOcean API token is present in the environment.
+
+    Returns an error when the named env var is unset or empty.  The
+    token VALUE is never echoed — only the variable name appears in the
+    diagnostic so the message is safe to display or log.
+    """
+    if os.environ.get(token_env):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.doctor.cloud_token_missing",
+            severity="error",
+            message=(
+                f"${token_env} is not set; the DigitalOcean backend "
+                "can't authenticate"
+            ),
+            source=_host_source(),
+            suggestion=f"export {token_env}=<your-token> (do not commit it)",
+        )
+    ]
+
+
+def check_cloud_do_token_not_committed(
+    repo_root: Path | None = None,
+) -> list[Diagnostic]:
+    """Scan Git-tracked files for a committed DigitalOcean token literal.
+
+    Uses ``git grep`` so only tracked (committed) content is scanned;
+    untracked files and the working tree are ignored.  Best-effort:
+    returns ``[]`` when ``git`` isn't on PATH or the directory isn't a
+    repo.
+
+    IMPORTANT: diagnostic messages and suggestions contain only the
+    matched file path and line number — never the matched line content
+    or the token value itself.
+    """
+    root = repo_root if repo_root is not None else _playground_repo_root()
+    if root is None:
+        return []
+    if shutil.which("git") is None:
+        return []
+
+    # DO personal-access tokens: dop_v1_ followed by exactly 64 word chars.
+    pattern = r"dop_v1_[A-Za-z0-9]{64}"
+    try:
+        result = subprocess.run(  # noqa: S603 — explicit args, no shell
+            ["git", "grep", "-nE", pattern],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+
+    # rc=0 → matches found; rc=1 → no matches; rc=128 → not a repo
+    if result.returncode != 0:
+        return []
+
+    # Collect "file:line" pairs — strip the matched text entirely.
+    locations: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        # git grep -n format: path:lineno:content
+        parts = raw_line.split(":", 2)
+        if len(parts) >= 2:
+            locations.append(f"{parts[0]}:{parts[1]}")
+
+    if not locations:
+        return []
+
+    loc_summary = ", ".join(locations[:5])
+    if len(locations) > 5:
+        loc_summary += f" … ({len(locations)} total)"
+
+    return [
+        Diagnostic(
+            id="runtime.doctor.cloud_token_committed",
+            severity="error",
+            message=(
+                "A DigitalOcean API token pattern (dop_v1_…) was found in "
+                f"Git-tracked file(s): {loc_summary}. "
+                "Committed tokens must be rotated immediately."
+            ),
+            source=_host_source(),
+            suggestion=(
+                "Rotate the token in the DigitalOcean control panel, then "
+                "remove it from tracked files and rewrite history with "
+                "`git filter-repo` or BFG."
+            ),
+        )
+    ]
+
+
+def check_cloud_do_tofu() -> list[Diagnostic]:
+    """`tofu` binary on PATH (required to run the DO OpenTofu root)."""
+    if shutil.which("tofu") is not None:
+        return []
+    return [
+        _binary_missing(
+            "tofu",
+            diagnostic_id="runtime.doctor.cloud_tofu_missing",
+            install_hint=(
+                "install OpenTofu: https://opentofu.org/docs/intro/install/"
+            ),
+        )
+    ]
+
+
+def check_cloud_do_state_writable(state_dir: Path) -> list[Diagnostic]:
+    """Verify the per-backend state directory can be created and written.
+
+    Tries to create ``<state_dir>/state/cloud-digitalocean``, write a
+    temporary probe file, and remove it.  Returns an error on any
+    ``OSError`` so the operator knows before ``apply`` that the state
+    path is unusable.
+    """
+    target = state_dir / "state" / "cloud-digitalocean"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / ".doctor_probe"
+        probe.write_text("probe")
+        probe.unlink()
+    except OSError as exc:
+        return [
+            Diagnostic(
+                id="runtime.doctor.cloud_state_unwritable",
+                severity="error",
+                message=(
+                    f"Cannot write to state directory {target}: {exc}"
+                ),
+                source=_host_source(str(target)),
+                suggestion=(
+                    f"Ensure {target} is writable, or choose a different "
+                    "state dir with --state-dir."
+                ),
+            )
+        ]
+    return []
+
+
+def _cloud_token_env(config_dir: Path | None) -> str:
+    """Return the ``token_env`` name from the cloud-digitalocean provider
+    config, or ``"DIGITALOCEAN_TOKEN"`` when the config is absent or
+    unreadable.
+
+    Best-effort: any load error returns the default so ``check_cloud_do_token``
+    still runs with a sensible env-var name.
+    """
+    if config_dir is None:
+        return "DIGITALOCEAN_TOKEN"
+    try:
+        from playground.config.loader import load_config  # local import avoids circular
+
+        loaded, _ = load_config(config_dir)
+        provider = loaded.providers.get("cloud-digitalocean")
+        if provider is None:
+            return "DIGITALOCEAN_TOKEN"
+        spec_data = provider.spec.model_dump()
+        return str(spec_data.get("token_env", "DIGITALOCEAN_TOKEN"))
+    except Exception:  # noqa: BLE001
+        return "DIGITALOCEAN_TOKEN"
+
+
+def check_cloud_do_provider_config(
+    config_dir: Path,
+    *,
+    provider_name: str = "cloud-digitalocean",
+) -> list[Diagnostic]:
+    """Probe the cloud-digitalocean provider config for common misconfigurations.
+
+    Checks:
+    - Provider config block exists in ``config_dir``.
+    - Warning if none of region/size/image are set (they have code
+      defaults, so this is advisory).
+    - Warning when ``firewall.ssh_cidrs`` is absent or empty (SSH open
+      to the whole internet).
+    """
+    from playground.config.loader import load_config  # local import avoids circular
+
+    try:
+        loaded, _ = load_config(config_dir)
+    except Exception as exc:  # noqa: BLE001
+        return [
+            Diagnostic(
+                id="runtime.doctor.cloud_provider_config_missing",
+                severity="error",
+                message=f"Could not load config from {config_dir}: {exc}",
+                source=_host_source(str(config_dir)),
+                suggestion=(
+                    f"Add config/providers/{provider_name}.yaml "
+                    "with kind: ProviderConfig."
+                ),
+            )
+        ]
+
+    provider = loaded.providers.get(provider_name)
+    if provider is None:
+        return [
+            Diagnostic(
+                id="runtime.doctor.cloud_provider_config_missing",
+                severity="error",
+                message=(
+                    f"No ProviderConfig named {provider_name!r} found in "
+                    f"{config_dir}"
+                ),
+                source=_host_source(str(config_dir)),
+                suggestion=(
+                    f"Add config/providers/{provider_name}.yaml "
+                    "with kind: ProviderConfig."
+                ),
+            )
+        ]
+
+    diagnostics: list[Diagnostic] = []
+    spec_data = provider.spec.model_dump()
+
+    # Advisory: check whether any of region/size/image are configured.
+    missing_keys = [k for k in ("region", "size", "image") if not spec_data.get(k)]
+    if missing_keys:
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_region_unset",
+                severity="warning",
+                message=(
+                    f"Provider {provider_name!r} is missing spec field(s): "
+                    f"{', '.join(missing_keys)}. Code defaults will be used; "
+                    "set them explicitly to avoid surprises."
+                ),
+                source=_host_source(str(config_dir)),
+                suggestion=(
+                    f"Add region/size/image to "
+                    f"config/providers/{provider_name}.yaml spec."
+                ),
+            )
+        )
+
+    # Firewall: warn if ssh_cidrs absent or empty.
+    firewall = spec_data.get("firewall") or {}
+    ssh_cidrs = firewall.get("ssh_cidrs") if isinstance(firewall, dict) else None
+    if not ssh_cidrs:
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_ssh_open",
+                severity="warning",
+                message=(
+                    "SSH firewall allows 0.0.0.0/0 (open to the internet); "
+                    "set spec.providers.cloud-digitalocean.firewall.ssh_cidrs "
+                    "to your operator CIDR."
+                ),
+                source=_host_source(str(config_dir)),
+                suggestion=(
+                    f"In config/providers/{provider_name}.yaml, add:\n"
+                    "  firewall:\n"
+                    "    ssh_cidrs: [<your-ip>/32]"
+                ),
+            )
+        )
+
+    return diagnostics
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
 
-def run_all_checks(*, ssh_key_path: Path | None = None) -> list[Diagnostic]:
-    """Run every host probe in a stable order and concatenate diagnostics.
+def run_all_checks(
+    *,
+    ssh_key_path: Path | None = None,
+    backend: str | None = None,
+    config_dir: Path | None = None,
+    state_dir: Path | None = None,
+) -> list[Diagnostic]:
+    """Run host probes in a stable order and concatenate diagnostics.
+
+    When ``backend == "cloud-digitalocean"`` a cloud-focused subset is
+    run: libvirt / vbox / KVM host checks are skipped because a
+    cloud-only operator has no virsh, no storage pool, and no KVM
+    requirements.  All other ``backend`` values (including ``None``)
+    fall through to the original full libvirt/vbox list so existing
+    callers are unaffected.
 
     The order matters for human-readable output: PATH checks first so
     later checks that depend on those binaries don't double-report,
-    then libvirt-side state, then SSH + ansible. Each individual check
-    is independently skippable / replaceable; the orchestrator just
-    bundles them.
+    then backend-specific state, then SSH + ansible.
     """
-    diagnostics: list[Diagnostic] = []
+    if backend == "cloud-digitalocean":
+        diagnostics: list[Diagnostic] = []
+        diagnostics.extend(check_cloud_do_tofu())
+        diagnostics.extend(check_ssh_public_key(ssh_key_path))
+        diagnostics.extend(check_ansible_and_collections())
+        diagnostics.extend(check_ansible_config())
+        # Cloud-specific group
+        diagnostics.extend(check_cloud_do_token(_cloud_token_env(config_dir)))
+        diagnostics.extend(check_cloud_do_token_not_committed())
+        _state_dir = state_dir if state_dir is not None else Path(".playground")
+        diagnostics.extend(check_cloud_do_state_writable(_state_dir))
+        if config_dir is not None:
+            diagnostics.extend(check_cloud_do_provider_config(config_dir))
+        return diagnostics
+
+    # Default: full libvirt/vbox suite (unchanged).
+    diagnostics = []
     diagnostics.extend(check_iso_tool())
     diagnostics.extend(check_virsh())
     diagnostics.extend(check_libvirt_group_membership())
@@ -1273,6 +1650,7 @@ def run_all_checks(*, ssh_key_path: Path | None = None) -> list[Diagnostic]:
     diagnostics.extend(check_tofu_state_alignment())
     diagnostics.extend(check_vboxmanage())
     diagnostics.extend(check_qemu_img())
+    diagnostics.extend(check_xsltproc())
     diagnostics.extend(check_kvm_nested_enabled())
     diagnostics.extend(check_no_recent_vmx_failures())
     diagnostics.extend(check_running_inside_hypervisor())

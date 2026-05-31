@@ -43,7 +43,7 @@ class OperationRun(StrictModel):
     """JSON-serialized lifecycle marker for one mutating command."""
 
     run_id: str
-    operation: Literal["apply", "destroy", "reset", "stop"]
+    operation: Literal["apply", "destroy", "reset", "stop", "suspend", "resume"]
     lab: str
     status: RunStatus
     started_at: str
@@ -65,7 +65,7 @@ def allocate_run_id(operation: str, lab: str, now: datetime | None = None) -> st
 
 def start_run(
     runs_dir: Path,
-    operation: Literal["apply", "destroy", "reset", "stop"],
+    operation: Literal["apply", "destroy", "reset", "stop", "suspend", "resume"],
     lab: str,
     run_id: str | None = None,
 ) -> tuple[OperationRun, Path]:

@@ -27,6 +27,34 @@ from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.runs.operation import StepResult
 
 
+def run_tofu_init(
+    tofu_dir: Path,
+    log_path: Path,
+    *,
+    bus: EventBus | None = None,
+    run_id: str | None = None,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Invoke ``tofu init -input=false`` in ``tofu_dir``.
+
+    The committed ``tofu/`` libvirt root is pre-initialized, so the
+    libvirt apply path has never needed this. The generated per-lab
+    DigitalOcean root is created fresh for each lab and does require
+    ``init`` before ``apply``.
+
+    Captures combined stdout+stderr to ``log_path``. When ``bus`` is
+    supplied, each output line is published as a ``log_line`` event.
+    """
+    return _run_step(
+        name="tofu-init",
+        command=["tofu", "init", "-input=false"],
+        cwd=tofu_dir,
+        log_path=log_path,
+        missing_binary_id="runtime.apply.tofu_binary_missing",
+        bus=bus,
+        run_id=run_id,
+    )
+
+
 def run_tofu_apply(
     tofu_dir: Path,
     var_file: Path,
@@ -235,5 +263,6 @@ __all__ = [
     "run_ansible_playbook",
     "run_tofu_apply",
     "run_tofu_destroy",
+    "run_tofu_init",
     "tail_log",
 ]

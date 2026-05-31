@@ -54,6 +54,22 @@ class PlanBudget(StrictModel):
     limits: Budget
 
 
+class CostEstimate(StrictModel):
+    """Advisory hourly and monthly cost estimate for a lab plan.
+
+    Populated by backend-specific logic (e.g. the cloud-digitalocean
+    adapter) and forwarded into :class:`Plan` by :func:`render_plan`.
+    Local backends leave it ``None``. The ``advisory`` flag signals that
+    figures are estimates; callers should direct operators to the provider's
+    official pricing page for authoritative numbers.
+    """
+
+    hourly_usd: float
+    monthly_usd: float
+    note: str = ""
+    advisory: bool = True
+
+
 class Plan(StrictModel):
     """A backend-neutral preview of what `apply` would do.
 
@@ -65,6 +81,7 @@ class Plan(StrictModel):
     offline: bool
     actions: list[PlanAction]
     budget: PlanBudget
+    cost_estimate: CostEstimate | None = None
     warnings: list[Diagnostic] = Field(default_factory=list)
 
 
@@ -72,12 +89,17 @@ def render_plan(
     resolved: ResolvedLab,
     *,
     warnings: list[Diagnostic] | None = None,
+    cost_estimate: CostEstimate | None = None,
 ) -> Plan:
     """Produce a :class:`Plan` for ``resolved``.
 
     ``warnings`` carries forward any non-error diagnostics from validation
     (e.g. ``config.backend.per_vm_resources_unsupported``). The planner
     does not invent diagnostics — it only forwards what the caller passes.
+
+    ``cost_estimate`` is an optional advisory cost breakdown supplied by
+    the caller (typically a backend-specific adapter). This function is
+    pure — it stores whatever is passed; it never computes prices itself.
 
     Pure function: no I/O, no subprocess.
     """
@@ -92,6 +114,7 @@ def render_plan(
         offline=resolved.offline,
         actions=actions,
         budget=_budget(resolved),
+        cost_estimate=cost_estimate,
         warnings=list(warnings or []),
     )
 
@@ -206,4 +229,4 @@ def _budget(resolved: ResolvedLab) -> PlanBudget:
     )
 
 
-__all__ = ["Plan", "PlanAction", "PlanBudget", "render_plan"]
+__all__ = ["CostEstimate", "Plan", "PlanAction", "PlanBudget", "render_plan"]

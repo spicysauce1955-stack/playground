@@ -209,3 +209,11 @@ def test_loader_emits_validation_failed_for_bad_field(tmp_path: Path) -> None:
 def test_loader_raises_for_missing_directory(tmp_path: Path) -> None:
     with pytest.raises(NotADirectoryError):
         load_config(tmp_path / "does-not-exist")
+
+
+def test_cloud_smoke_lab_loads_in_committed_config() -> None:
+    """cloud-smoke and cloud-digitalocean provider are present after load."""
+    loaded, diagnostics = load_config(CONFIG_DIR)
+    assert diagnostics == []
+    assert "cloud-smoke" in loaded.labs
+    assert "cloud-digitalocean" in loaded.providers

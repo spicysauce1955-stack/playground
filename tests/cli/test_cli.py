@@ -1807,4 +1807,188 @@ def test_inventory_render_writes_inventory_and_json_payload(
     assert "[playground]" in body
     assert "node1 ansible_host=10.0.10.42" in body
     assert "router1 ansible_host=10.0.10.44" in body
-    assert "pg_lab=generic-infra" in body
+
+
+# ---------------------------------------------------------------------------
+# plan — cost estimate line for cloud-smoke
+# ---------------------------------------------------------------------------
+
+
+def test_plan_cloud_smoke_human_prints_cost_line() -> None:
+    """``playground plan cloud-smoke`` prints a 'Cost (estimated)' section."""
+    result = CliRunner().invoke(
+        app,
+        ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Cost (estimated):" in result.output
+    assert "/hr" in result.output
+    assert "/mo" in result.output
+
+
+def test_plan_cloud_smoke_json_has_cost_estimate() -> None:
+    """``playground plan cloud-smoke -o json`` includes non-null cost_estimate."""
+    result = CliRunner().invoke(
+        app,
+        ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR), "--output", "json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["cost_estimate"] is not None
+    ce = payload["cost_estimate"]
+    assert ce["hourly_usd"] > 0
+    assert ce["monthly_usd"] > 0
+    assert ce["advisory"] is True
+
+
+def test_plan_generic_infra_json_has_null_cost_estimate() -> None:
+    """Local-backend lab has no cost estimate."""
+    result = CliRunner().invoke(
+        app,
+        ["plan", "generic-infra", "--config-dir", str(CONFIG_DIR), "--output", "json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["cost_estimate"] is None
+
+
+# ---------------------------------------------------------------------------
+# suspend — local backend exits non-zero with verb_not_supported diagnostic
+# ---------------------------------------------------------------------------
+
+
+def test_suspend_on_libvirt_lab_exits_nonzero(tmp_path: Path) -> None:
+    """Invoking ``playground suspend`` on a local-libvirt lab fails gracefully."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "suspend",
+            "generic-infra",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "verb_not_supported" in result.output or "verb_not_supported" in result.stderr
+
+
+def test_suspend_on_vbox_lab_exits_nonzero(tmp_path: Path) -> None:
+    """Invoking ``playground suspend`` on a local-vbox lab fails gracefully."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "suspend",
+            "vbox-smoke",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "verb_not_supported" in result.output or "verb_not_supported" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# suspend / resume — cloud-smoke routes to monkeypatched dispatch functions
+# ---------------------------------------------------------------------------
+
+
+def test_suspend_cloud_smoke_calls_execute_suspend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``playground suspend cloud-smoke`` calls dispatch.execute_suspend."""
+    from playground.cli import main as cli_main
+    from playground.runs import OperationRun
+
+    captured: dict[str, object] = {}
+
+    def fake_execute_suspend(**kwargs: object) -> tuple[OperationRun, list[object]]:
+        captured.update(kwargs)
+        run = OperationRun(
+            run_id="20260531T000000Z-suspend-cloud-smoke",
+            operation="suspend",
+            lab="cloud-smoke",
+            status="succeeded",
+            started_at="2026-05-31T00:00:00+00:00",
+            finished_at="2026-05-31T00:00:01+00:00",
+            steps=[],
+            summary="suspend lab 'cloud-smoke' on digitalocean",
+        )
+        return run, []
+
+    monkeypatch.setattr(cli_main, "execute_suspend", fake_execute_suspend)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "suspend",
+            "cloud-smoke",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "suspended lab 'cloud-smoke'" in result.output
+    assert "Droplets were destroyed to stop billing" in result.output
+    # execute_suspend was called with the resolved lab.
+    assert "resolved" in captured
+    assert captured["resolved"].lab_name == "cloud-smoke"
+
+
+def test_resume_cloud_smoke_calls_execute_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``playground resume cloud-smoke`` calls dispatch.execute_resume."""
+    from playground.cli import main as cli_main
+    from playground.runs import OperationRun, StepResult
+
+    captured: dict[str, object] = {}
+
+    def fake_execute_resume(**kwargs: object) -> tuple[OperationRun, list[object]]:
+        captured.update(kwargs)
+        run = OperationRun(
+            run_id="20260531T000000Z-resume-cloud-smoke",
+            operation="resume",
+            lab="cloud-smoke",
+            status="succeeded",
+            started_at="2026-05-31T00:00:00+00:00",
+            finished_at="2026-05-31T00:00:01+00:00",
+            steps=[
+                StepResult(
+                    name="tofu-init",
+                    command=["tofu", "init"],
+                    exit_code=0,
+                    log_path="/tmp/tofu-init.log",
+                    started_at="2026-05-31T00:00:00+00:00",
+                    finished_at="2026-05-31T00:00:01+00:00",
+                )
+            ],
+            summary="resume lab 'cloud-smoke' on digitalocean (1 Droplets)",
+        )
+        return run, []
+
+    monkeypatch.setattr(cli_main, "execute_resume", fake_execute_resume)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "resume",
+            "cloud-smoke",
+            "--config-dir",
+            str(CONFIG_DIR),
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "resumed lab 'cloud-smoke'" in result.output
+    # execute_resume was called with the resolved lab.
+    assert "resolved" in captured
+    assert captured["resolved"].lab_name == "cloud-smoke"

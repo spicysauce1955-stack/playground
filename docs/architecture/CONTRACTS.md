@@ -287,6 +287,103 @@ port). On any failure, partially-created VMs are rolled back
   starts with `<lab>-`) + `clean-state-files`. Never touches the cached
   base image.
 
+## Backend: cloud-digitalocean
+
+A third backend (`spec.backend: cloud-digitalocean`) provisions Droplets via
+OpenTofu's `digitalocean` provider. The CLI/TUI route through
+`playground.backend.dispatch` as with the other backends. The **configure half
+is identical shared code** (`wait-for-vms-ready` → `ansible-playbook` →
+`verify-lab`; these live under `backend/local_libvirt/` for historical reasons
+but take `ssh_port=22` because Droplets have routable public IPs — no NAT
+port-forward needed). Only the provisioning half and lifecycle verbs differ.
+
+### cloud-digitalocean apply pipeline
+
+```
+ResolvedLab (backend=cloud-digitalocean)
+        |
+        v
+  build_do_plan (plan.py)   # pure: Droplet size/region/tags/names
+        |
+        v
+  render_do_tfvars (tfvars.py)  # pure; token NEVER included
+        |
+        v
+  _prepare_tofu_dir             # copy tofu/cloud_digitalocean/*.tf +
+                                # cloud_init.cfg into
+                                # .playground/state/cloud-digitalocean/<lab>/
+        |
+        v
+================ execute_apply / execute_resume (runner.py) ================
+| tofu-init        (.playground/state/cloud-digitalocean/<lab>/ as cwd)
+| tofu-apply       (-var-file=<lab>.tfvars.json)
+| fetch-vm-ips     (tofu output -json → vm_ips map)
+| render-inventory (pure; ssh_port=22 for all VMs)
+| wait-for-vms-ready  (SHARED) public IP:22 per Droplet
+| ansible-playbook    (SHARED)
+| verify-lab          (SHARED, warning-only)
+============================================================================
+```
+
+### cloud-digitalocean destroy / suspend / reset
+
+```
+destroy / suspend:
+  tofu-destroy  → tag-sweep (list+delete by tag lab:<lab>, re-list survivors)
+
+reset:
+  tofu-destroy  → tag-sweep → clean-state-files
+  (clean-state-files removes per-lab dir + inventory; run logs are kept)
+```
+
+### cloud-digitalocean contract
+
+**Per-lab state directory**: `.playground/state/cloud-digitalocean/<lab>/`
+holds the copied `.tf` sources, `cloud_init.cfg`, `<lab>.tfvars.json`, and
+`terraform.tfstate`. Each lab has its own directory so concurrent cloud labs
+don't clash (unlike the single `tofu/terraform.tfstate` shared by
+local-libvirt).
+
+**Token**: passed to `tofu` via the `DIGITALOCEAN_TOKEN` environment variable
+inherited by the subprocess. The `provider "digitalocean" {}` block in
+`tofu/cloud_digitalocean/versions.tf` has no `token =` field. The
+`render_do_tfvars` allowlist (`_TFVARS_KEYS`) excludes any token-like key.
+Token must not appear in any tfvars file, log event, Diagnostic, or run record.
+
+**`vm_ips` output shape**: `tofu output -json` must emit
+`vm_ips: {vm_name: ip_string}` — a flat map keyed by the bare VM name (e.g.
+`"node1": "203.0.113.10"`). This shape is a hard contract consumed by
+`fetch_vm_ips` and reused unchanged by `render_inventory` and `verify_lab`.
+
+**Lifecycle verbs** beyond apply/destroy:
+
+- `suspend` — destroys all Droplets to stop billing. **Powered-off Droplets
+  still bill on DigitalOcean**, so suspend uses `tofu destroy` (not a
+  power-off API call). Publishes a `log_line` warning before any mutation.
+  Per-lab state (tfvars, tfstate) is **preserved** so `resume` can rebuild.
+- `resume` — re-provisions from config (`execute_apply` path with
+  `operation="resume"`). Publishes a `log_line` warning before mutation: VM
+  disk changes are NOT preserved (no snapshot). `local-libvirt` and
+  `local-vbox` return `runtime.backend.verb_not_supported` for suspend/resume.
+- `reset` — best-effort teardown + `clean-state-files` (removes per-lab dir,
+  inventory, workload staging); run logs are kept. Idempotent: missing paths
+  are silently skipped.
+
+**Tag sweep**: destroy/suspend/reset always run a tag-sweep after
+`tofu destroy`. It lists Droplets by `lab:<lab>` tag, deletes each, then
+re-lists. If any survivors remain the operation exits `status=failed` with
+`runtime.<operation>.orphaned_resource` diagnostics containing the
+DigitalOcean console URL for each orphan. This prevents reporting success
+while paid compute is still running.
+
+**`query_status`**: the source of truth is the live DO API (Droplets tagged
+`lab:<lab>`), not tofu state. Stale state cannot cause a false "no compute"
+reading.
+
+**ssh_port**: always 22. Droplets receive public IPv4 directly; no NAT
+port-forward is involved. `wait_for_vms_ready` and `verify_lab` receive
+`ssh_ports=None`, which both functions treat as "use port 22 for all VMs".
+
 ## Cross-layer pitfalls (things future-you will hit)
 
 These are the gotchas we've already paid for. Each one cost
@@ -431,6 +528,49 @@ timing out after 5 minutes. The escape hatches are
 See [`nested_virtualization.md`](nested_virtualization.md) for the
 escalation ladder, symptom → rung mapping, and how to verify each
 knob landed.
+
+### cloud-digitalocean: token is env-only — never HCL, tfvars, logs, or diagnostics
+
+The `DIGITALOCEAN_TOKEN` value must never appear in any `.tf` file,
+`tfvars.json`, log event, Diagnostic message, or run record. The
+`provider "digitalocean" {}` block has no `token =` field — the
+provider reads it from the environment automatically. The
+`render_do_tfvars` key-allowlist (`_TFVARS_KEYS`) enforces this on
+the Python side; a unit test asserts the allowlist equals the
+variables declared in `variables.tf`. When adding new provider-config
+keys, add them to `_TFVARS_KEYS` only if they belong in `variables.tf`
+— never add a key that carries secret material.
+
+### cloud-digitalocean: tofu state is per-lab, not global
+
+Unlike local-libvirt (single `tofu/terraform.tfstate`), cloud state lives
+under `.playground/state/cloud-digitalocean/<lab>/terraform.tfstate`. Each
+lab is isolated: `playground apply lab-A` and `playground apply lab-B` can
+run on the same machine without overwriting each other's state. If you move
+or rename the per-lab directory the state is lost and `tofu apply` will try
+to create all resources again — use `playground reset` to wipe and start
+clean.
+
+### cloud-digitalocean: suspend≠power-off; the tag sweep is the safety net
+
+DigitalOcean bills powered-off Droplets at the same rate as running ones.
+`playground suspend` therefore runs `tofu destroy` (full deletion), not a
+power-off. After destroy, the tag sweep (`list → delete → re-list`) catches
+any Droplets the provider missed (partial-apply, provider bug, race).
+If survivors remain, `execute_suspend` / `execute_destroy` exit `status=failed`
+with `runtime.<operation>.orphaned_resource` diagnostics and the console URL.
+**Never paper over survivor diagnostics with a no-op** — stranded Droplets
+accrue charges silently.
+
+### cloud-digitalocean: `vm_ips` output shape is a cross-layer contract
+
+`tofu output -json` must emit `vm_ips` as a flat `{vm_name: ipv4_string}` map
+(e.g. `{"node1": "203.0.113.10"}`). `fetch_vm_ips` in `inventory.py` extracts
+`data["vm_ips"]["value"]` and validates every key and value is a string. If
+`outputs.tf` changes this shape (e.g. wraps it in a nested object or renames
+`vm_ips`) `fetch_vm_ips` will return `({}, [diagnostic])`, and apply will fail
+at the "fetch-vm-ips" step with a clear error. Always keep `outputs.tf`'s
+`vm_ips` shape in sync with `fetch_vm_ips`.
 
 ## When to update this doc
 

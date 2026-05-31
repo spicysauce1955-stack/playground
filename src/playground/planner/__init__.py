@@ -11,6 +11,7 @@ The planner does not execute backend commands and does not read state.
 """
 
 from playground.planner.plan import (
+    CostEstimate,
     Plan,
     PlanAction,
     PlanBudget,
@@ -24,6 +25,7 @@ from playground.planner.scheduling import (
 )
 
 __all__ = [
+    "CostEstimate",
     "Plan",
     "PlanAction",
     "PlanBudget",

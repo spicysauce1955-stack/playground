@@ -13,9 +13,13 @@ import typer
 
 from playground.backend.dispatch import (
     SUPPORTED_BACKENDS,
+    estimate_cost,
     execute_apply,
     execute_destroy,
     execute_reset,
+    execute_resume,
+    execute_suspend,
+    plan_provider_summary,
     query_status,
     unsupported_backend_diagnostic,
 )
@@ -129,16 +133,47 @@ def doctor_command(
             ),
         ),
     ] = None,
+    backend: Annotated[
+        str | None,
+        typer.Option(
+            "--backend",
+            help=(
+                "Run backend-specific checks, e.g. cloud-digitalocean. "
+                "When set, only the checks relevant to that backend are run "
+                "(libvirt/vbox host probes are skipped for cloud backends). "
+                "Omit to run the full local-backend suite."
+            ),
+        ),
+    ] = None,
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    state_dir: Annotated[
+        Path,
+        typer.Option("--state-dir", help="State directory for backend state."),
+    ] = Path(".playground"),
 ) -> None:
     """Probe the local host for playground prerequisites.
 
-    Runs a fixed set of read-only checks (PATH binaries, libvirt group,
-    storage pool, SSH key, AppArmor config, ansible collections) and
-    reports each missing prereq as a diagnostic with an actionable fix.
+    Without ``--backend``: runs the full local-backend suite (PATH
+    binaries, libvirt group, storage pool, SSH key, AppArmor config,
+    ansible collections).
+
+    With ``--backend cloud-digitalocean``: runs a cloud-focused subset —
+    token env-var present, no committed token in Git, tofu installed,
+    SSH key, ansible collections, state dir writable, and provider config
+    checks.  Libvirt/vbox/KVM host probes are skipped.
+
     Exits 0 when no errors fire; 1 if any check returned an error.
     Warnings never block the exit code.
     """
-    diagnostics = run_doctor_checks(ssh_key_path=ssh_key)
+    diagnostics = run_doctor_checks(
+        ssh_key_path=ssh_key,
+        backend=backend,
+        config_dir=config_dir,
+        state_dir=state_dir,
+    )
 
     if output is OutputFormat.json:
         _print_json(
@@ -363,16 +398,24 @@ def plan_command(
     _print_warnings(diagnostics)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
-    plan = render_plan(resolved, warnings=warnings)
+    cost = estimate_cost(resolved, config_dir=config_dir)
+    provider_summary = plan_provider_summary(resolved, config_dir=config_dir)
+    plan = render_plan(resolved, warnings=warnings, cost_estimate=cost)
 
     if output is OutputFormat.json:
-        _print_json(plan.model_dump(mode="json"))
+        payload = plan.model_dump(mode="json")
+        payload["provider"] = provider_summary
+        _print_json(payload)
         return
 
-    _render_plan_human(plan)
+    _render_plan_human(plan, provider_summary=provider_summary)
 
 
-def _render_plan_human(plan: Plan) -> None:
+def _render_plan_human(
+    plan: Plan,
+    *,
+    provider_summary: dict[str, str] | None = None,
+) -> None:
     typer.echo(f"Plan for lab {plan.lab_name!r} (backend: {plan.backend})")
     if plan.offline:
         typer.echo("  offline: true")
@@ -395,6 +438,13 @@ def _render_plan_human(plan: Plan) -> None:
             typer.echo(f"  + {action.name}  {action.summary}")
         typer.echo("")
 
+    if provider_summary is not None:
+        typer.echo(f"Provider ({plan.backend}):")
+        for key, value in provider_summary.items():
+            display_key = key.replace("_", " ")
+            typer.echo(f"  {display_key}: {value}")
+        typer.echo("")
+
     budget = plan.budget
     limits = budget.limits
     typer.echo("Budget:")
@@ -410,6 +460,14 @@ def _render_plan_human(plan: Plan) -> None:
         f"{limits.max_containers} workloads"
     )
     typer.echo(f"  fits: {'yes' if budget.fits else 'NO'}")
+
+    if plan.cost_estimate is not None:
+        ce = plan.cost_estimate
+        typer.echo("")
+        typer.echo("Cost (estimated):")
+        typer.echo(f"  ~${ce.hourly_usd:.4f}/hr  ~${ce.monthly_usd:.2f}/mo")
+        if ce.note:
+            typer.echo(f"  {ce.note}")
 
 
 @tofu_app.command("render")
@@ -1119,6 +1177,161 @@ def reset_command(
     typer.echo(f"reset lab {lab!r}")
     typer.echo(f"  run: {finished.run_id}")
     typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
+
+
+@app.command("suspend")
+def suspend_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to suspend.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Suspend ``lab`` by destroying its Droplets to stop billing.
+
+    DigitalOcean charges for powered-off Droplets; this command destroys
+    them (``tofu destroy``) then sweeps for any orphaned tagged resources.
+    Local state and run history are preserved so ``playground resume`` can
+    rebuild from the same config.
+
+    NOTE: Droplets are destroyed, not snapshotted. Any in-VM disk changes
+    since the last apply are not preserved.
+
+    ``suspend`` is only meaningful for cloud backends. Local backend labs
+    will receive a ``runtime.backend.verb_not_supported`` error.
+    """
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
+
+    bus = EventBus()
+    finished, diagnostics = execute_suspend(
+        resolved=resolved,
+        state_dir=state_dir,
+        tofu_dir=tofu_dir,
+        bus=bus,
+    )
+
+    if finished is None:
+        # Backend does not support suspend (local backends).
+        _exit_on_errors(diagnostics, output, json_errors=False)
+        return
+
+    if finished.status == "failed":
+        _present_apply_failure(output, finished, diagnostics, state_dir)
+        raise typer.Exit(code=1)
+
+    if output is OutputFormat.json:
+        _print_json(finished.model_dump(mode="json", exclude_none=True))
+        return
+
+    typer.echo(f"suspended lab {lab!r}")
+    typer.echo("  note: Droplets were destroyed to stop billing; disk state is not preserved")
+    typer.echo(f"  run: {finished.run_id}")
+    typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
+
+
+@app.command("resume")
+def resume_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to resume.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    ansible_dir: Annotated[
+        Path,
+        typer.Option("--ansible-dir", help="Ansible directory (containing site.yml)."),
+    ] = Path("ansible"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Resume a previously suspended ``lab`` by rebuilding its Droplets.
+
+    Rebuilds Droplets from the current config (``tofu apply``) and re-runs
+    readiness checks and Ansible provisioning. This is equivalent to
+    ``apply`` on a lab that was suspended.
+
+    NOTE: Droplets are created from the base image; VM disk changes from
+    before the suspend are not preserved (no snapshot).
+
+    ``resume`` is only meaningful for cloud backends. Local backend labs
+    will receive a ``runtime.backend.verb_not_supported`` error.
+    """
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
+
+    bus = EventBus()
+    finished, diagnostics = execute_resume(
+        resolved=resolved,
+        state_dir=state_dir,
+        tofu_dir=tofu_dir,
+        ansible_dir=ansible_dir,
+        config_dir=config_dir,
+        bus=bus,
+    )
+
+    if finished is None:
+        # Backend does not support resume (local backends).
+        _exit_on_errors(diagnostics, output, json_errors=False)
+        return
+
+    if finished.status == "failed":
+        _present_apply_failure(output, finished, diagnostics, state_dir)
+        raise typer.Exit(code=1)
+
+    if output is OutputFormat.json:
+        payload = finished.model_dump(mode="json", exclude_none=True)
+        if diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in diagnostics]
+        _print_json(payload)
+        return
+
+    if diagnostics:
+        _print_diagnostics(diagnostics, err=True)
+    typer.echo(f"resumed lab {lab!r}")
+    typer.echo(f"  run: {finished.run_id}")
+    typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
+    for step in finished.steps:
+        typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
 
 
 def _present_apply_failure(

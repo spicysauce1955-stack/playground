@@ -1,0 +1,49 @@
+# cloud-smoke — minimal single-VM cloud lab
+#
+# Requires:  export DIGITALOCEAN_TOKEN=<your-token>  before apply.
+#
+# The declared network is advisory in this slice (Slice 1): the
+# DigitalOcean adapter does not yet wire it to a VPC.  The Droplet
+# receives a public IP directly from DigitalOcean.
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: cloud-smoke
+  description: |
+    Minimal single-VM smoke lab for the cloud-digitalocean backend.
+    Provisions one docker-host Droplet on DigitalOcean via OpenTofu.
+    Exercises validate and plan without requiring libvirtd or a token.
+  tags: [cloud, digitalocean, smoke]
+
+spec:
+  backend: cloud-digitalocean
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 4
+    max_memory_mb: 4096
+    max_disk_gb: 100
+    max_vms: 2
+    max_containers: 10
+
+  networks:
+    - name: lab-net
+      profile: nat
+      cidr: 10.60.0.0/24
+
+  vms:
+    - name: node1
+      role: docker-host
+      networks: [lab-net]
+      resources:
+        vcpu: 1
+        memory_mb: 1024
+        disk_gb: 25
+
+  providers:
+    cloud-digitalocean:
+      # Lab-level overrides for the provider defaults in
+      # config/providers/cloud-digitalocean.yaml.
+      region: nyc3
+      size: s-1vcpu-1gb

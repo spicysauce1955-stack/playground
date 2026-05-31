@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
 from playground.models.diagnostic import Diagnostic, SourceLocation
-from playground.planner import render_plan
+from playground.planner import CostEstimate, render_plan
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
@@ -208,3 +208,104 @@ def test_render_plan_workload_target_vm(resolved_generic_infra) -> None:
 
     workload = next(a for a in plan.actions if a.resource_type == "workload")
     assert workload.summary == "compose -> vm:docker1"
+
+
+# ---------------------------------------------------------------------------
+# CostEstimate tests
+# ---------------------------------------------------------------------------
+
+
+def test_render_plan_cost_estimate_default_is_none(resolved_generic_infra) -> None:
+    """No cost_estimate passed → Plan.cost_estimate is None."""
+    plan = render_plan(resolved_generic_infra)
+
+    assert plan.cost_estimate is None
+
+
+def test_render_plan_cost_estimate_forwarded_when_provided(
+    resolved_generic_infra,
+) -> None:
+    """When a CostEstimate is passed, render_plan stores it verbatim."""
+    estimate = CostEstimate(
+        hourly_usd=0.0089,
+        monthly_usd=6.0,
+        note="estimated; verify at digitalocean.com/pricing",
+    )
+
+    plan = render_plan(resolved_generic_infra, cost_estimate=estimate)
+
+    assert plan.cost_estimate is estimate
+    assert plan.cost_estimate.hourly_usd == 0.0089
+    assert plan.cost_estimate.monthly_usd == 6.0
+    assert plan.cost_estimate.note == "estimated; verify at digitalocean.com/pricing"
+    assert plan.cost_estimate.advisory is True
+
+
+def test_render_plan_cost_estimate_advisory_flag_default(
+    resolved_generic_infra,
+) -> None:
+    """CostEstimate.advisory defaults to True."""
+    estimate = CostEstimate(hourly_usd=0.0, monthly_usd=0.0)
+
+    assert estimate.advisory is True
+
+
+def test_render_plan_cost_estimate_note_defaults_empty(
+    resolved_generic_infra,
+) -> None:
+    """CostEstimate.note defaults to an empty string."""
+    estimate = CostEstimate(hourly_usd=0.01, monthly_usd=7.0)
+
+    assert estimate.note == ""
+
+
+def test_render_plan_cost_estimate_model_dump_round_trips(
+    resolved_generic_infra,
+) -> None:
+    """model_dump(mode='json') includes cost_estimate fields cleanly."""
+    estimate = CostEstimate(
+        hourly_usd=0.0089,
+        monthly_usd=6.00,
+        note="advisory",
+        advisory=True,
+    )
+
+    plan = render_plan(resolved_generic_infra, cost_estimate=estimate)
+    data = plan.model_dump(mode="json")
+
+    assert data["cost_estimate"] == {
+        "hourly_usd": 0.0089,
+        "monthly_usd": 6.0,
+        "note": "advisory",
+        "advisory": True,
+    }
+
+
+def test_render_plan_no_cost_estimate_serializes_null(
+    resolved_generic_infra,
+) -> None:
+    """When cost_estimate is None, model_dump emits cost_estimate: null."""
+    plan = render_plan(resolved_generic_infra)
+    data = plan.model_dump(mode="json")
+
+    assert "cost_estimate" in data
+    assert data["cost_estimate"] is None
+
+
+def test_cost_estimate_is_frozen(resolved_generic_infra) -> None:
+    """CostEstimate is immutable (inherits frozen=True from StrictModel)."""
+    estimate = CostEstimate(hourly_usd=0.01, monthly_usd=7.0)
+
+    with pytest.raises(ValidationError):
+        estimate.hourly_usd = 99.0  # type: ignore[misc]
+
+
+def test_render_plan_does_not_compute_cost_estimate_itself(
+    resolved_generic_infra,
+) -> None:
+    """render_plan must stay pure: it never imports a backend or sets cost."""
+    # Call with no cost_estimate argument and verify it stays None —
+    # the function must not silently populate the field from any backend.
+    plan = render_plan(resolved_generic_infra)
+
+    assert plan.cost_estimate is None

@@ -1,0 +1,215 @@
+"""DigitalOcean API credentials and thin HTTP client.
+
+Credential rule is absolute: the token value is **never** logged, returned
+in a Diagnostic, put in an exception message, or passed as a subprocess
+argument.  The only external surface is ``token_env_name`` (the NAME of the
+env-var, not its value) and the boolean ``token_present``.
+
+The HTTP call is isolated behind ``_request`` — a module-level function that
+can be monkeypatched in tests.  Tests never need a real network connection.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import httpx
+
+from playground.models.diagnostic import Diagnostic, SourceLocation
+from playground.models.resolved import ResolvedLab
+
+# ---------------------------------------------------------------------------
+# Credential helpers
+# ---------------------------------------------------------------------------
+
+DEFAULT_TOKEN_ENV = "DIGITALOCEAN_TOKEN"
+
+CONSOLE_URL = "https://cloud.digitalocean.com/droplets/{id}"
+
+
+def token_env_name(resolved: ResolvedLab) -> str:
+    """Return the env-var NAME that holds the DigitalOcean API token.
+
+    Reads ``spec.providers.<backend>.token_env`` from the lab if set,
+    otherwise falls back to :data:`DEFAULT_TOKEN_ENV`.  Always returns the
+    NAME of the variable, never its value.
+    """
+    return (
+        resolved.providers.get(resolved.backend, {}).get("token_env")
+        or DEFAULT_TOKEN_ENV
+    )
+
+
+def read_token(resolved: ResolvedLab) -> str | None:
+    """Read the API token from the environment.  Never logs or returns the value
+    in any error path — only used internally by ``list_droplets_by_tag`` and
+    ``delete_droplet``.
+    """
+    return os.environ.get(token_env_name(resolved))
+
+
+def token_present(resolved: ResolvedLab) -> bool:
+    """Return True if the API token env-var is set and non-empty."""
+    return bool(read_token(resolved))
+
+
+# ---------------------------------------------------------------------------
+# HTTP seam (monkeypatchable)
+# ---------------------------------------------------------------------------
+
+
+def _request(
+    method: str,
+    path: str,
+    token: str,
+    *,
+    params: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Execute one HTTP request against the DigitalOcean API.
+
+    Returns ``(status_code, parsed_body)``.  On any transport error or JSON
+    decode failure returns ``(0, {})``.
+
+    The ``Authorization: Bearer <token>`` header is set here and NEVER
+    logged.  Callers must not log the ``token`` argument either.
+    """
+    try:
+        with httpx.Client(
+            base_url="https://api.digitalocean.com",
+            timeout=15,
+        ) as client:
+            response = client.request(
+                method,
+                path,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            try:
+                body: dict[str, Any] = response.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            return response.status_code, body
+    except Exception:  # noqa: BLE001 — transport error; caller handles (0, {})
+        return 0, {}
+
+
+# ---------------------------------------------------------------------------
+# API wrappers
+# ---------------------------------------------------------------------------
+
+
+def list_droplets_by_tag(
+    token: str,
+    tag: str,
+) -> tuple[list[dict[str, Any]], list[Diagnostic]]:
+    """GET /v2/droplets?tag_name=<tag>&per_page=200.
+
+    Returns ``(droplets, diagnostics)``.  On a non-2xx response or transport
+    failure returns ``([], [warning_diagnostic])``.  The warning message
+    deliberately contains no token value.
+    """
+    status, body = _request(
+        "GET",
+        "/v2/droplets",
+        token,
+        params={"tag_name": tag, "per_page": 200},
+    )
+    if status == 0 or status >= 300:
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message=(
+                    f"DigitalOcean API returned status {status} when listing "
+                    f"Droplets by tag {tag!r}; state may be stale"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "check that $DIGITALOCEAN_TOKEN is valid and the account "
+                    "has read access; retry or inspect the console at "
+                    "https://cloud.digitalocean.com"
+                ),
+            )
+        ]
+    droplets = body.get("droplets", [])
+    if not isinstance(droplets, list):
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message=(
+                    f"DigitalOcean API response for tag {tag!r} had unexpected "
+                    "shape (missing 'droplets' list)"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ]
+    return droplets, []
+
+
+def delete_droplet(
+    token: str,
+    droplet_id: int | str,
+) -> list[Diagnostic]:
+    """DELETE /v2/droplets/<id>.
+
+    Treats 204 (deleted) and 404 (already gone) as success — idempotent.
+    Other status codes produce a warning diagnostic without the token value.
+    """
+    status, _ = _request("DELETE", f"/v2/droplets/{droplet_id}", token)
+    if status in (204, 404, 0):
+        # 204 = deleted, 404 = already gone, 0 = transport error we tolerate
+        # (the tag-sweep will catch survivors).
+        return []
+    if status != 0 and status not in (204, 404):
+        return [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message=(
+                    f"DigitalOcean API returned status {status} when deleting "
+                    f"Droplet {droplet_id}; resource may still be running"
+                ),
+                source=SourceLocation(path=f"droplet/{droplet_id}"),
+                suggestion=(
+                    f"remove manually at "
+                    f"{CONSOLE_URL.format(id=droplet_id)}"
+                ),
+            )
+        ]
+    return []
+
+
+def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
+    """Extract ``{name, id, status, public_ipv4}`` from a raw droplet dict.
+
+    ``public_ipv4`` is the first ``networks.v4`` entry whose ``type`` is
+    ``"public"``, or ``None`` when no public IPv4 is present.
+    """
+    networks_v4: list[dict[str, Any]] = (
+        (d.get("networks") or {}).get("v4") or []
+    )
+    public_ipv4: str | None = None
+    for net in networks_v4:
+        if net.get("type") == "public":
+            public_ipv4 = net.get("ip_address")
+            break
+    return {
+        "name": d.get("name"),
+        "id": d.get("id"),
+        "status": d.get("status"),
+        "public_ipv4": public_ipv4,
+    }
+
+
+__all__ = [
+    "CONSOLE_URL",
+    "DEFAULT_TOKEN_ENV",
+    "delete_droplet",
+    "droplet_summary",
+    "list_droplets_by_tag",
+    "read_token",
+    "token_env_name",
+    "token_present",
+]

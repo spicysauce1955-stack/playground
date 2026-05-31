@@ -235,3 +235,29 @@ def test_unknown_lab_raises_keyerror() -> None:
     assert diagnostics == []
     with pytest.raises(KeyError):
         resolve_lab(loaded, "never-defined")
+
+
+def test_cloud_smoke_resolves_with_correct_backend_and_no_errors() -> None:
+    """cloud-smoke resolves to a ResolvedLab with backend=cloud-digitalocean
+    and produces no error diagnostics.  Requires no libvirtd, no token."""
+    from playground.validation import validate as validate_loaded_config
+
+    loaded, load_diagnostics = load_config(CONFIG_DIR)
+    assert load_diagnostics == [], f"unexpected load diagnostics: {load_diagnostics}"
+
+    validation_diagnostics = validate_loaded_config(loaded, ansible_roles_dir=None)
+    errors = [d for d in validation_diagnostics if d.severity == "error"]
+    assert errors == [], f"unexpected validation errors: {errors}"
+
+    resolved = resolve_lab(loaded, "cloud-smoke")
+
+    assert resolved.backend == "cloud-digitalocean"
+    assert resolved.lab_name == "cloud-smoke"
+    assert len(resolved.vms) == 1
+    assert resolved.vms[0].name == "node1"
+    assert resolved.vms[0].role == "docker-host"
+    assert resolved.vms[0].vcpu == 1
+    assert resolved.vms[0].memory_mb == 1024
+    assert resolved.vms[0].disk_gb == 25
+    assert len(resolved.networks) == 1
+    assert resolved.networks[0].name == "lab-net"
