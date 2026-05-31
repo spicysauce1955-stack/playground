@@ -292,6 +292,7 @@ def test_apply_happy_path(
     content_lower = tfvars_path.read_text().lower()
     assert "token" not in content_lower, f"Unexpected 'token' in tfvars: {content_lower!r}"
 
+
     # --- inventory written ---
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     assert inventory_path.exists()
@@ -308,6 +309,54 @@ def test_apply_happy_path(
     run_json_text = run_json_path.read_text().lower()
     assert FAKE_TOKEN.lower() not in run_json_text
     assert "dop_v1" not in run_json_text
+
+
+def test_apply_passes_absolute_var_file_to_tofu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """Regression: the ``-var-file`` handed to tofu must be ABSOLUTE.
+
+    ``tofu apply`` runs with ``cwd=<per-lab dir>``. When ``state_dir`` is
+    relative (the CLI default is ``.playground``), a relative var-file path
+    resolves *inside* the per-lab dir and tofu fails with "variables file
+    ... does not exist". A live apply caught this; the previously-mocked
+    tests never exercised the real cwd/path resolution. Use a relative
+    ``state_dir`` here (chdir'd into a tmp cwd) so the bug would reappear.
+    """
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    monkeypatch.chdir(tmp_path)
+    _install_shims(monkeypatch)
+
+    captured: dict[str, Path] = {}
+
+    def capturing_apply(tofu_dir, var_file, log_path, *, bus, run_id):
+        captured["var_file"] = Path(var_file)
+        return _ok_step("tofu-apply", Path(log_path)), []
+
+    monkeypatch.setattr(
+        "playground.backend.cloud_digitalocean.runner.run_tofu_apply",
+        capturing_apply,
+    )
+
+    run, _ = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=Path(".playground"),  # relative on purpose
+        tofu_dir=source_root.resolve(),
+        ansible_dir=ansible_dir.resolve(),
+        config_dir=CONFIG_DIR.resolve(),
+        bus=EventBus(),
+    )
+
+    assert run is not None and run.status == "succeeded"
+    assert "var_file" in captured
+    assert captured["var_file"].is_absolute(), (
+        "-var-file must be absolute so tofu (cwd=per-lab dir) can find it; "
+        f"got {captured['var_file']!r}"
+    )
 
 
 # ===========================================================================

@@ -168,7 +168,7 @@ def execute_reset(
     bus.publish(run.run_id, "operation_started", {"operation": "reset", "lab": lab})
 
     per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
-    var_file = per_lab_dir / f"{lab}.tfvars.json"
+    var_file = (per_lab_dir / f"{lab}.tfvars.json").resolve()
     source_root = tofu_dir / "cloud_digitalocean"
 
     steps: list[StepResult] = []
@@ -308,7 +308,7 @@ def _provision(
 
     per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
     source_root = tofu_dir / "cloud_digitalocean"
-    var_file = per_lab_dir / f"{lab}.tfvars.json"
+    var_file = (per_lab_dir / f"{lab}.tfvars.json").resolve()
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
 
     runs_dir = state_dir / "runs"
@@ -540,7 +540,7 @@ def _teardown(
 
     per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
     source_root = tofu_dir / "cloud_digitalocean"
-    var_file = per_lab_dir / f"{lab}.tfvars.json"
+    var_file = (per_lab_dir / f"{lab}.tfvars.json").resolve()
 
     # Build the plan using merged provider settings (same merge logic as
     # apply) so destroy-time tfvars match what apply used.
