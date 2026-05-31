@@ -205,11 +205,11 @@ def _install_shims(
     def fake_list_droplets_by_tag(token, tag):
         _call_count["list"] += 1
         if _call_count["list"] == 1:
-            return list(list_droplets_return), []
+            return list(list_droplets_return), [], True
         # Second call (survivors check)
         if list_droplets_survivors is not None:
-            return list(list_droplets_survivors), []
-        return [], []
+            return list(list_droplets_survivors), [], True
+        return [], [], True
 
     def fake_schedule_workloads(resolved):
         return {vm.name: [] for vm in resolved.vms}, []
@@ -682,3 +682,366 @@ def test_no_token_in_run_record_or_events(
             assert FAKE_TOKEN not in text, (
                 f"Token value leaked into {fpath.relative_to(state_dir)}"
             )
+
+
+# ===========================================================================
+# Bug 1 — tag-sweep re-list failure → inconclusive, run must fail
+# ===========================================================================
+
+
+def _install_shims_with_relist_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    list_droplets_return: list[dict[str, Any]] | None = None,
+) -> None:
+    """Like _install_shims but the second list call (re-list) FAILS (ok=False)."""
+    if list_droplets_return is None:
+        list_droplets_return = []
+
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    _call_count: dict[str, int] = {"list": 0}
+    MOD = "playground.backend.cloud_digitalocean.runner"
+
+    def fake_run_tofu_init(tofu_dir, log_path, *, bus, run_id):
+        return _ok_step("tofu-init", Path(log_path)), []
+
+    def fake_run_tofu_destroy(tofu_dir, var_file, log_path, *, bus, run_id):
+        return _ok_step("tofu-destroy", Path(log_path)), []
+
+    def fake_list_droplets_by_tag(token, tag):
+        _call_count["list"] += 1
+        if _call_count["list"] == 1:
+            # First pass: success, return the configured droplets to delete.
+            return list(list_droplets_return), [], True
+        # Second pass (re-list): simulate API failure.
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message="connection timed out during re-list",
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ], False
+
+    monkeypatch.setattr(f"{MOD}.run_tofu_init", fake_run_tofu_init)
+    monkeypatch.setattr(f"{MOD}.run_tofu_destroy", fake_run_tofu_destroy)
+    monkeypatch.setattr(f"{MOD}.list_droplets_by_tag", fake_list_droplets_by_tag)
+
+
+def test_tag_sweep_relist_failure_destroy_is_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """When the re-list after deletes FAILS (API error), the sweep is inconclusive.
+    The destroy operation must be marked FAILED (not succeeded) so the operator
+    is alerted that billing state is unknown."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims_with_relist_failure(monkeypatch, list_droplets_return=[])
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+
+    bus = EventBus()
+    run, diags = execute_destroy(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "failed", (
+        "destroy must be FAILED when re-list is inconclusive"
+    )
+    # sweep_inconclusive diagnostic must be present
+    inconclusive_ids = [d.id for d in diags if "sweep_inconclusive" in d.id]
+    assert inconclusive_ids, (
+        f"Expected sweep_inconclusive diagnostic; got: {[d.id for d in diags]}"
+    )
+
+
+def test_tag_sweep_relist_failure_suspend_is_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """Same as destroy: suspend must be FAILED when re-list is inconclusive."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims_with_relist_failure(monkeypatch, list_droplets_return=[])
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+
+    bus = EventBus()
+    run, diags = execute_suspend(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "failed", (
+        "suspend must be FAILED when re-list is inconclusive"
+    )
+    inconclusive_ids = [d.id for d in diags if "sweep_inconclusive" in d.id]
+    assert inconclusive_ids
+
+
+def _install_shims_with_first_list_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shims where the FIRST list call (before any deletes) FAILS."""
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    MOD = "playground.backend.cloud_digitalocean.runner"
+
+    def fake_run_tofu_init(tofu_dir, log_path, *, bus, run_id):
+        return _ok_step("tofu-init", Path(log_path)), []
+
+    def fake_run_tofu_destroy(tofu_dir, var_file, log_path, *, bus, run_id):
+        return _ok_step("tofu-destroy", Path(log_path)), []
+
+    def fake_list_droplets_by_tag(token, tag):
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message="connection refused",
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ], False
+
+    monkeypatch.setattr(f"{MOD}.run_tofu_init", fake_run_tofu_init)
+    monkeypatch.setattr(f"{MOD}.run_tofu_destroy", fake_run_tofu_destroy)
+    monkeypatch.setattr(f"{MOD}.list_droplets_by_tag", fake_list_droplets_by_tag)
+
+
+def test_tag_sweep_first_list_failure_destroy_is_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """When the INITIAL listing fails, sweep is inconclusive and destroy fails."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims_with_first_list_failure(monkeypatch)
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+
+    bus = EventBus()
+    run, diags = execute_destroy(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "failed", (
+        "destroy must be FAILED when initial list is inconclusive"
+    )
+    inconclusive_ids = [d.id for d in diags if "sweep_inconclusive" in d.id]
+    assert inconclusive_ids
+
+
+# ===========================================================================
+# Bug 2 — execute_reset: survivors/inconclusive → fail + no state deletion
+# ===========================================================================
+
+
+def test_reset_with_surviving_droplet_fails_and_preserves_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """When the tag-sweep reports survivors, execute_reset must:
+    1. Return status='failed' (not succeeded).
+    2. NOT delete the per-lab dir or inventory (operator's only handle to live
+       resources).
+    """
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+
+    survivor = {"id": 99, "name": "cloud-smoke-node1", "status": "active", "networks": {}}
+    _install_shims(
+        monkeypatch,
+        list_droplets_return=[survivor],
+        list_droplets_survivors=[survivor],
+    )
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+    (per_lab_dir / "terraform.tfstate").write_text('{"version":4}')
+
+    inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
+    inventory_path.parent.mkdir(parents=True)
+    inventory_path.write_text("[playground]\nnode1 ansible_host=1.2.3.4\n")
+
+    bus = EventBus()
+    run, diags = execute_reset(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "failed", (
+        "reset must FAIL when tagged Droplets still survive"
+    )
+    # Per-lab state files must NOT be deleted — they're needed to clean up.
+    assert per_lab_dir.exists(), (
+        "per-lab dir must be preserved when reset fails (operator needs it)"
+    )
+    assert inventory_path.exists(), (
+        "inventory must be preserved when reset fails (operator needs it)"
+    )
+
+
+def test_reset_with_inconclusive_sweep_fails_and_preserves_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """When the tag-sweep is inconclusive (API error during re-list), execute_reset
+    must fail and NOT delete state files."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims_with_relist_failure(monkeypatch, list_droplets_return=[])
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+
+    inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
+    inventory_path.parent.mkdir(parents=True)
+    inventory_path.write_text("[playground]\n")
+
+    bus = EventBus()
+    run, diags = execute_reset(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "failed", (
+        "reset must FAIL when sweep is inconclusive"
+    )
+    assert per_lab_dir.exists(), (
+        "per-lab dir must be preserved when reset sweep is inconclusive"
+    )
+    assert inventory_path.exists(), (
+        "inventory must be preserved when reset sweep is inconclusive"
+    )
+    # clean-state-files step must NOT appear in run steps
+    step_names = [s.name for s in run.steps]
+    assert "clean-state-files" not in step_names, (
+        "clean-state-files must NOT run when teardown is not confirmed clean"
+    )
+
+
+def test_reset_clean_sweep_succeeds_and_deletes_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """Happy-path reset: no survivors, no API error → succeeded and state deleted."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims(monkeypatch, list_droplets_return=[], list_droplets_survivors=[])
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+
+    inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
+    inventory_path.parent.mkdir(parents=True)
+    inventory_path.write_text("[playground]\n")
+
+    bus = EventBus()
+    run, diags = execute_reset(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "succeeded"
+    assert not per_lab_dir.exists(), "per-lab dir must be removed on clean reset"
+    assert not inventory_path.exists(), "inventory must be removed on clean reset"
+    step_names = [s.name for s in run.steps]
+    assert "clean-state-files" in step_names
+
+
+# ===========================================================================
+# Bug 5 — teardown uses merged provider settings (config_dir threaded through)
+# ===========================================================================
+
+
+def test_teardown_uses_merged_provider_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+) -> None:
+    """destroy must write tfvars using the merged provider settings (same as
+    apply), not just the bare lab provider overrides.  Verify that the region
+    written to tfvars comes from the provider config when the lab omits it."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims(monkeypatch, list_droplets_return=[], list_droplets_survivors=[])
+
+    state_dir = tmp_path / ".playground"
+    lab = resolved_cloud_smoke.lab_name
+    per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
+    per_lab_dir.mkdir(parents=True)
+    (per_lab_dir / "main.tf").write_text("terraform {}")
+
+    bus = EventBus()
+    run, _ = execute_destroy(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        bus=bus,
+        config_dir=CONFIG_DIR,
+    )
+    assert run is not None
+    assert run.status == "succeeded"
+
+    # The tfvars written by _teardown must contain the region field from the
+    # merged provider config (the cloud-smoke lab uses nyc3 via provider config).
+    import json
+    tfvars_path = per_lab_dir / f"{lab}.tfvars.json"
+    assert tfvars_path.exists(), "tfvars must be written by teardown"
+    tfvars = json.loads(tfvars_path.read_text())
+    # The merged settings include region="nyc3" from the provider config.
+    assert tfvars.get("region") == "nyc3", (
+        f"expected region='nyc3' from merged provider settings; got {tfvars.get('region')!r}"
+    )

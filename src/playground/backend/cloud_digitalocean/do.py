@@ -102,12 +102,18 @@ def _request(
 def list_droplets_by_tag(
     token: str,
     tag: str,
-) -> tuple[list[dict[str, Any]], list[Diagnostic]]:
+) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
     """GET /v2/droplets?tag_name=<tag>&per_page=200.
 
-    Returns ``(droplets, diagnostics)``.  On a non-2xx response or transport
-    failure returns ``([], [warning_diagnostic])``.  The warning message
-    deliberately contains no token value.
+    Returns ``(droplets, diagnostics, ok)``.
+
+    - Genuine empty list: ``([], [], True)``.
+    - Success with results: ``([...], [], True)``.
+    - API or transport failure: ``([], [warning_diagnostic], False)``.
+
+    The ``ok`` flag is the authoritative signal: callers **must not** treat
+    a failure ``([], [...], False)`` as "no Droplets found".  The warning
+    message deliberately contains no token value.
     """
     status, body = _request(
         "GET",
@@ -131,7 +137,7 @@ def list_droplets_by_tag(
                     "https://cloud.digitalocean.com"
                 ),
             )
-        ]
+        ], False
     droplets = body.get("droplets", [])
     if not isinstance(droplets, list):
         return [], [
@@ -144,8 +150,8 @@ def list_droplets_by_tag(
                 ),
                 source=SourceLocation(path="DigitalOcean API"),
             )
-        ]
-    return droplets, []
+        ], False
+    return droplets, [], True
 
 
 def delete_droplet(
@@ -155,30 +161,32 @@ def delete_droplet(
     """DELETE /v2/droplets/<id>.
 
     Treats 204 (deleted) and 404 (already gone) as success — idempotent.
-    Other status codes produce a warning diagnostic without the token value.
+    Status 0 (transport error) and any other non-2xx status produce a warning
+    diagnostic without the token value; the tag-sweep re-list will determine
+    whether the Droplet actually persists.
     """
     status, _ = _request("DELETE", f"/v2/droplets/{droplet_id}", token)
-    if status in (204, 404, 0):
-        # 204 = deleted, 404 = already gone, 0 = transport error we tolerate
-        # (the tag-sweep will catch survivors).
+    if status in (204, 404):
+        # 204 = deleted, 404 = already gone — both are definitive success.
         return []
-    if status != 0 and status not in (204, 404):
-        return [
-            Diagnostic(
-                id="runtime.cloud.api_error",
-                severity="warning",
-                message=(
-                    f"DigitalOcean API returned status {status} when deleting "
-                    f"Droplet {droplet_id}; resource may still be running"
-                ),
-                source=SourceLocation(path=f"droplet/{droplet_id}"),
-                suggestion=(
-                    f"remove manually at "
-                    f"{CONSOLE_URL.format(id=droplet_id)}"
-                ),
-            )
-        ]
-    return []
+    # Status 0 is a transport error; all other values are unexpected HTTP
+    # responses.  In either case the Droplet's fate is unknown — return a
+    # warning so the caller's tag-sweep re-list can determine survivors.
+    return [
+        Diagnostic(
+            id="runtime.cloud.api_error",
+            severity="warning",
+            message=(
+                f"DigitalOcean API returned status {status} when deleting "
+                f"Droplet {droplet_id}; resource may still be running"
+            ),
+            source=SourceLocation(path=f"droplet/{droplet_id}"),
+            suggestion=(
+                f"remove manually at "
+                f"{CONSOLE_URL.format(id=droplet_id)}"
+            ),
+        )
+    ]
 
 
 def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:

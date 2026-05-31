@@ -63,7 +63,7 @@ def test_query_status_no_token_does_not_call_api(
 
     def fake_list(token, tag):
         called.append((token, tag))
-        return [], []
+        return [], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     query_status(resolved_cloud_smoke)
@@ -92,7 +92,7 @@ def test_query_status_active_droplet_is_running(
                     "v4": [{"type": "public", "ip_address": "1.2.3.4"}]
                 },
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, diags = query_status(resolved_cloud_smoke)
@@ -122,7 +122,7 @@ def test_query_status_off_droplet_is_provisioned(
                 "status": "off",
                 "networks": {"v4": []},
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -141,7 +141,7 @@ def test_query_status_missing_droplet_is_missing(
     monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
 
     def fake_list(token, tag):
-        return [], []
+        return [], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -167,7 +167,7 @@ def test_query_status_unknown_droplet_in_unknown_vms(
                 "status": "active",
                 "networks": {"v4": []},
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -189,7 +189,7 @@ def test_query_status_declared_vm_not_in_unknown_vms(
                 "status": "active",
                 "networks": {"v4": [{"type": "public", "ip_address": "5.5.5.5"}]},
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -214,7 +214,7 @@ def test_query_status_provisioned_vms_count(resolved_cloud_smoke, monkeypatch):
                 "status": "active",
                 "networks": {"v4": [{"type": "public", "ip_address": "9.9.9.9"}]},
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -231,7 +231,7 @@ def test_query_status_expected_vms_matches_lab(resolved_cloud_smoke, monkeypatch
 
     monkeypatch.setattr(
         status_module, "list_droplets_by_tag",
-        lambda token, tag: ([], []),
+        lambda token, tag: ([], [], True),
     )
     lab_status, _ = query_status(resolved_cloud_smoke)
     assert lab_status.expected_vms == len(resolved_cloud_smoke.vms)
@@ -260,7 +260,7 @@ def test_query_status_non_conforming_name_in_unknown_vms(
                 "status": "active",
                 "networks": {"v4": []},
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -286,7 +286,7 @@ def test_query_status_unknown_vms_uses_unprefixed_name_for_conforming(
                 "status": "active",
                 "networks": {"v4": []},
             }
-        ], []
+        ], [], True
 
     monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
     lab_status, _ = query_status(resolved_cloud_smoke)
@@ -294,3 +294,111 @@ def test_query_status_unknown_vms_uses_unprefixed_name_for_conforming(
     # "<lab>-extra-node".
     assert "extra-node" in lab_status.unknown_vms
     assert f"{lab}-extra-node" not in lab_status.unknown_vms
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 — API failure must surface as error, not silent all-missing
+# ---------------------------------------------------------------------------
+
+
+def test_query_status_api_failure_returns_provider_unreachable_error(
+    resolved_cloud_smoke, monkeypatch
+):
+    """When list_droplets_by_tag returns ok=False (API error), query_status
+    must emit a runtime.status.provider_unreachable error diagnostic rather
+    than silently reporting all VMs as 'missing' (which looks like confirmed
+    teardown to scripts)."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+
+    def fake_list_fail(token, tag):
+        from playground.models.diagnostic import Diagnostic, SourceLocation
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message="API returned 503",
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ], False
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list_fail)
+    lab_status, diags = query_status(resolved_cloud_smoke)
+
+    # The provider_unreachable diagnostic must be present at error severity.
+    ids = [d.id for d in diags]
+    assert "runtime.status.provider_unreachable" in ids, (
+        f"Expected provider_unreachable diagnostic; got ids: {ids}"
+    )
+    unreachable = next(d for d in diags if d.id == "runtime.status.provider_unreachable")
+    assert unreachable.severity == "error", (
+        "provider_unreachable must be error, not warning"
+    )
+
+
+def test_query_status_api_failure_escalates_api_error_to_error(
+    resolved_cloud_smoke, monkeypatch
+):
+    """The original api_error warning should also be escalated to error
+    so callers checking severity see no warnings that look like soft issues."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+
+    def fake_list_fail(token, tag):
+        from playground.models.diagnostic import Diagnostic, SourceLocation
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message="transport error",
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ], False
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list_fail)
+    _, diags = query_status(resolved_cloud_smoke)
+
+    api_error_diags = [d for d in diags if d.id == "runtime.cloud.api_error"]
+    for d in api_error_diags:
+        assert d.severity == "error", (
+            f"api_error diagnostic should be escalated to error on failure; "
+            f"got severity={d.severity!r}"
+        )
+
+
+def test_query_status_api_failure_not_silently_missing(
+    resolved_cloud_smoke, monkeypatch
+):
+    """An API failure must not produce the same output as 'all VMs torn down'.
+    The returned LabStatus may still have state='missing' (VmState has no
+    'unknown') but the diagnostics list MUST be non-empty with error severity
+    so callers/scripts that check diagnostics see a clear error."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+
+    def fake_list_fail(token, tag):
+        from playground.models.diagnostic import Diagnostic, SourceLocation
+        return [], [
+            Diagnostic(
+                id="runtime.cloud.api_error",
+                severity="warning",
+                message="connection refused",
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ], False
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list_fail)
+
+    # Genuine all-torn-down also returns all missing — but with empty diags.
+    def fake_list_empty(token, tag):
+        return [], [], True
+
+    lab_status_fail, diags_fail = query_status(resolved_cloud_smoke)
+    # Reset the monkeypatch to test genuine empty.
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list_empty)
+    lab_status_ok, diags_ok = query_status(resolved_cloud_smoke)
+
+    # Both may have all-missing states but the failure case has error diagnostics.
+    assert any(d.severity == "error" for d in diags_fail), (
+        "API failure must produce at least one error diagnostic"
+    )
+    assert not any(d.severity == "error" for d in diags_ok), (
+        "Genuine empty should not produce error diagnostics"
+    )

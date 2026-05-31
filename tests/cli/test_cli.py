@@ -1992,3 +1992,51 @@ def test_resume_cloud_smoke_calls_execute_resume(
     # execute_resume was called with the resolved lab.
     assert "resolved" in captured
     assert captured["resolved"].lab_name == "cloud-smoke"
+
+
+# ===========================================================================
+# Bug 4 — plan_command calls load_config exactly once
+# ===========================================================================
+
+
+def test_plan_command_calls_load_config_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """plan_command must parse the config tree exactly once.
+
+    Previously estimate_cost and plan_provider_summary each called
+    merge_provider_settings → load_config, so config was parsed 3×.
+    After the fix, the loaded config is passed in directly and load_config
+    must be called only once (by _load_config_or_exit).
+    """
+    from playground.cli import main as cli_main
+    from playground.config import loader as loader_module
+
+    call_count: dict[str, int] = {"n": 0}
+    _original_load_config = loader_module.load_config
+
+    def counting_load_config(config_dir):
+        call_count["n"] += 1
+        return _original_load_config(config_dir)
+
+    monkeypatch.setattr(loader_module, "load_config", counting_load_config)
+    # Also patch it in the cli.main namespace (that's what _load_config_or_exit uses).
+    monkeypatch.setattr(cli_main, "load_config", counting_load_config)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "plan",
+            "cloud-smoke",
+            "--config-dir",
+            str(CONFIG_DIR),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert call_count["n"] == 1, (
+        f"Expected load_config to be called exactly once by plan_command; "
+        f"was called {call_count['n']} times. "
+        "estimate_cost and plan_provider_summary must reuse the already-loaded config."
+    )

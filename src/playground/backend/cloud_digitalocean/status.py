@@ -65,8 +65,54 @@ def query_status(resolved: ResolvedLab) -> tuple[LabStatus, list[Diagnostic]]:
             diagnostics,
         )
 
-    droplets, api_diags = list_droplets_by_tag(token, f"lab:{lab}")
+    droplets, api_diags, list_ok = list_droplets_by_tag(token, f"lab:{lab}")
     diagnostics.extend(api_diags)
+
+    if not list_ok:
+        # Provider was unreachable or returned an error; we cannot determine
+        # the real state.  Escalate the diagnostic to error severity so
+        # callers/scripts key off it, and surface UNKNOWN rather than lying
+        # that every VM is "missing".
+        escalated = [
+            diag.model_copy(update={"severity": "error"}) for diag in api_diags
+        ]
+        # Replace the warning copies already added with the escalated ones.
+        for diag in api_diags:
+            diagnostics.remove(diag)
+        diagnostics.extend(escalated)
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.status.provider_unreachable",
+                severity="error",
+                message=(
+                    "DigitalOcean API request failed; VM state is UNKNOWN "
+                    "— provider was unreachable, not confirmed absent"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "check network connectivity and that $DIGITALOCEAN_TOKEN "
+                    "is valid; retry `playground status`"
+                ),
+            )
+        )
+        # Return the LabStatus with all VMs as "missing" but with error
+        # diagnostics so the caller knows this is an API failure, not a
+        # confirmed teardown.
+        missing_vms = [
+            VmStatus(name=vm.name, role=vm.role, ip=None, state="missing")
+            for vm in resolved.vms
+        ]
+        return (
+            LabStatus(
+                lab=lab,
+                backend=resolved.backend,
+                expected_vms=len(resolved.vms),
+                provisioned_vms=0,
+                vms=missing_vms,
+                unknown_vms=[],
+            ),
+            diagnostics,
+        )
 
     # Build a map from droplet name -> summary dict.
     droplet_map: dict[str, dict[str, Any]] = {}

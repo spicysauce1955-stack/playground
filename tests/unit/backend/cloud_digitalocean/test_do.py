@@ -137,10 +137,11 @@ def test_list_droplets_by_tag_returns_droplets_on_200(monkeypatch):
             200, {"droplets": [_FAKE_DROPLET]}
         ),
     )
-    droplets, diags = list_droplets_by_tag("tok", "lab:cloud-smoke")
+    droplets, diags, ok = list_droplets_by_tag("tok", "lab:cloud-smoke")
     assert len(droplets) == 1
     assert droplets[0]["name"] == "cloud-smoke-node1"
     assert diags == []
+    assert ok is True
 
 
 def test_list_droplets_by_tag_returns_empty_list_on_401(monkeypatch):
@@ -148,10 +149,11 @@ def test_list_droplets_by_tag_returns_empty_list_on_401(monkeypatch):
         do_module, "_request",
         lambda method, path, token, *, params=None: (401, {}),
     )
-    droplets, diags = list_droplets_by_tag("bad-tok", "lab:cloud-smoke")
+    droplets, diags, ok = list_droplets_by_tag("bad-tok", "lab:cloud-smoke")
     assert droplets == []
     assert len(diags) == 1
     assert diags[0].severity == "warning"
+    assert ok is False
 
 
 def test_list_droplets_by_tag_returns_warning_on_transport_error(monkeypatch):
@@ -159,10 +161,11 @@ def test_list_droplets_by_tag_returns_warning_on_transport_error(monkeypatch):
         do_module, "_request",
         lambda method, path, token, *, params=None: (0, {}),
     )
-    droplets, diags = list_droplets_by_tag("tok", "lab:x")
+    droplets, diags, ok = list_droplets_by_tag("tok", "lab:x")
     assert droplets == []
     assert len(diags) == 1
     assert diags[0].id == "runtime.cloud.api_error"
+    assert ok is False
 
 
 def test_list_droplets_by_tag_empty_droplets_on_200_no_matching(monkeypatch):
@@ -170,9 +173,10 @@ def test_list_droplets_by_tag_empty_droplets_on_200_no_matching(monkeypatch):
         do_module, "_request",
         lambda method, path, token, *, params=None: (200, {"droplets": []}),
     )
-    droplets, diags = list_droplets_by_tag("tok", "lab:empty-lab")
+    droplets, diags, ok = list_droplets_by_tag("tok", "lab:empty-lab")
     assert droplets == []
     assert diags == []
+    assert ok is True
 
 
 # ---------------------------------------------------------------------------
@@ -208,14 +212,20 @@ def test_delete_droplet_500_returns_warning(monkeypatch):
     assert diags[0].severity == "warning"
 
 
-def test_delete_droplet_transport_error_is_silent(monkeypatch):
+def test_delete_droplet_transport_error_returns_warning(monkeypatch):
+    """Transport error (status 0) must return a warning, not succeed silently.
+
+    Status 0 means the HTTP call never completed; the Droplet's fate is unknown
+    so the caller's tag-sweep re-list must determine whether it survived.
+    """
     monkeypatch.setattr(
         do_module, "_request",
         lambda method, path, token, *, params=None: (0, {}),
     )
     diags = delete_droplet("tok", 99)
-    # exit code 0 (transport error) is tolerated — tag-sweep catches survivors.
-    assert diags == []
+    assert len(diags) == 1
+    assert diags[0].severity == "warning"
+    assert diags[0].id == "runtime.cloud.api_error"
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +240,8 @@ def test_list_droplets_by_tag_no_token_in_diagnostics(monkeypatch):
         do_module, "_request",
         lambda method, path, token, *, params=None: (403, {}),
     )
-    _, diags = list_droplets_by_tag(secret, "lab:x")
+    _, diags, ok = list_droplets_by_tag(secret, "lab:x")
+    assert ok is False
     for d in diags:
         assert secret not in (d.message or ""), (
             f"token leaked in diagnostic message: {d.message!r}"
@@ -288,3 +299,87 @@ def test_droplet_summary_returns_correct_id_and_name():
     assert summary["id"] == 12345
     assert summary["name"] == "cloud-smoke-node1"
     assert summary["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 — list_droplets_by_tag: ok flag distinguishes failure from empty
+# ---------------------------------------------------------------------------
+
+
+def test_list_droplets_by_tag_genuine_empty_ok_true(monkeypatch):
+    """200 response with empty droplets list → ok=True (not a failure)."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (200, {"droplets": []}),
+    )
+    droplets, diags, ok = list_droplets_by_tag("tok", "lab:empty")
+    assert ok is True
+    assert droplets == []
+    assert diags == []
+
+
+def test_list_droplets_by_tag_transport_failure_ok_false(monkeypatch):
+    """Transport error (status 0) → ok=False; caller must not treat as empty."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (0, {}),
+    )
+    droplets, diags, ok = list_droplets_by_tag("tok", "lab:x")
+    assert ok is False
+    assert droplets == []
+    assert len(diags) == 1
+
+
+def test_list_droplets_by_tag_http_error_ok_false(monkeypatch):
+    """Non-2xx HTTP response → ok=False; caller must not treat as empty."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (500, {}),
+    )
+    droplets, diags, ok = list_droplets_by_tag("tok", "lab:x")
+    assert ok is False
+    assert droplets == []
+    assert len(diags) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 — delete_droplet: transport error (status 0) returns warning
+# ---------------------------------------------------------------------------
+
+
+def test_delete_droplet_204_ok_no_warning(monkeypatch):
+    """204 Deleted is unambiguous success — no warning."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (204, {}),
+    )
+    assert delete_droplet("tok", 42) == []
+
+
+def test_delete_droplet_404_ok_no_warning(monkeypatch):
+    """404 Not Found means already gone — no warning."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (404, {}),
+    )
+    assert delete_droplet("tok", 42) == []
+
+
+def test_delete_droplet_transport_error_0_returns_warning(monkeypatch):
+    """Status 0 (transport error) must return a warning diagnostic.
+
+    Previously this was treated the same as 204/404 (success). That was wrong:
+    the HTTP call never completed so we cannot know whether the Droplet was
+    deleted.  A warning forces the tag-sweep re-list to decide.
+    """
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (0, {}),
+    )
+    diags = delete_droplet("tok", 99)
+    assert len(diags) == 1
+    assert diags[0].id == "runtime.cloud.api_error"
+    assert diags[0].severity == "warning"
+    # Suggestion must guide operator to the console (no token value)
+    assert "digitalocean.com" in (diags[0].suggestion or "").lower() or \
+           "manually" in (diags[0].suggestion or "").lower()

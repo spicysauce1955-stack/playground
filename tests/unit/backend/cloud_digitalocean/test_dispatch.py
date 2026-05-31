@@ -287,8 +287,9 @@ def test_estimate_cost_uses_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     config_dir so provider-config defaults (not just lab overrides) are used."""
     seen: dict[str, object] = {}
 
-    def fake_merge(resolved, *, config_dir=None):
+    def fake_merge(resolved, *, config_dir=None, loaded=None):
         seen["config_dir"] = config_dir
+        seen["loaded"] = loaded
         return {"size": "s-2vcpu-4gb"}
 
     monkeypatch.setattr(do_backend, "merge_provider_settings", fake_merge)
@@ -310,8 +311,8 @@ def test_estimate_cost_with_config_dir_reflects_provider_size(
     resolved = _resolved("cloud-smoke")
 
     # Monkeypatch merge_provider_settings to return a size the lab didn't set.
-    def patched_merge(r, *, config_dir=None):
-        base = merge_provider_settings(r, config_dir=config_dir)
+    def patched_merge(r, *, config_dir=None, loaded=None):
+        base = merge_provider_settings(r, config_dir=config_dir, loaded=loaded)
         base["size"] = "s-2vcpu-4gb"
         return base
 
@@ -398,7 +399,7 @@ def test_plan_provider_summary_ssh_exposure_lists_cidrs(
     """When firewall_ssh_cidrs is set, they appear joined in ssh_exposure."""
     resolved = _resolved("cloud-smoke")
 
-    def fake_merge(r, *, config_dir=None):
+    def fake_merge(r, *, config_dir=None, loaded=None):
         return {
             "region": "nyc3",
             "size": "s-1vcpu-1gb",

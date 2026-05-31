@@ -115,6 +115,7 @@ def execute_destroy(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     """Destroy all Droplets. Never raises."""
     return _teardown(
@@ -123,6 +124,7 @@ def execute_destroy(
         state_dir=state_dir,
         tofu_dir=tofu_dir,
         bus=bus,
+        config_dir=config_dir,
     )
 
 
@@ -132,6 +134,7 @@ def execute_suspend(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     """Destroy Droplets to stop billing.  Never raises.
 
@@ -144,6 +147,7 @@ def execute_suspend(
         state_dir=state_dir,
         tofu_dir=tofu_dir,
         bus=bus,
+        config_dir=config_dir,
     )
 
 
@@ -153,6 +157,7 @@ def execute_reset(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     """Best-effort teardown + wipe per-lab state files. Never raises."""
     lab = resolved.lab_name
@@ -171,9 +176,10 @@ def execute_reset(
 
     # ---- Step 1: tofu-destroy (best-effort) ----
     bus.publish(run.run_id, "step_started", {"step": "tofu-destroy"})
+    # Use merged provider settings (same as apply) so destroy tfvars match.
     plan = build_do_plan(
         resolved,
-        provider_settings=dict(resolved.providers.get(resolved.backend, {})),
+        provider_settings=_provider_settings(config_dir, resolved),
     )
     ssh_key, _ = _read_ssh_public_key(resolved)
     if per_lab_dir.exists():
@@ -218,7 +224,22 @@ def execute_reset(
     )
     all_diagnostics.extend(sweep_diags)
 
-    # ---- Step 3: clean-state-files ----
+    # If the sweep found survivors or was inconclusive, do NOT delete state —
+    # the per-lab dir/inventory are the operator's only handle to the live
+    # resources.  Fail the reset so the operator is alerted.
+    if _sweep_failed("reset", sweep_diags):
+        finished = finish_run(
+            run, run_dir, status="failed", steps=steps,
+            summary=(
+                f"reset lab {lab!r} on digitalocean: "
+                "tag-sweep found survivors or was inconclusive — "
+                "state files NOT deleted to preserve operator access to live resources"
+            ),
+        )
+        bus.publish(run.run_id, "operation_finished", {"status": "failed"})
+        return finished, all_diagnostics
+
+    # ---- Step 3: clean-state-files (only when teardown is confirmed clean) ----
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
     bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
@@ -494,6 +515,7 @@ def _teardown(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     """Shared destroy/suspend lifecycle. Never raises."""
     lab = resolved.lab_name
@@ -520,10 +542,11 @@ def _teardown(
     source_root = tofu_dir / "cloud_digitalocean"
     var_file = per_lab_dir / f"{lab}.tfvars.json"
 
-    # Build a minimal plan for tofu-destroy (needs vm_names + name_prefix).
+    # Build the plan using merged provider settings (same merge logic as
+    # apply) so destroy-time tfvars match what apply used.
     plan = build_do_plan(
         resolved,
-        provider_settings=dict(resolved.providers.get(resolved.backend, {})),
+        provider_settings=_provider_settings(config_dir, resolved),
     )
     ssh_key, _ = _read_ssh_public_key(resolved)
 
@@ -577,18 +600,18 @@ def _teardown(
     )
     all_diagnostics.extend(sweep_diags)
 
-    # If any orphaned survivors remain, the operation must not report success —
-    # paid compute is still running.
-    orphan_diags = [
-        d for d in sweep_diags
-        if d.id == f"runtime.{operation}.orphaned_resource"
-    ]
-    if orphan_diags:
+    # If orphaned survivors remain OR the sweep is inconclusive (API error),
+    # the operation must not report success — paid compute may still be running.
+    if _sweep_failed(operation, sweep_diags):
+        orphan_count = sum(
+            1 for d in sweep_diags
+            if d.id == f"runtime.{operation}.orphaned_resource"
+        )
         finished = finish_run(
             run, run_dir, status="failed", steps=steps,
             summary=(
                 f"{operation} lab {lab!r} on digitalocean: "
-                f"{len(orphan_diags)} Droplet(s) still present"
+                f"{orphan_count} Droplet(s) still present or sweep inconclusive"
             ),
         )
         bus.publish(run.run_id, "operation_finished", {"status": "failed"})
@@ -719,8 +742,39 @@ def _tag_sweep(
         )
 
     # First pass — list + delete.
-    droplets, list_diags = list_droplets_by_tag(token, tag)
+    droplets, list_diags, list_ok = list_droplets_by_tag(token, tag)
     diagnostics.extend(list_diags)
+
+    if not list_ok:
+        # The initial listing itself failed; we cannot know what is running.
+        lines.append("INCONCLUSIVE: initial listing failed — cannot enumerate Droplets to delete")
+        diag = Diagnostic(
+            id=f"runtime.{operation}.sweep_inconclusive",
+            severity="error",
+            message=(
+                f"tag-sweep for lab {lab!r} is INCONCLUSIVE: the initial "
+                f"Droplet listing failed (API/transport error). "
+                "Droplets tagged with "
+                f"'{tag}' may still be running and billing. "
+                "Verify manually at "
+                "https://cloud.digitalocean.com/droplets"
+            ),
+            source=SourceLocation(path="DigitalOcean API"),
+            suggestion=(
+                f"open https://cloud.digitalocean.com/droplets and check for "
+                f"Droplets tagged '{tag}'; if any remain, delete them manually "
+                f"then run `playground reset {lab}`"
+            ),
+        )
+        diagnostics.append(diag)
+        lines.append(str(diag.message))
+        log_path.write_text("\n".join(lines) + "\n")
+        # Non-zero exit so _teardown / execute_reset see a failing sweep.
+        return (
+            _step("tag-sweep", exit_code=1, log_path=log_path, started=started),
+            diagnostics,
+        )
+
     for d in droplets:
         summary = droplet_summary(d)
         did: int | str | None = summary.get("id")
@@ -739,7 +793,39 @@ def _tag_sweep(
                 )
 
     # Second pass — re-list to find survivors.
-    survivors, _ = list_droplets_by_tag(token, tag)
+    survivors, relist_diags, relist_ok = list_droplets_by_tag(token, tag)
+    diagnostics.extend(relist_diags)
+
+    if not relist_ok:
+        # Re-list after attempted deletes failed; sweep is inconclusive.
+        lines.append("INCONCLUSIVE: re-list after deletes failed — cannot confirm no survivors")
+        diag = Diagnostic(
+            id=f"runtime.{operation}.sweep_inconclusive",
+            severity="error",
+            message=(
+                f"tag-sweep for lab {lab!r} is INCONCLUSIVE: Droplet deletes "
+                "were attempted but the confirmation re-list failed "
+                "(API/transport error). "
+                "Droplets tagged with "
+                f"'{tag}' may still be running and billing. "
+                "Verify manually at "
+                "https://cloud.digitalocean.com/droplets"
+            ),
+            source=SourceLocation(path="DigitalOcean API"),
+            suggestion=(
+                f"open https://cloud.digitalocean.com/droplets and check for "
+                f"Droplets tagged '{tag}'; if any remain, delete them manually "
+                f"then run `playground reset {lab}`"
+            ),
+        )
+        diagnostics.append(diag)
+        lines.append(str(diag.message))
+        log_path.write_text("\n".join(lines) + "\n")
+        return (
+            _step("tag-sweep", exit_code=1, log_path=log_path, started=started),
+            diagnostics,
+        )
+
     for d in survivors:
         summary = droplet_summary(d)
         did = summary.get("id")
@@ -766,6 +852,25 @@ def _tag_sweep(
         _step("tag-sweep", exit_code=0, log_path=log_path, started=started),
         diagnostics,
     )
+
+
+def _sweep_failed(operation: str, sweep_diags: list[Diagnostic]) -> bool:
+    """Return True if a tag-sweep result means the teardown must be failed.
+
+    A sweep must fail the containing operation when:
+    - Orphaned Droplets survived deletion (``orphaned_resource`` diagnostic), or
+    - The sweep is inconclusive due to an API/transport error that prevented
+      confirming cleanup (``sweep_inconclusive`` diagnostic).
+
+    Both represent a state where paid compute may still be running.
+    """
+    for d in sweep_diags:
+        if d.id in (
+            f"runtime.{operation}.orphaned_resource",
+            f"runtime.{operation}.sweep_inconclusive",
+        ):
+            return True
+    return False
 
 
 def _clean_state_files(

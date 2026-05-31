@@ -398,8 +398,10 @@ def plan_command(
     _print_warnings(diagnostics)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
-    cost = estimate_cost(resolved, config_dir=config_dir)
-    provider_summary = plan_provider_summary(resolved, config_dir=config_dir)
+    # Pass the already-loaded config to avoid parsing the config tree a second
+    # and third time inside estimate_cost / plan_provider_summary.
+    cost = estimate_cost(resolved, loaded=loaded)
+    provider_summary = plan_provider_summary(resolved, loaded=loaded)
     plan = render_plan(resolved, warnings=warnings, cost_estimate=cost)
 
     if output is OutputFormat.json:
@@ -1095,6 +1097,7 @@ def destroy_command(
         state_dir=state_dir,
         tofu_dir=tofu_dir,
         bus=bus,
+        config_dir=config_dir,
     )
 
     if finished.status == "failed":
@@ -1160,6 +1163,7 @@ def reset_command(
         state_dir=state_dir,
         tofu_dir=tofu_dir,
         bus=bus,
+        config_dir=config_dir,
     )
 
     if finished.status == "failed":
@@ -1230,6 +1234,7 @@ def suspend_command(
         state_dir=state_dir,
         tofu_dir=tofu_dir,
         bus=bus,
+        config_dir=config_dir,
     )
 
     if finished is None:

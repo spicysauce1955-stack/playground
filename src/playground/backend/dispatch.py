@@ -22,6 +22,7 @@ that's not the same as having an implemented adapter).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from playground.backend import cloud_digitalocean, local_libvirt, local_vbox
 from playground.events import EventBus
@@ -30,6 +31,9 @@ from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
 from playground.planner.plan import CostEstimate
 from playground.runs import OperationRun
+
+if TYPE_CHECKING:
+    from playground.config.loader import LoadedConfig
 
 LIBVIRT = "local-libvirt"
 VBOX = "local-vbox"
@@ -112,6 +116,7 @@ def execute_destroy(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     if resolved.backend == VBOX:
         return local_vbox.execute_destroy(
@@ -120,6 +125,7 @@ def execute_destroy(
     if resolved.backend == DIGITALOCEAN:
         return cloud_digitalocean.execute_destroy(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
+            config_dir=config_dir,
         )
     # CLI guards unsupported backends before here; libvirt is the default.
     return local_libvirt.execute_destroy(
@@ -133,6 +139,7 @@ def execute_reset(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     if resolved.backend == VBOX:
         return local_vbox.execute_reset(
@@ -141,6 +148,7 @@ def execute_reset(
     if resolved.backend == DIGITALOCEAN:
         return cloud_digitalocean.execute_reset(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
+            config_dir=config_dir,
         )
     return local_libvirt.execute_reset(
         resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
@@ -153,6 +161,7 @@ def execute_suspend(
     state_dir: Path,
     tofu_dir: Path,
     bus: EventBus,
+    config_dir: Path | None = None,
 ) -> tuple[OperationRun | None, list[Diagnostic]]:
     """Suspend a cloud lab by destroying its Droplets to stop billing.
 
@@ -162,6 +171,7 @@ def execute_suspend(
     if resolved.backend == DIGITALOCEAN:
         return cloud_digitalocean.execute_suspend(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
+            config_dir=config_dir,
         )
     return None, [verb_not_supported_diagnostic("suspend", resolved.backend)]
 
@@ -202,6 +212,7 @@ def estimate_cost(
     resolved: ResolvedLab,
     *,
     config_dir: Path | None = None,
+    loaded: LoadedConfig | None = None,
 ) -> CostEstimate | None:
     """Return an advisory :class:`CostEstimate` for ``resolved``, or ``None``.
 
@@ -210,11 +221,12 @@ def estimate_cost(
 
     ``config_dir`` is forwarded to :func:`merge_provider_settings` so the
     estimate reflects the merged provider-config defaults, not just lab
-    overrides.
+    overrides.  Pass ``loaded`` to reuse an already-parsed config and avoid
+    re-loading the config tree.
     """
     if resolved.backend == DIGITALOCEAN:
         provider_settings = cloud_digitalocean.merge_provider_settings(
-            resolved, config_dir=config_dir
+            resolved, config_dir=config_dir, loaded=loaded,
         )
         plan = cloud_digitalocean.build_do_plan(
             resolved,
@@ -228,6 +240,7 @@ def plan_provider_summary(
     resolved: ResolvedLab,
     *,
     config_dir: Path | None = None,
+    loaded: LoadedConfig | None = None,
 ) -> dict[str, str] | None:
     """Return an ordered provider-detail dict for the plan display, or ``None``.
 
@@ -249,13 +262,15 @@ def plan_provider_summary(
 
     :param resolved: Fully resolved lab model.
     :param config_dir: Config directory to load provider defaults from.
+    :param loaded: Already-loaded config to reuse.  When provided,
+        *config_dir* is ignored, avoiding redundant I/O.
     :returns: Ordered dict or ``None`` for non-DO backends.
     """
     if resolved.backend != DIGITALOCEAN:
         return None
 
     provider_settings = cloud_digitalocean.merge_provider_settings(
-        resolved, config_dir=config_dir
+        resolved, config_dir=config_dir, loaded=loaded,
     )
     plan = cloud_digitalocean.build_do_plan(
         resolved, provider_settings=provider_settings

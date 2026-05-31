@@ -8,16 +8,20 @@ It lives here rather than in ``plan.py`` to keep the plan module I/O-free.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from playground.config.loader import load_config
 from playground.models.resolved import ResolvedLab
+
+if TYPE_CHECKING:
+    from playground.config.loader import LoadedConfig
 
 
 def merge_provider_settings(
     resolved: ResolvedLab,
     *,
     config_dir: Path | None = None,
+    loaded: LoadedConfig | None = None,
 ) -> dict[str, Any]:
     """Return the merged provider settings for a cloud-digitalocean lab.
 
@@ -32,7 +36,10 @@ def merge_provider_settings(
     :param resolved: Fully resolved, backend-neutral lab model.
     :param config_dir: Path to the config directory (e.g. ``config/``).
         ``None`` means skip loading provider defaults and use lab overrides
-        only.
+        only.  Ignored when *loaded* is provided.
+    :param loaded: Already-loaded :class:`~playground.config.loader.LoadedConfig`.
+        When provided, *config_dir* is ignored and the config is not re-loaded,
+        avoiding redundant I/O when the caller already holds a loaded config.
     :returns: Merged dict suitable for passing to :func:`build_do_plan` as
         ``provider_settings``.
     """
@@ -41,10 +48,21 @@ def merge_provider_settings(
     )
     base: dict[str, Any] = {}
 
-    if config_dir is not None:
+    if loaded is not None:
+        # Caller supplied an already-loaded config — use it directly.
         try:
-            loaded, _diags = load_config(config_dir)
             provider_cfg = loaded.providers.get(resolved.backend)
+            if provider_cfg is not None:
+                try:
+                    base = dict(provider_cfg.spec.model_dump())
+                except Exception:  # noqa: BLE001
+                    base = {}
+        except Exception:  # noqa: BLE001
+            base = {}
+    elif config_dir is not None:
+        try:
+            _loaded, _diags = load_config(config_dir)
+            provider_cfg = _loaded.providers.get(resolved.backend)
             if provider_cfg is not None:
                 try:
                     base = dict(provider_cfg.spec.model_dump())
