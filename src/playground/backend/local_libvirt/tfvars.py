@@ -99,8 +99,6 @@ def render_tfvars(resolved: ResolvedLab) -> dict[str, Any]:
     # vmread/vmwrite startup crash.
     provider_cfg = resolved.providers.get("local-libvirt", {}) or {}
     cpu_mode = provider_cfg.get("cpu_mode")
-    if isinstance(cpu_mode, str) and cpu_mode:
-        payload["cpu_mode"] = cpu_mode
 
     # CPU feature disables — lab YAML's
     # `spec.providers.local-libvirt.cpu_features_disable`. Each entry is a
@@ -135,6 +133,31 @@ def render_tfvars(resolved: ResolvedLab) -> dict[str, Any]:
                 f"'qemu' (got {domain_type!r})"
             )
         payload["domain_type"] = domain_type
+
+    # Cross-knob: libvirt rejects `<cpu mode='host-passthrough'>` with
+    # `<domain type='qemu'>`. The default cpu_mode is host-passthrough
+    # (Redroid needs it), so a lab that opts into `domain_type: qemu`
+    # without overriding cpu_mode would fail at domain creation with
+    # "CPU mode 'host-passthrough' is not supported by hypervisor".
+    # Two cases:
+    #   - cpu_mode unset → auto-coerce to host-model so the operator's
+    #     "just set domain_type=qemu" rung-2 invocation actually boots.
+    #   - cpu_mode explicitly = host-passthrough → reject loudly, the
+    #     user asked for an impossible combination.
+    if domain_type == "qemu":
+        if cpu_mode is None:
+            cpu_mode = "host-model"
+        elif cpu_mode == "host-passthrough":
+            raise ValueError(
+                "spec.providers.local-libvirt: domain_type='qemu' is "
+                "incompatible with cpu_mode='host-passthrough' (libvirt "
+                "rejects host-passthrough on TCG domains). Use "
+                "cpu_mode='host-model' or omit cpu_mode to let the "
+                "renderer pick host-model for you."
+            )
+
+    if isinstance(cpu_mode, str) and cpu_mode:
+        payload["cpu_mode"] = cpu_mode
 
     return payload
 

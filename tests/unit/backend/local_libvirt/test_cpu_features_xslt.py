@@ -84,3 +84,41 @@ def test_rendered_template_is_well_formed_xml() -> None:
         f"--- stderr ---\n{result.stderr}\n"
         f"--- rendered ---\n{rendered}"
     )
+
+
+@pytest.mark.skipif(
+    shutil.which("tofu") is None,
+    reason="tofu not installed; skipping templatefile() integration check",
+)
+def test_tofu_templatefile_accepts_template() -> None:
+    """Regression guard for Bug A (2026-05-28): on the first live apply
+    with `cpu_features_disable: [vmx]`, ``templatefile()`` rejected the
+    file because the XML comment contained literal ``${...}`` /
+    ``%{...}`` patterns which tofu's HCL template parser interpreted as
+    code (it doesn't care that they sit inside an XML comment).
+
+    The Python emulator in :func:`_render` doesn't exercise the HCL
+    parser, so it gave false confidence. This test calls the real
+    ``tofu console`` to evaluate ``templatefile(...)`` against the
+    on-disk template and asserts the call succeeds. Skipped when tofu
+    isn't on PATH; runs in <1 s when it is."""
+    tofu_dir = REPO_ROOT / "tofu"
+    expr = (
+        f'templatefile("{TEMPLATE.name}", '
+        '{ features = ["vmx", "svm", "hypervisor"] })\n'
+    )
+    result = subprocess.run(  # noqa: S603 — explicit args, no shell
+        ["tofu", "console"], input=expr, text=True,
+        capture_output=True, check=False, cwd=tofu_dir,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        "tofu console rejected templatefile() against "
+        f"{TEMPLATE.name}:\n--- stderr ---\n{result.stderr}\n"
+        f"--- stdout ---\n{result.stdout}"
+    )
+    # The rendered XSLT must include the disable elements we asked for.
+    for flag in ("vmx", "svm", "hypervisor"):
+        assert f'name="{flag}"' in result.stdout, (
+            f"expected feature {flag!r} missing from rendered output"
+        )

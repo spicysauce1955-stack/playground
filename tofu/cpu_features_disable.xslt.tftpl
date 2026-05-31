@@ -1,17 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   XSLT 1.0 transform injected by tofu via the dmacvicar/libvirt provider's
-  `xml { xslt = ... }` escape hatch (provider PR #431) to add
-  `<feature policy='disable' name='X'/>` children inside the domain's
-  `<cpu>` block. Provider v0.7.6 does not expose a native `cpu.feature`
+  xml { xslt = ... } escape hatch (provider PR #431) to add
+  <feature policy='disable' name='X'/> children inside the domain's
+  <cpu> block. Provider v0.7.6 does not expose a native cpu.feature
   attribute; xslt is the supported workaround.
 
-  Templated from `tofu/main.tf` with one variable:
+  Templated from tofu/main.tf with one variable:
     features : list(string) — CPU flag names to disable, e.g. ["vmx"].
 
-  This file is consumed by `templatefile()`, so `${ ... }` is OpenTofu
-  template syntax, not XSLT — the XSLT itself uses no `${...}` and the
-  output is plain XSLT.
+  CONTRIBUTOR WARNING: this file is fed through OpenTofu's templatefile()
+  function. The whole file is parsed for template expressions — XML
+  comments included. Do not paste dollar-brace or percent-brace literals
+  into this comment (those are tofu's interpolation and directive
+  openers; literal occurrences anywhere in the file cause apply to fail
+  at `Invalid expression` / `Invalid template directive`). To document
+  those patterns elsewhere, see docs/architecture/CONTRACTS.md.
 -->
 <xsl:stylesheet version="1.0"
     xmlns:xsl="http://www.w3.org/1999/XSL/Transform">

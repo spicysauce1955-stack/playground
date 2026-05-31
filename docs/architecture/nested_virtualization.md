@@ -79,6 +79,14 @@ won't even try VMX operations. Cheap, fast, often enough — pair it
 with `host-model` because `host-passthrough` can still leak the flag
 to the guest despite the disable (Ubuntu bug #1830268).
 
+**Host prerequisite**: rung 1 requires `xsltproc` on PATH. The
+dmacvicar/libvirt provider's `xml { xslt = ... }` escape hatch shells
+out to it to apply the disable transform; without it, apply fails at
+domain creation with `exec: "xsltproc": executable file not found in
+$PATH`. `playground doctor` flags this as
+`runtime.doctor.xsltproc_missing` (warning). Install with
+`sudo apt install -y xsltproc`.
+
 Trade-off: Redroid still works (no VMX requirement), but anything
 that *needs* nested virt inside the L2 guest will fail.
 
@@ -89,6 +97,12 @@ spec:
   providers:
     local-libvirt:
       domain_type: qemu                 # bypasses KVM entirely
+      # cpu_mode is left implicit — the renderer auto-coerces it to
+      # `host-model` because `host-passthrough` (the platform default,
+      # required for Redroid) is incompatible with TCG and libvirt
+      # would reject domain creation with "CPU mode 'host-passthrough'
+      # is not supported by hypervisor". If you want a different
+      # non-passthrough mode, set `cpu_mode` explicitly.
       wait_ssh_timeout_seconds: 1800    # TCG boots are slow
       wait_cloud_init_timeout_seconds: 2400
 ```
@@ -101,6 +115,13 @@ Trade-off: 10–100× slower than KVM (CPU-bound workloads worst).
 Apply easily takes 20+ minutes; raise the wait timeouts as shown.
 `redroid-host` + TCG is **unverified** — the validator surfaces
 `config.backend.tcg_mode_slow` with a louder warning for that combo.
+
+**Why cpu_mode matters here**: setting `domain_type: qemu` alongside
+`cpu_mode: host-passthrough` (the platform default) makes libvirt
+reject the domain — host-passthrough is a KVM-only mode. The
+renderer detects this and either auto-coerces to `host-model` (when
+cpu_mode is unset) or errors out at render time (when cpu_mode is
+explicitly host-passthrough).
 
 ### Rung 3: re-run on a host with proper nested support
 

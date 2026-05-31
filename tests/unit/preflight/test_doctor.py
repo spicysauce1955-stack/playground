@@ -812,6 +812,40 @@ def test_tofu_state_drift_warns_on_command_failure(
 
 
 # ---------------------------------------------------------------------------
+# check_xsltproc
+# ---------------------------------------------------------------------------
+
+
+def test_xsltproc_silent_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Apply via `cpu_features_disable` needs xsltproc; when it's
+    installed the probe must stay quiet."""
+    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"xsltproc"}))
+    assert doctor.check_xsltproc() == []
+
+
+def test_xsltproc_warns_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug D (2026-05-28): xsltproc was a silent dependency of the
+    rung-1 escape hatch; apply failed at domain creation with
+    "exec: xsltproc: executable file not found in $PATH" on hosts where
+    the binary wasn't installed. Doctor surfaces it in preflight as a
+    warning — libvirt-only operators that never reach for rung 1 are
+    not blocked, but those that do get a clear early signal."""
+    monkeypatch.setattr(doctor.shutil, "which", _which_factory(set()))
+    diagnostics = doctor.check_xsltproc()
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "runtime.doctor.xsltproc_missing"
+    assert diagnostics[0].severity == "warning"
+    # Message must teach the operator both the scope (only
+    # cpu_features_disable labs) and the exact failure mode.
+    msg = diagnostics[0].message
+    assert "cpu_features_disable" in msg
+    assert "xsltproc" in msg
+    suggestion = diagnostics[0].suggestion or ""
+    assert "apt install" in suggestion
+    assert "xsltproc" in suggestion
+
+
+# ---------------------------------------------------------------------------
 # check_kvm_nested_enabled
 # ---------------------------------------------------------------------------
 
@@ -876,62 +910,124 @@ def test_nested_reads_one_as_on(
 # ---------------------------------------------------------------------------
 
 
-def test_vmx_failures_silent_when_journalctl_missing(
+def test_vmx_failures_silent_when_no_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Neither dmesg nor journalctl on PATH — probe fail-opens."""
     monkeypatch.setattr(doctor.shutil, "which", _which_factory(set()))
     assert doctor.check_no_recent_vmx_failures() == []
 
 
-def test_vmx_failures_silent_when_journalctl_finds_nothing(
+def _make_run_router(*, dmesg_stdout: str = "", dmesg_rc: int = 0,
+                     journal_stdout: str = "", journal_rc: int = 0):
+    """Build a subprocess.run replacement that branches on argv[0]."""
+
+    def _run(args, **_kwargs):
+        if args[0] == "dmesg":
+            return _fake_completed(returncode=dmesg_rc, stdout=dmesg_stdout)
+        if args[0] == "journalctl":
+            return _fake_completed(returncode=journal_rc, stdout=journal_stdout)
+        return _fake_completed(returncode=0, stdout="")
+
+    return _run
+
+
+def test_vmx_failures_silent_when_dmesg_and_journal_clean(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``journalctl -g pattern`` exits 1 when no match — silent path."""
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"journalctl"}))
     monkeypatch.setattr(
-        doctor.subprocess, "run",
-        lambda *_a, **_kw: _fake_completed(returncode=1, stdout=""),
+        doctor.shutil, "which", _which_factory({"dmesg", "journalctl"}),
     )
+    monkeypatch.setattr(doctor.subprocess, "run", _make_run_router())
     assert doctor.check_no_recent_vmx_failures() == []
 
 
-def test_vmx_failures_warns_when_recent_match(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The bob-lnx symptom from 2026-05-28: nested VMX leaks blow up
-    kvm_intel and we want doctor to surface this fast."""
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"journalctl"}))
+def test_vmx_failures_warns_on_dmesg_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Primary path: dmesg is readable and contains vmwrite errors —
+    no journalctl call needed."""
+    monkeypatch.setattr(
+        doctor.shutil, "which", _which_factory({"dmesg", "journalctl"}),
+    )
     monkeypatch.setattr(
         doctor.subprocess, "run",
-        lambda *_a, **_kw: _fake_completed(
-            returncode=0,
-            stdout=(
-                "2026-05-28T10:00:00 host kernel: kvm_intel: vmread failed: "
-                "field=0x6800 (err 5)\n"
-                "2026-05-28T10:00:01 host kernel: kvm_intel: vmwrite failed: "
-                "field=0x6800 (err 5)\n"
-            ),
-        ),
+        _make_run_router(dmesg_stdout=(
+            "[Wed May 28 11:09:05 2026] vmread failed: field=4400\n"
+            "[Wed May 28 11:09:05 2026] vmwrite failed: field=4812 val=ffff err=0\n"
+        )),
     )
     diagnostics = doctor.check_no_recent_vmx_failures()
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "runtime.doctor.kvm_intel_recent_failures"
     assert diagnostics[0].severity == "warning"
-    # Suggestion lists the three rungs of the escalation ladder.
     suggestion = diagnostics[0].suggestion or ""
     assert "cpu_features_disable" in suggestion
     assert "domain_type" in suggestion
-    assert "nested VMX" in suggestion
+    # Message clarifies the host could be L0 OR L1 — bob-lnx is L0
+    # bare-metal yet still hits these errors.
+    msg = diagnostics[0].message
+    assert "nested-VMX" in msg
+
+
+def test_vmx_failures_falls_back_to_journalctl_when_dmesg_restricted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug C (2026-05-28): Ubuntu's default kernel.dmesg_restrict=1
+    makes dmesg return rc=1 with empty stdout for non-root users.
+    The probe must then fall through to journalctl rather than
+    declaring 'no failures.'"""
+    monkeypatch.setattr(
+        doctor.shutil, "which", _which_factory({"dmesg", "journalctl"}),
+    )
+    monkeypatch.setattr(
+        doctor.subprocess, "run",
+        _make_run_router(
+            dmesg_rc=1, dmesg_stdout="",
+            journal_stdout=(
+                "May 28 11:09:05 bob-lnx kernel: vmread failed: field=4400\n"
+                "May 28 11:09:05 bob-lnx kernel: vmwrite failed: field=4812\n"
+            ),
+        ),
+    )
+    diagnostics = doctor.check_no_recent_vmx_failures()
+    assert len(diagnostics) == 1
+    assert "vmread failed" in diagnostics[0].message
+
+
+def test_vmx_failures_uses_24_hour_window_not_1_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug C root cause: a 1-hour window missed the failures because
+    the operator wedged apply, fixed things, then ran doctor 8+ hours
+    later. Lock in the wider window via the journalctl args."""
+    seen_args: list[list[str]] = []
+
+    def _capture(args, **_kwargs):
+        seen_args.append(args)
+        if args[0] == "dmesg":
+            return _fake_completed(returncode=1, stdout="")
+        return _fake_completed(returncode=0, stdout="")
+
+    monkeypatch.setattr(
+        doctor.shutil, "which", _which_factory({"dmesg", "journalctl"}),
+    )
+    monkeypatch.setattr(doctor.subprocess, "run", _capture)
+    doctor.check_no_recent_vmx_failures()
+
+    journal_calls = [a for a in seen_args if a[0] == "journalctl"]
+    assert journal_calls, "journalctl fallback never invoked"
+    assert "24 hours ago" in journal_calls[0]
 
 
 def test_vmx_failures_handles_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"journalctl"}))
+    monkeypatch.setattr(
+        doctor.shutil, "which", _which_factory({"dmesg", "journalctl"}),
+    )
 
     def _timeout(*_a, **_kw):
         raise subprocess.TimeoutExpired(cmd=["journalctl"], timeout=5.0)
 
     monkeypatch.setattr(doctor.subprocess, "run", _timeout)
-    # A hanging journal must not crash doctor; silent fail-open.
+    # Both dmesg and journalctl timing out must not crash doctor.
     assert doctor.check_no_recent_vmx_failures() == []
 
 
@@ -1053,6 +1149,11 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
     # systemd-detect-virt / sysfs).
     monkeypatch.setattr(
         doctor,
+        "check_xsltproc",
+        _make("xsltproc", "runtime.doctor.xsltproc_missing"),
+    )
+    monkeypatch.setattr(
+        doctor,
         "check_kvm_nested_enabled",
         _make("nested", "runtime.doctor.nested_disabled"),
     )
@@ -1084,6 +1185,7 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
         "runtime.doctor.cloud_init_image_unverified",
         "runtime.doctor.ansible_config_not_wired",
         "runtime.doctor.tofu_state_drift",
+        "runtime.doctor.xsltproc_missing",
         "runtime.doctor.nested_disabled",
         "runtime.doctor.kvm_intel_recent_failures",
         "runtime.doctor.host_is_virtualized",
@@ -1093,6 +1195,7 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
         "iso", "virsh", "libvirt-group", "pool", "pool-perms",
         "ssh", "apparmor", "ansible", "ansible-cfg", "cloud-init",
         "ansible-wired", "tofu-drift",
+        "xsltproc",
         "nested", "vmx-fail", "virt-host",
     ]
     assert observed == expected

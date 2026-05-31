@@ -273,3 +273,46 @@ def test_render_tfvars_rejects_non_string_domain_type() -> None:
     resolved = _resolved_with_libvirt_overrides({"domain_type": 42})
     with pytest.raises(ValueError, match="domain_type"):
         render_tfvars(resolved)
+
+
+def test_render_tfvars_auto_coerces_cpu_mode_when_domain_type_qemu_and_cpu_mode_unset() -> None:
+    """Bug B (2026-05-28): on bob-lnx the operator set only
+    `domain_type: qemu` for the rung-2 fallback. The tofu default
+    `cpu_mode=host-passthrough` then conflicted with TCG and libvirt
+    rejected domain creation with "CPU mode 'host-passthrough' is not
+    supported by hypervisor". The renderer must downshift cpu_mode
+    automatically so the documented rung-2 invocation actually boots."""
+    resolved = _resolved_with_libvirt_overrides({"domain_type": "qemu"})
+    payload = render_tfvars(resolved)
+    assert payload["domain_type"] == "qemu"
+    assert payload["cpu_mode"] == "host-model"
+
+
+def test_render_tfvars_rejects_qemu_plus_host_passthrough_combo() -> None:
+    """An explicit operator request for the incompatible combo must
+    fail fast at render time — not 30 seconds later at libvirt's
+    domain-creation rejection."""
+    resolved = _resolved_with_libvirt_overrides(
+        {"domain_type": "qemu", "cpu_mode": "host-passthrough"},
+    )
+    with pytest.raises(ValueError, match="host-passthrough.*TCG"):
+        render_tfvars(resolved)
+
+
+def test_render_tfvars_preserves_explicit_cpu_mode_when_domain_type_qemu() -> None:
+    """An explicit non-passthrough cpu_mode wins; the renderer doesn't
+    second-guess the operator."""
+    resolved = _resolved_with_libvirt_overrides(
+        {"domain_type": "qemu", "cpu_mode": "qemu64"},
+    )
+    payload = render_tfvars(resolved)
+    assert payload["cpu_mode"] == "qemu64"
+
+
+def test_render_tfvars_does_not_auto_coerce_cpu_mode_when_domain_type_kvm() -> None:
+    """Auto-coercion is qemu-only; kvm domains are fine with the default
+    host-passthrough cpu_mode."""
+    resolved = _resolved_with_libvirt_overrides({"domain_type": "kvm"})
+    payload = render_tfvars(resolved)
+    assert payload["domain_type"] == "kvm"
+    assert "cpu_mode" not in payload
