@@ -6,7 +6,8 @@ config tree, validates and resolves it through a Python control layer, and
 eventually applies it through visible OpenTofu, Ansible, and Docker
 modules. Today the platform provisions KVM/libvirt VMs that run
 containerized Android (Redroid) for nested-virt experiments; the design
-leaves room for cloud backends, traffic capture, and security workflows.
+also provisions short-lived DigitalOcean Droplets (the `cloud-digitalocean`
+backend), and leaves room for traffic capture and security workflows.
 
 ## Two layers
 
@@ -136,6 +137,32 @@ playground destroy generic-infra                 # tear down via tofu
 playground reset generic-infra                   # scrub-by-name when destroy fails
 playground tui                                   # Textual UI over everything above
 ```
+
+## Cloud backend — DigitalOcean
+
+A lab can run on short-lived DigitalOcean Droplets instead of locally by
+setting `spec.backend: cloud-digitalocean` (see `config/labs/cloud-smoke.yaml`
+and `config/providers/cloud-digitalocean.yaml`). The same generic lab model,
+OpenTofu → Ansible pipeline, and `.playground/` state layout apply; only the
+create/destroy half differs (Droplets via the `digitalocean/digitalocean`
+provider, reached over their public IP).
+
+```bash
+export DIGITALOCEAN_TOKEN=<your-token>           # required; never committed/logged
+playground doctor --backend cloud-digitalocean   # token, tofu, key, firewall checks
+playground plan cloud-smoke                       # region/size/image + SSH exposure + est. cost
+playground apply cloud-smoke                      # create Droplet, wait, run Ansible
+playground status cloud-smoke                     # live DigitalOcean state (by tag)
+playground suspend cloud-smoke                    # DESTROY Droplet (powered-off Droplets still bill); keep local state
+playground resume cloud-smoke                     # rebuild from config (disk changes not preserved)
+playground destroy cloud-smoke                    # remove all lab-owned DO resources
+```
+
+Notes: cost figures in `plan` are advisory; `suspend`/`resume` are cloud-only
+(local backends reject them); the token is read from `$DIGITALOCEAN_TOKEN`
+(the platform does not auto-load `.env`). Redroid/nested-virt is not supported
+on DigitalOcean. See `docs/architecture/CONTRACTS.md` →
+"Backend: cloud-digitalocean".
 
 ## License
 
