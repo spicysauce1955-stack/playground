@@ -93,6 +93,9 @@ Deferred:
 
 - full TUI
 - cloud providers
+
+  > Update (2026-05-31): a `cloud-digitalocean` backend has since shipped
+  > (validated live); see `docs/architecture/cloud_digitalocean_design.md`.
 - packet capture workflows
 - Android device lifecycle automation beyond the current Redroid baseline
 - full Docker Compose/Swarm execution if it expands the first slice too much

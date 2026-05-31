@@ -31,8 +31,8 @@ tests, then supporting docs.
 - Keep OpenTofu and Ansible visible, editable, and inspectable.
 - Model lab intent in backend-neutral terms before translating it to concrete
   provider actions.
-- Support local libvirt first while leaving room for future cloud or remote
-  backends.
+- Support local libvirt first; local-vbox and cloud-digitalocean backends have
+  since been added (cloud is no longer just "future").
 - Warn and explain risks by default; block only when strict mode or hard
   validation errors require it.
 - Build CLI-first so the TUI can later reuse stable config, state, and operation

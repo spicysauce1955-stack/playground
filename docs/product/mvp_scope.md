@@ -65,6 +65,9 @@ The operator can define a generic infra lab in YAML, validate it, see a plan, ap
 - Security tool presets.
 - Attacker/victim templates.
 - Cloud providers.
+
+  > Update (2026-05-31): a `cloud-digitalocean` backend has since been added
+  > as a post-MVP backend; see `docs/architecture/cloud_digitalocean_design.md`.
 - Full graphical UI.
 
 ## MVP Commands

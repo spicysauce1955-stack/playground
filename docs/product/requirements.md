@@ -46,6 +46,11 @@ The primary user is the project owner/operator:
   visible OpenTofu and Ansible backend modules prematurely.
 - Do not build the TUI before the CLI/core operations are specified.
 - Do not hardcode cloud support in the first implementation.
+
+> Update (2026-05-31): a `cloud-digitalocean` backend has since shipped
+> (validated live); see `docs/product/cloud_digitalocean_prd.md` and
+> `docs/architecture/cloud_digitalocean_design.md`. Generic lab intent
+> stayed backend-neutral as required.
 - Do not make Android/Redroid the first MVP slice, even though the architecture must support it later.
 - Do not enforce security trust policies by default. The system should expose risks and topology, not block expert use.
 

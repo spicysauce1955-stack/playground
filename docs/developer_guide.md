@@ -57,8 +57,12 @@ playground/
 │   ├── models/             # Pydantic models: kinds, resolved, status, diagnostic
 │   ├── validation/         # Cross-reference checks → Diagnostics
 │   ├── planner/            # Plan rendering + workload scheduling + file staging
-│   ├── backend/            # Adapter layer (today: local_libvirt)
-│   │   └── local_libvirt/  # inventory, tfvars, apply (subprocess), status, runner
+│   ├── backend/            # Adapter layer: local_libvirt, local_vbox, cloud_digitalocean
+│   │   │                   #   all routed through dispatch.py on ResolvedLab.backend
+│   │   ├── local_libvirt/  # inventory, tfvars, apply (subprocess), status, runner
+│   │   ├── local_vbox/     # VBoxManage-based backend (NAT port-forward SSH)
+│   │   ├── cloud_digitalocean/ # DigitalOcean Droplets via OpenTofu
+│   │   └── dispatch.py     # routes on ResolvedLab.backend to the right adapter
 │   ├── events/             # In-process EventBus + JsonlWriter
 │   ├── runs/               # OperationRun + start/finish helpers
 │   ├── tui/                # Textual app (lab browser, live ops, runs viewer)
@@ -116,6 +120,7 @@ Runtime baseline:
 |---|---|
 | OpenTofu | VM/network provisioning under `tofu/` |
 | `dmacvicar/libvirt` `~> 0.7.1` | Local libvirt provider |
+| `digitalocean/digitalocean` `~> 2.0` | DigitalOcean provider (cloud backend) |
 | Ansible + `community.docker` | `docker` and `redroid` roles |
 | cloud-init | SSH key injection (`tofu/cloud_init.cfg`) |
 | Docker CE | Installed inside guest VMs |
@@ -142,8 +147,8 @@ LoadedConfig    (typed kinds, parse diagnostics, source map)
         ▼  resolve_lab(loaded, "lab-name")
 ResolvedLab     (backend-neutral, frozen, ready for adapters)
         │
-        ▼  (future) backend adapter
-tofu / ansible / docker / future providers
+        ▼  backend adapter (dispatch.py -> local_libvirt / local_vbox / cloud_digitalocean)
+tofu / ansible / docker / DigitalOcean / future providers
 ```
 
 Every stage produces `Diagnostic`s rather than throwing on user mistakes

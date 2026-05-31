@@ -131,8 +131,9 @@ Carried forward to future work:
   warning documents the gap. Future slice can enrich tofu to accept
   per-VM resources as a list of objects.
 - CLI imports the concrete `playground.backend.local_libvirt` adapter
-  directly. Introduce a small adapter protocol / registry only when a
-  second backend appears.
+  directly. A `dispatch.py` registry now routes on `ResolvedLab.backend`;
+  the second (`local-vbox`) and third (`cloud-digitalocean`) backends have
+  landed and the registry is in production use.
 
 ## 5. Plan Rendering
 
@@ -761,6 +762,29 @@ Tests: 2 new inventory tests (`needs_<role>` groups for
 generic-infra and the cross-VM lab) + updated loader test
 covering the new role. Suite now 313 passing, 3 skipped.
 Ansible syntax-check clean.
+
+## 17. Additional backends — local-vbox + cloud-digitalocean
+
+Status: done.
+
+Two backends shipped on top of the core platform:
+
+- **`local-vbox`** (slice 17a) — VirtualBox via `VBoxManage`; VMs reached
+  over a NAT SSH port-forward (`127.0.0.1:<port>`); uses `qemu-img` to
+  convert base images. Adds `vbox-smoke` lab. Validated live.
+
+- **`cloud-digitalocean`** (slice 17b) — DigitalOcean Droplets via OpenTofu
+  (`digitalocean/digitalocean ~> 2.0`). Per-lab generated tofu+state under
+  `.playground/state/cloud-digitalocean/<lab>/` (not the committed `tofu/`
+  root). Credentials from `$DIGITALOCEAN_TOKEN` only; never in HCL or logs.
+  Adds cloud-only `suspend`/`resume` verbs (`suspend` destroys Droplets to
+  stop billing; `resume` rebuilds from config — no snapshot, disk not
+  preserved). cloud-init readiness gate is advisory (Ansible is the real
+  gate, because DO's vendor first-boot script dirties `cloud-init status`).
+  Redroid/nested-virt not supported on DO. Validated live end-to-end.
+
+`dispatch.py` is the backend registry that routes `ResolvedLab.backend`
+to the correct adapter for all three backends.
 
 ## Backlog (acknowledged, not sequenced)
 

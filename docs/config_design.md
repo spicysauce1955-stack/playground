@@ -19,6 +19,8 @@ config/
   defaults.yaml
   providers/
     local-libvirt.yaml
+    local-vbox.yaml
+    cloud-digitalocean.yaml
   artifacts/
     sources.yaml
   networks/
@@ -97,8 +99,10 @@ Near-term validation gaps:
 Generic lab intent should stay backend-neutral. Provider-specific settings must
 live under provider config or provider override sections.
 
-The first backend is `local-libvirt`, but the config model should not make cloud
-or other future providers impossible.
+The first backend was `local-libvirt`; `local-vbox` and `cloud-digitalocean`
+have since been added, validating the design's backend-neutrality claim.
+DigitalOcean settings (token env var, region, slug) live in the provider config
+and lab override sections; the generic lab model was unchanged.
 
 ## Runtime Overrides
 
