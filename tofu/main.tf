@@ -54,22 +54,24 @@ resource "libvirt_network" "lab" {
     enabled = true
   }
 
-  # Authoritative DNS records — set when the lab pinned IPs for VMs
-  # on this network. Belt-and-braces with cloud-init's self-registered
-  # hostname (cloud_init.cfg sets hostname/fqdn from the same data).
-  dynamic "dns" {
-    for_each = length(lookup(var.vm_dns_hosts, each.key, [])) > 0 ? [1] : []
-    content {
-      # Without this, the provider's getDNSEnableFromResource emits
-      # <dns enable='no'> and libvirt disables dnsmasq DNS for the
-      # network entirely — silently ignoring the host records below.
-      enabled = true
-      dynamic "hosts" {
-        for_each = var.vm_dns_hosts[each.key]
-        content {
-          hostname = hosts.value.hostname
-          ip       = hosts.value.ip
-        }
+  # DNS MUST be enabled on EVERY network, unconditionally (BUG-4).
+  # The dmacvicar/libvirt provider's getDNSEnableFromResource defaults to
+  # "no" when no enabled `dns` block is present, so it emits
+  # <dns enable='no'> and libvirt disables dnsmasq DNS on the network.
+  # Guests then receive no upstream resolver via DHCP — systemd-resolved's
+  # 127.0.0.53 stub has nothing to forward to, so name resolution fails
+  # (and ansible's `apt update` fails) even though internet-by-IP works.
+  # With it enabled, dnsmasq forwards to the host resolver and advertises
+  # itself as the DNS server in its DHCP offers. Per-VM host records are
+  # added only when the lab pinned IPs (var.vm_dns_hosts); cloud-init also
+  # self-registers each hostname/fqdn.
+  dns {
+    enabled = true
+    dynamic "hosts" {
+      for_each = lookup(var.vm_dns_hosts, each.key, [])
+      content {
+        hostname = hosts.value.hostname
+        ip       = hosts.value.ip
       }
     }
   }
