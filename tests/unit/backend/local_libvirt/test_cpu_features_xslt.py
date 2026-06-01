@@ -90,7 +90,7 @@ def test_rendered_template_is_well_formed_xml() -> None:
     shutil.which("tofu") is None,
     reason="tofu not installed; skipping templatefile() integration check",
 )
-def test_tofu_templatefile_accepts_template() -> None:
+def test_tofu_templatefile_accepts_template(tmp_path: Path) -> None:
     """Regression guard for Bug A (2026-05-28): on the first live apply
     with `cpu_features_disable: [vmx]`, ``templatefile()`` rejected the
     file because the XML comment contained literal ``${...}`` /
@@ -101,15 +101,21 @@ def test_tofu_templatefile_accepts_template() -> None:
     parser, so it gave false confidence. This test calls the real
     ``tofu console`` to evaluate ``templatefile(...)`` against the
     on-disk template and asserts the call succeeds. Skipped when tofu
-    isn't on PATH; runs in <1 s when it is."""
-    tofu_dir = REPO_ROOT / "tofu"
+    isn't on PATH; runs in <1 s when it is.
+
+    Runs in an isolated temp dir holding only a copy of the template, NOT
+    in ``tofu/``. ``tofu console`` in ``tofu/`` initializes the libvirt
+    provider and acquires the state lock, so the check used to fail
+    whenever a concurrent ``tofu apply`` held that lock. An empty dir
+    needs no provider init and no state, so the render is hermetic."""
+    shutil.copy(TEMPLATE, tmp_path / TEMPLATE.name)
     expr = (
         f'templatefile("{TEMPLATE.name}", '
         '{ features = ["vmx", "svm", "hypervisor"] })\n'
     )
     result = subprocess.run(  # noqa: S603 — explicit args, no shell
         ["tofu", "console"], input=expr, text=True,
-        capture_output=True, check=False, cwd=tofu_dir,
+        capture_output=True, check=False, cwd=tmp_path,
         timeout=30,
     )
     assert result.returncode == 0, (
