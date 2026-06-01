@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from textual.widgets import ListView
 
 from playground.tui.app import PlaygroundTui
 
@@ -20,6 +21,12 @@ async def test_app_boots_and_renders_committed_lab() -> None:
         # The committed lab list should be visible.
         labels = [str(item.id) for item in app.query("ListItem")]
         assert "lab-generic-infra" in labels
+        # Render generic-infra explicitly rather than relying on which lab
+        # sorts first — the default selection shifts as labs are added or
+        # removed, so the assertions below must target a known lab.
+        listview = app.query_one("#lab-list", ListView)
+        listview.index = labels.index("lab-generic-infra")
+        await pilot.pause()
         text = app.detail_text
         assert "generic-infra" in text
         assert "backend: local-libvirt" in text
