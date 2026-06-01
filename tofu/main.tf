@@ -147,7 +147,7 @@ resource "libvirt_domain" "playground_node" {
     content {
       network_id     = libvirt_network.lab[network_interface.value.net].id
       addresses      = network_interface.value.ip != "" ? [network_interface.value.ip] : null
-      wait_for_lease = true
+      wait_for_lease = network_interface.key == 0
     }
   }
 

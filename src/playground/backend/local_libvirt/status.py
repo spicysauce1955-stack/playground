@@ -41,15 +41,20 @@ def query_status(
     ]
 
     lab_vm_names = {vm.name for vm in resolved.vms}
-    vms = [
-        VmStatus(
-            name=vm.name,
-            role=vm.role,
-            ip=vm_ips.get(vm.name),
-            state="provisioned" if vm.name in vm_ips else "missing",
+    vms = []
+    for vm in resolved.vms:
+        ip = vm_ips.get(vm.name)
+        state: str = "provisioned" if vm.name in vm_ips else "missing"
+        vms.append(
+            VmStatus(
+                name=vm.name,
+                role=vm.role,
+                ip=ip,
+                state=state,  # type: ignore[arg-type]
+                ssh_host=ip if ip is not None else None,
+                ssh_port=22 if ip is not None else None,
+            )
         )
-        for vm in resolved.vms
-    ]
     provisioned = sum(1 for v in vms if v.state == "provisioned")
     unknown = sorted(name for name in vm_ips if name not in lab_vm_names)
 

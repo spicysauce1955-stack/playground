@@ -12,6 +12,7 @@ from __future__ import annotations
 from playground.backend.local_vbox.vbox import (
     list_running_vms,
     list_vms,
+    nat_ssh_port,
     vboxmanage_available,
 )
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -53,7 +54,23 @@ def query_status(resolved: ResolvedLab) -> tuple[LabStatus, list[Diagnostic]]:
             state = "provisioned"
         else:
             state = "missing"
-        vms.append(VmStatus(name=vm.name, role=vm.role, ip=None, state=state))
+        if state in ("running", "provisioned"):
+            port = nat_ssh_port(vbox_name)
+            ssh_host: str | None = "127.0.0.1"
+            ssh_port: int | None = port
+        else:
+            ssh_host = None
+            ssh_port = None
+        vms.append(
+            VmStatus(
+                name=vm.name,
+                role=vm.role,
+                ip=None,
+                state=state,  # type: ignore[arg-type]
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+            )
+        )
 
     present = sum(1 for v in vms if v.state in ("running", "provisioned"))
     declared = {f"{lab}-{vm.name}" for vm in resolved.vms}

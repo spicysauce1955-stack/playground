@@ -140,7 +140,12 @@ def execute_apply(
             )
         return _finalize_failure(
             run, run_dir, steps, bus, tofu_diagnostics,
-            "tofu apply failed; no VMs provisioned",
+            (
+                f"tofu apply failed; some or all libvirt domains may have been "
+                f"created before the failure and could still be running. "
+                f"Run `playground reset {lab}` (or `playground destroy {lab}`) "
+                f"to clean up any orphaned domains before re-applying."
+            ),
         )
 
     if crash_diagnostics:

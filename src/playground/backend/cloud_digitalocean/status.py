@@ -148,6 +148,8 @@ def query_status(resolved: ResolvedLab) -> tuple[LabStatus, list[Diagnostic]]:
                 ip=ip,
                 state=state,
                 provider_id=provider_id,
+                ssh_host=ip if ip is not None else None,
+                ssh_port=22 if ip is not None else None,
             )
         )
 

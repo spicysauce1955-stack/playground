@@ -141,6 +141,57 @@ def test_query_status_lists_unknown_tofu_domains(
     assert status.unknown_vms == ["ghost-vm"]
 
 
+# ---------------------------------------------------------------------------
+# NOTE-2 — ssh_host / ssh_port on provisioned libvirt VMs
+# ---------------------------------------------------------------------------
+
+
+def test_query_status_provisioned_vm_reports_ssh_host(
+    resolved_generic_infra, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provisioned libvirt VM must expose ssh_host equal to its IP."""
+    payload = json.dumps(
+        {"vm_ips": {"value": {"node1": "10.0.10.10"}}}
+    )
+    bin_dir = _write_tofu_shim(tmp_path, payload)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    status, _ = query_status(resolved_generic_infra, tmp_path)
+
+    node1 = next(v for v in status.vms if v.name == "node1")
+    assert node1.ssh_host == "10.0.10.10"
+
+
+def test_query_status_provisioned_vm_reports_ssh_port_22(
+    resolved_generic_infra, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provisioned libvirt VM must expose ssh_port=22."""
+    payload = json.dumps(
+        {"vm_ips": {"value": {"node1": "10.0.10.11"}}}
+    )
+    bin_dir = _write_tofu_shim(tmp_path, payload)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    status, _ = query_status(resolved_generic_infra, tmp_path)
+
+    node1 = next(v for v in status.vms if v.name == "node1")
+    assert node1.ssh_port == 22
+
+
+def test_query_status_missing_vm_reports_no_ssh_endpoint(
+    resolved_generic_infra, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing libvirt VM must have ssh_host=None and ssh_port=None."""
+    bin_dir = _write_tofu_shim(tmp_path, "{}")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    status, _ = query_status(resolved_generic_infra, tmp_path)
+
+    for vm in status.vms:
+        assert vm.ssh_host is None
+        assert vm.ssh_port is None
+
+
 def test_query_status_surfaces_parse_failures(
     resolved_generic_infra, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

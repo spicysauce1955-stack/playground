@@ -31,6 +31,16 @@ class VmStatus(StrictModel):
     provider_id: str | None = None
     """Cloud provider resource ID (e.g. DigitalOcean Droplet ID as a string).
     ``None`` for local backends (libvirt, vbox) that have no external resource ID."""
+    ssh_host: str | None = None
+    """Reachable SSH host for a backend-neutral consumer.
+    libvirt and cloud backends set this to the VM IP; vbox uses
+    ``127.0.0.1`` (NAT port-forward). ``None`` when the VM is not
+    yet provisioned or otherwise unreachable."""
+    ssh_port: int | None = None
+    """Reachable SSH port for a backend-neutral consumer.
+    libvirt and cloud backends use 22; vbox uses the per-VM
+    NAT-forwarded host port. ``None`` when the VM is not yet
+    provisioned or otherwise unreachable."""
 
 
 class LabStatus(StrictModel):

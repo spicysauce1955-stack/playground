@@ -364,6 +364,79 @@ def test_query_status_api_failure_escalates_api_error_to_error(
         )
 
 
+# ---------------------------------------------------------------------------
+# NOTE-2 — ssh_host / ssh_port on active droplet
+# ---------------------------------------------------------------------------
+
+
+def test_query_status_active_droplet_reports_ssh_host(
+    resolved_cloud_smoke, monkeypatch
+):
+    """An active droplet with a public IPv4 must expose ssh_host=<that ip>."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+    vm_name = resolved_cloud_smoke.vms[0].name
+    lab = resolved_cloud_smoke.lab_name
+
+    def fake_list(token, tag):
+        return [
+            {
+                "id": 42,
+                "name": f"{lab}-{vm_name}",
+                "status": "active",
+                "networks": {
+                    "v4": [{"type": "public", "ip_address": "203.0.113.5"}]
+                },
+            }
+        ], [], True
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
+    lab_status, _ = query_status(resolved_cloud_smoke)
+    vm = next(v for v in lab_status.vms if v.name == vm_name)
+    assert vm.ssh_host == "203.0.113.5"
+
+
+def test_query_status_active_droplet_reports_ssh_port_22(
+    resolved_cloud_smoke, monkeypatch
+):
+    """An active droplet must expose ssh_port=22."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+    vm_name = resolved_cloud_smoke.vms[0].name
+    lab = resolved_cloud_smoke.lab_name
+
+    def fake_list(token, tag):
+        return [
+            {
+                "id": 43,
+                "name": f"{lab}-{vm_name}",
+                "status": "active",
+                "networks": {
+                    "v4": [{"type": "public", "ip_address": "203.0.113.6"}]
+                },
+            }
+        ], [], True
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
+    lab_status, _ = query_status(resolved_cloud_smoke)
+    vm = next(v for v in lab_status.vms if v.name == vm_name)
+    assert vm.ssh_port == 22
+
+
+def test_query_status_missing_droplet_reports_no_ssh_endpoint(
+    resolved_cloud_smoke, monkeypatch
+):
+    """A missing droplet (not in API response) must have ssh_host=None, ssh_port=None."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+
+    def fake_list(token, tag):
+        return [], [], True
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
+    lab_status, _ = query_status(resolved_cloud_smoke)
+    for vm in lab_status.vms:
+        assert vm.ssh_host is None
+        assert vm.ssh_port is None
+
+
 def test_query_status_api_failure_not_silently_missing(
     resolved_cloud_smoke, monkeypatch
 ):
