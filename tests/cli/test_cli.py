@@ -2040,3 +2040,61 @@ def test_plan_command_calls_load_config_once(
         f"was called {call_count['n']} times. "
         "estimate_cost and plan_provider_summary must reuse the already-loaded config."
     )
+
+
+# ===========================================================================
+# BUG-1 Fix 2 — per-lab validation warnings must not leak across labs
+# ===========================================================================
+
+
+def test_plan_cloud_smoke_does_not_leak_generic_infra_warning() -> None:
+    """BUG-1 regression: planning cloud-smoke must NOT emit the
+    config.backend.per_vm_resources_unsupported warning that belongs to
+    generic-infra (which uses local-libvirt with heterogeneous VM resources).
+    After the fix, validate_loaded_config is called with lab='cloud-smoke'
+    so only that lab's diagnostics are checked."""
+    result = CliRunner().invoke(
+        app,
+        ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR)],
+    )
+
+    assert result.exit_code == 0, result.output
+    combined = result.stdout + result.stderr
+    assert "per_vm_resources_unsupported" not in combined, (
+        "generic-infra's per_vm_resources_unsupported warning leaked into "
+        "cloud-smoke's plan output — the lab= scoping in plan_command is broken."
+    )
+
+
+def test_plan_generic_infra_still_emits_its_own_warning() -> None:
+    """BUG-1 regression (positive case): planning generic-infra must still
+    emit config.backend.per_vm_resources_unsupported for that lab itself."""
+    result = CliRunner().invoke(
+        app,
+        ["plan", "generic-infra", "--config-dir", str(CONFIG_DIR)],
+    )
+
+    assert result.exit_code == 0, result.output
+    combined = result.stdout + result.stderr
+    assert "per_vm_resources_unsupported" in combined, (
+        "generic-infra's own per_vm_resources_unsupported warning was suppressed — "
+        "the lab= scoping in plan_command is too aggressive."
+    )
+
+
+def test_validate_whole_tree_still_emits_generic_infra_warning() -> None:
+    """BUG-1 regression: playground validate is a whole-tree command and
+    must still emit warnings from every lab, including generic-infra's
+    config.backend.per_vm_resources_unsupported."""
+    result = CliRunner().invoke(
+        app,
+        ["validate", "--config-dir", str(CONFIG_DIR)],
+    )
+
+    assert result.exit_code == 0, result.output
+    combined = result.stdout + result.stderr
+    assert "per_vm_resources_unsupported" in combined, (
+        "playground validate no longer emits generic-infra's "
+        "per_vm_resources_unsupported warning — the whole-tree validate path "
+        "is broken."
+    )

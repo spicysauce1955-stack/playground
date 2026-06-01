@@ -249,7 +249,7 @@ def show_lab(
     """Show a resolved lab definition."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=name))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -301,7 +301,7 @@ def render_inventory_command(
     """Render an Ansible inventory for ``lab`` from tofu state."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -392,7 +392,7 @@ def plan_command(
     """Render a backend-neutral plan for ``lab`` (read-only)."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     warnings = _warnings_in(diagnostics)
     _print_warnings(diagnostics)
@@ -497,7 +497,7 @@ def render_tfvars_command(
     """Render a ``-var-file`` payload for ``lab`` so ``tofu apply`` is in sync."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -571,7 +571,7 @@ def apply_command(
     """Apply ``lab``: render inputs, run tofu apply, render inventory, run Ansible."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -875,7 +875,7 @@ def exec_command(
 
     loaded, diagnostics = _load_config_or_exit(config_dir, OutputFormat.human)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, OutputFormat.human, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -993,7 +993,7 @@ def status_command(
     """Show observed state of ``lab`` — or every lab when ``lab`` is omitted."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1084,7 +1084,7 @@ def destroy_command(
     """Destroy ``lab``: render the same vars apply uses, then `tofu destroy`."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1150,7 +1150,7 @@ def reset_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1221,7 +1221,7 @@ def suspend_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1297,7 +1297,7 @@ def resume_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 

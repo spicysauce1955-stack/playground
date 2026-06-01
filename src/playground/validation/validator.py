@@ -72,12 +72,26 @@ def _source_for(loaded: LoadedConfig, kind: str, name: str) -> SourceLocation:
     return SourceLocation(path="config/")
 
 
-def validate(loaded: LoadedConfig, ansible_roles_dir: Path | None = None) -> list[Diagnostic]:
+def validate(
+    loaded: LoadedConfig,
+    ansible_roles_dir: Path | None = None,
+    *,
+    lab: str | None = None,
+) -> list[Diagnostic]:
     """Run every cross-reference check and return collected diagnostics.
 
     ``ansible_roles_dir`` enables the ``config.reference.ansible_role_missing``
     warning. When ``None``, the check is
     skipped — this lets unit tests run without a real ansible/ tree.
+
+    ``lab`` scopes the **per-lab** checks to a single lab. When set, only
+    that lab's diagnostics are emitted (plus the lab-independent
+    config-integrity checks: required singletons + role graph). This keeps
+    one lab's warnings (e.g. ``config.backend.per_vm_resources_unsupported``)
+    out of another lab's plan/apply/status output. ``None`` validates every
+    lab (the ``playground validate`` whole-tree behavior). An unknown ``lab``
+    name simply yields no per-lab diagnostics; the caller's resolve step
+    surfaces the unknown-lab error.
     """
     diagnostics: list[Diagnostic] = []
 
@@ -85,8 +99,13 @@ def validate(loaded: LoadedConfig, ansible_roles_dir: Path | None = None) -> lis
     diagnostics.extend(_check_role_inheritance(loaded))
     diagnostics.extend(_check_ansible_roles(loaded, ansible_roles_dir))
 
-    for lab in loaded.labs.values():
-        diagnostics.extend(_check_lab(lab, loaded))
+    if lab is None:
+        labs_to_check = list(loaded.labs.values())
+    else:
+        target = loaded.labs.get(lab)
+        labs_to_check = [target] if target is not None else []
+    for lab_obj in labs_to_check:
+        diagnostics.extend(_check_lab(lab_obj, loaded))
 
     return diagnostics
 
