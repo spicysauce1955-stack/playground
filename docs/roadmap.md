@@ -786,6 +786,43 @@ Two backends shipped on top of the core platform:
 `dispatch.py` is the backend registry that routes `ResolvedLab.backend`
 to the correct adapter for all three backends.
 
+## barak-deploy hardening (2026-06-02 qualification round)
+
+Fixes from the barak-deploy team's cross-VM qualification, prioritized
+in `PLAYGROUND-REQUEST-barak-deploy.md`. All done.
+
+- **Cloud-credential preflight (NOTE-6).** A revoked/expired/wrong-scope
+  DigitalOcean token used to fail only deep inside `tofu apply` (after a
+  Droplet might exist) as a raw `401`. `do.verify_token` (`GET
+  /v2/account`) now backs three preflights: `doctor`
+  (`check_cloud_do_token_auth`), the cloud runner's `cloud-preflight`
+  step (hard-fails `apply` before any tofu run), and `plan`
+  (warning-only — `_cloud_credential_warnings`, ids
+  `runtime.plan.cloud_token_{missing,unauthorized,forbidden}`). 401 vs
+  403 are distinguished; the token value is never logged.
+- **Deterministic exit codes.** `apply`/`suspend`/`resume` exit non-zero
+  on a rejected preflight even when the rejecting diagnostics are
+  warnings; the per-VM-resources warning is demoted off read-only
+  commands.
+- **BUG-6 workload `from_json`.** `workload_container` / `workload_compose`
+  accept `pg_workloads` as a list or a JSON string.
+- **BUG-7 exec quoting.** `exec` shlex-quotes the remote argv into one
+  ssh argument; `--host` is an alias for `--on`.
+- **PAPERCUT-5 stale state-lock.** `reset` runs a `clear-stale-lock` step
+  (`local_libvirt/lock.py`) before tofu-destroy. Staleness is proven by
+  liveness — a non-blocking `lockf` probe of tofu's POSIX lock — so a
+  lock with no live owner is `tofu force-unlock`-ed
+  (`runtime.reset.lock_cleared`) while a live one is left alone
+  (`runtime.reset.lock_held`).
+- **`playground cp` (request item 6).** New scp-backed file transfer:
+  `cp <local> [lab:]host:/path` and the reverse. Exactly one side is
+  remote (colon-before-slash, scp-style); reuses the backend-neutral
+  `VmStatus.ssh_host`/`ssh_port` endpoint resolution `exec` uses (so it
+  works over the vbox NAT port and cloud public IP), passes `-r` for
+  directories, and propagates scp's exit code. Diagnostic ids
+  `config.cp.{no_remote_endpoint,two_remote_endpoints,missing_host,
+  lab_required,unknown_vm,vm_ip_not_found}`, `runtime.cp.scp_binary_missing`.
+
 ## Backlog (acknowledged, not sequenced)
 
 Items confirmed as real product needs but explicitly not urgent —

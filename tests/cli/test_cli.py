@@ -64,6 +64,20 @@ def _stub_live_apply_steps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_mod, "verify_lab", _stub_verify)
 
 
+@pytest.fixture(autouse=True)
+def _stub_cloud_token_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the cloud-credential preflight (`plan`/`apply` on a cloud lab)
+    offline by default: stub the DigitalOcean auth probe to "authenticated"
+    so no test makes a live `GET /v2/account`. Tests that exercise the
+    401/403/missing-token paths re-patch verify_token and the token env
+    themselves (the patch takes effect because the preflight imports
+    verify_token lazily at call time)."""
+    monkeypatch.setattr(
+        "playground.backend.cloud_digitalocean.do.verify_token",
+        lambda _token: 200,
+    )
+
+
 def _write_fake_tofu(tmp_path: Path, payload: str) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1493,6 +1507,217 @@ def test_exec_accepts_host_alias_for_on(
     assert "uptime" in (tmp_path / "ssh.log").read_text()
 
 
+# --------------------------------------------------------------------------- #
+# cp (file transfer over scp) — barak-deploy request item 6 / PAPERCUT-4
+# --------------------------------------------------------------------------- #
+
+
+def _write_scp_shim(tmp_path: Path, *, exit_code: int = 0) -> Path:
+    """PATH-shimmed `scp` that records its argv to a log file."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log_path = tmp_path / "scp.log"
+    scp = bin_dir / "scp"
+    scp.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" > {shlex.quote(str(log_path))}\n'
+        f"exit {exit_code}\n"
+    )
+    scp.chmod(scp.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
+
+
+def _patch_vbox_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "playground.cli.main.query_status",
+        lambda resolved, tofu_dir: (_fake_vbox_status(), []),
+    )
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("./local.tar", None),
+        ("/abs/path", None),
+        ("./has:colon", None),          # colon after a slash ⇒ local
+        ("node1:/tmp/app.tar", (None, "node1", "/tmp/app.tar")),
+        ("lab1:node1:/tmp/x", ("lab1", "node1", "/tmp/x")),
+        ("node1:", (None, "node1", "")),
+        (":/no/host", (None, "", "/no/host")),
+    ],
+)
+def test_cp_parse_endpoint(token: str, expected: tuple | None) -> None:
+    from playground.cli.main import _parse_endpoint
+
+    got = _parse_endpoint(token)
+    assert (None if got is None else tuple(got)) == expected
+
+
+def test_cp_upload_rewrites_remote_operand_and_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scp_bin = _write_scp_shim(tmp_path)
+    monkeypatch.setenv("PATH", f"{scp_bin}{os.pathsep}{os.environ['PATH']}")
+    _patch_vbox_status(monkeypatch)
+    local = tmp_path / "app.tar"
+    local.write_text("payload")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke",
+            "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tmp_path),
+            str(local), "node1:/tmp/app.tar",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    argv = (tmp_path / "scp.log").read_text().splitlines()
+    # vbox NAT forward → scp uses -P (capital) with the forwarded port.
+    assert "-P" in argv and "2222" in argv
+    # local side verbatim, remote side rewritten to user@host:path.
+    assert argv[-2] == str(local)
+    assert argv[-1] == "ubuntu@127.0.0.1:/tmp/app.tar"
+
+
+def test_cp_download_puts_remote_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scp_bin = _write_scp_shim(tmp_path)
+    monkeypatch.setenv("PATH", f"{scp_bin}{os.pathsep}{os.environ['PATH']}")
+    _patch_vbox_status(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke",
+            "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tmp_path),
+            "node1:/var/log/syslog", str(tmp_path / "syslog"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    argv = (tmp_path / "scp.log").read_text().splitlines()
+    assert argv[-2] == "ubuntu@127.0.0.1:/var/log/syslog"
+    assert argv[-1] == str(tmp_path / "syslog")
+
+
+def test_cp_recursive_flag_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scp_bin = _write_scp_shim(tmp_path)
+    monkeypatch.setenv("PATH", f"{scp_bin}{os.pathsep}{os.environ['PATH']}")
+    _patch_vbox_status(monkeypatch)
+    src = tmp_path / "dir"
+    src.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "-r", "--lab", "vbox-smoke",
+            "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tmp_path),
+            str(src), "node1:/tmp/dir",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert "-r" in (tmp_path / "scp.log").read_text().splitlines()
+
+
+def test_cp_lab_prefix_in_path_resolves_lab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`lab:host:/path` carries the lab, so --lab can be omitted."""
+    scp_bin = _write_scp_shim(tmp_path)
+    monkeypatch.setenv("PATH", f"{scp_bin}{os.pathsep}{os.environ['PATH']}")
+    _patch_vbox_status(monkeypatch)
+    local = tmp_path / "app.tar"
+    local.write_text("x")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tmp_path),
+            str(local), "vbox-smoke:node1:/tmp/app.tar",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert (tmp_path / "scp.log").read_text().splitlines()[-1] == (
+        "ubuntu@127.0.0.1:/tmp/app.tar"
+    )
+
+
+def test_cp_propagates_scp_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scp_bin = _write_scp_shim(tmp_path, exit_code=7)
+    monkeypatch.setenv("PATH", f"{scp_bin}{os.pathsep}{os.environ['PATH']}")
+    _patch_vbox_status(monkeypatch)
+    local = tmp_path / "app.tar"
+    local.write_text("x")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke",
+            "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tmp_path),
+            str(local), "node1:/tmp/app.tar",
+        ],
+    )
+
+    assert result.exit_code == 7
+
+
+def test_cp_rejects_two_local_paths(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke", "--config-dir", str(CONFIG_DIR),
+            str(tmp_path / "a"), str(tmp_path / "b"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "config.cp.no_remote_endpoint" in result.stderr
+
+
+def test_cp_rejects_two_remote_paths(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke", "--config-dir", str(CONFIG_DIR),
+            "node1:/a", "node1:/b",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "config.cp.two_remote_endpoints" in result.stderr
+
+
+def test_cp_unknown_vm_fails(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke", "--config-dir", str(CONFIG_DIR),
+            "--tofu-dir", str(tmp_path),
+            str(tmp_path / "a"), "ghost:/tmp/x",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "config.cp.unknown_vm" in result.stderr
+
+
+def test_cp_missing_host_fails(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "cp", "--lab", "vbox-smoke", "--config-dir", str(CONFIG_DIR),
+            str(tmp_path / "a"), ":/tmp/x",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "config.cp.missing_host" in result.stderr
+
+
 def test_apply_exits_nonzero_when_preflight_rejects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1991,6 +2216,80 @@ def test_plan_cloud_smoke_json_has_cost_estimate() -> None:
     assert ce["hourly_usd"] > 0
     assert ce["monthly_usd"] > 0
     assert ce["advisory"] is True
+
+
+# --------------------------------------------------------------------------- #
+# cloud-credential preflight in `plan` (NOTE-6) — warning-only, read-only
+# --------------------------------------------------------------------------- #
+
+
+def test_plan_cloud_warns_when_token_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    result = CliRunner().invoke(
+        app, ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR)],
+    )
+    assert result.exit_code == 0, result.output  # read-only: never hard-fails
+    assert "runtime.plan.cloud_token_missing" in result.stderr
+
+
+def test_plan_cloud_warns_on_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_secrettoken")
+    monkeypatch.setattr(
+        "playground.backend.cloud_digitalocean.do.verify_token", lambda _t: 401,
+    )
+    result = CliRunner().invoke(
+        app, ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR)],
+    )
+    assert result.exit_code == 0
+    assert "runtime.plan.cloud_token_unauthorized" in result.stderr
+    # the token value is never echoed anywhere.
+    assert "dop_v1_secrettoken" not in (result.stdout + result.stderr)
+
+
+def test_plan_cloud_warns_on_403(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_secrettoken")
+    monkeypatch.setattr(
+        "playground.backend.cloud_digitalocean.do.verify_token", lambda _t: 403,
+    )
+    result = CliRunner().invoke(
+        app, ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR)],
+    )
+    assert result.exit_code == 0
+    assert "runtime.plan.cloud_token_forbidden" in result.stderr
+
+
+def test_plan_cloud_silent_when_token_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_secrettoken")
+    # autouse stub already returns 200; assert no token diagnostic leaks.
+    result = CliRunner().invoke(
+        app, ["plan", "cloud-smoke", "--config-dir", str(CONFIG_DIR)],
+    )
+    assert result.exit_code == 0
+    assert "cloud_token" not in result.stderr
+
+
+def test_plan_local_lab_skips_cloud_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local-libvirt lab must never trigger the DigitalOcean auth probe."""
+    calls = {"n": 0}
+
+    def _spy(_token: str) -> int:
+        calls["n"] += 1
+        return 200
+
+    monkeypatch.setattr(
+        "playground.backend.cloud_digitalocean.do.verify_token", _spy,
+    )
+    result = CliRunner().invoke(
+        app, ["plan", "generic-infra", "--config-dir", str(CONFIG_DIR)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls["n"] == 0
 
 
 def test_plan_generic_infra_json_has_null_cost_estimate() -> None:

@@ -8,7 +8,7 @@ import shlex
 import subprocess
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, NamedTuple, NoReturn
 
 import typer
 
@@ -400,6 +400,16 @@ def plan_command(
     _print_warnings(diagnostics, keep_provisioning=True)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+
+    # Cloud-credential preflight (NOTE-6): for a cloud lab, make one cheap
+    # authenticated call so an expired/unscoped token is flagged here rather
+    # than deep inside a later `apply`. Warning-only — plan is read-only and
+    # the cost/budget below is still worth showing.
+    cloud_warnings = _cloud_credential_warnings(resolved)
+    if cloud_warnings:
+        _print_warnings(cloud_warnings)
+        warnings = warnings + cloud_warnings
+
     # Pass the already-loaded config to avoid parsing the config tree a second
     # and third time inside estimate_cost / plan_provider_summary.
     cost = estimate_cost(resolved, loaded=loaded)
@@ -996,6 +1006,239 @@ def exec_command(
     raise typer.Exit(code=completed.returncode)
 
 
+class _Endpoint(NamedTuple):
+    """A parsed `cp` operand. ``host`` empty + ``path`` only ⇒ local file."""
+
+    lab: str | None
+    host: str
+    path: str
+
+
+def _parse_endpoint(token: str) -> _Endpoint | None:
+    """Classify a `cp` operand as remote (`[lab:]host:path`) or local.
+
+    Returns ``None`` for a local path. Mirrors scp's rule: an operand is
+    remote when a colon appears before any slash. The locator before the
+    path is one or two colon-separated identifiers — ``host:path`` (lab
+    defaults to the only configured lab) or ``lab:host:path``. The path may
+    itself contain colons once a ``/`` has been seen (absolute paths).
+    """
+    colon = token.find(":")
+    if colon == -1:
+        return None
+    slash = token.find("/")
+    if slash != -1 and slash < colon:
+        return None  # the colon lives inside a local path like ./a:b
+    first, _, rest = token.partition(":")
+    rest_colon = rest.find(":")
+    rest_slash = rest.find("/")
+    if rest_colon != -1 and (rest_slash == -1 or rest_colon < rest_slash):
+        host, _, path = rest.partition(":")
+        return _Endpoint(lab=first, host=host, path=path)
+    return _Endpoint(lab=None, host=first, path=rest)
+
+
+@app.command(
+    "cp",
+    help=(
+        "Copy a file to or from a lab VM over scp. Exactly one of SRC / DST "
+        "is remote, written `host:/path` or `lab:host:/path` "
+        "(e.g. `central:/tmp/app.tar`)."
+    ),
+)
+def cp_command(
+    src: Annotated[
+        str,
+        typer.Argument(help="Source: a local path, or `host:/path` / `lab:host:/path`."),
+    ],
+    dst: Annotated[
+        str,
+        typer.Argument(help="Destination: a local path, or `host:/path` / `lab:host:/path`."),
+    ],
+    lab: Annotated[
+        str | None,
+        typer.Option(
+            "--lab",
+            help=(
+                "Lab name; overrides a `lab:` prefix in the path. Defaults to "
+                "the only configured lab when there is exactly one."
+            ),
+        ),
+    ] = None,
+    user: Annotated[
+        str,
+        typer.Option("--user", help="SSH user (default: ubuntu)."),
+    ] = "ubuntu",
+    recursive: Annotated[
+        bool,
+        typer.Option("--recursive", "-r", help="Recursively copy a directory."),
+    ] = False,
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+) -> None:
+    src_remote = _parse_endpoint(src)
+    dst_remote = _parse_endpoint(dst)
+
+    if src_remote is None and dst_remote is None:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.cp.no_remote_endpoint",
+                severity="error",
+                message=(
+                    "neither SRC nor DST is a VM path; write one side as "
+                    "`[lab:]host:/path` (e.g. `central:/tmp/app.tar`)"
+                ),
+                source=SourceLocation(path="<argv>"),
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+    if src_remote is not None and dst_remote is not None:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.cp.two_remote_endpoints",
+                severity="error",
+                message=(
+                    "VM-to-VM copy is not supported; copy via a local path "
+                    "(download from one host, then upload to the other)"
+                ),
+                source=SourceLocation(path="<argv>"),
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    remote = src_remote if src_remote is not None else dst_remote
+    assert remote is not None  # exactly one side is remote (checked above)
+    if not remote.host:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.cp.missing_host",
+                severity="error",
+                message=(
+                    "remote path is missing a VM name; write it as "
+                    "`[lab:]host:/path`"
+                ),
+                source=SourceLocation(path="<argv>"),
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    # Lab precedence: --lab flag > `lab:` in the path > the only configured lab.
+    lab_name = lab or remote.lab
+
+    loaded, diagnostics = _load_config_or_exit(config_dir, OutputFormat.human)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab_name))
+    _exit_on_errors(diagnostics, OutputFormat.human, json_errors=False)
+    _print_warnings(diagnostics)
+
+    if lab_name is None:
+        if len(loaded.labs) == 1:
+            lab_name = next(iter(loaded.labs))
+        else:
+            _exit_with_diagnostic(
+                Diagnostic(
+                    id="config.cp.lab_required",
+                    severity="error",
+                    message=(
+                        f"--lab required (or a `lab:` prefix) when "
+                        f"{len(loaded.labs)} labs are configured"
+                    ),
+                    source=SourceLocation(path=str(config_dir / "labs")),
+                    suggestion="run `playground lab list` and pass --lab <name>",
+                ),
+                OutputFormat.human,
+                json_errors=False,
+            )
+
+    resolved = _resolve_lab_or_exit(loaded, lab_name, config_dir, OutputFormat.human)
+
+    vm_names = {vm.name for vm in resolved.vms}
+    if remote.host not in vm_names:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.cp.unknown_vm",
+                severity="error",
+                message=(
+                    f"VM {remote.host!r} is not declared in lab {lab_name!r} "
+                    f"(known VMs: {sorted(vm_names) or '<none>'})"
+                ),
+                source=SourceLocation(path=f"config/labs/{lab_name}.yaml"),
+                key_path="spec.vms",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    # Same backend-neutral SSH endpoint resolution as `exec`: vbox is a
+    # 127.0.0.1 NAT port-forward, cloud a public IP, libvirt a guest IP —
+    # all uniform via VmStatus.ssh_host / ssh_port.
+    status, query_diagnostics = query_status(resolved, tofu_dir)
+    _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+
+    vm_status = next((v for v in status.vms if v.name == remote.host), None)
+    ssh_host = vm_status.ssh_host if vm_status else None
+    ssh_port = vm_status.ssh_port if vm_status else None
+    if not ssh_host:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="config.cp.vm_ip_not_found",
+                severity="error",
+                message=(
+                    f"VM {remote.host!r} has no reachable SSH endpoint — "
+                    "has the lab been applied?"
+                ),
+                source=SourceLocation(
+                    path=str(config_dir / "labs" / f"{lab_name}.yaml")
+                ),
+                suggestion=f"run `playground apply {lab_name}` first",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+
+    # Rewrite the remote operand to scp's `user@host:path`; the local side is
+    # passed through verbatim. scp uses -P (capital) for the port, unlike ssh.
+    remote_operand = f"{user}@{ssh_host}:{remote.path}"
+    scp_src = remote_operand if src_remote is not None else src
+    scp_dst = remote_operand if dst_remote is not None else dst
+    scp_argv = [
+        "scp",
+        *(["-P", str(ssh_port)] if ssh_port and ssh_port != 22 else []),
+        *(["-r"] if recursive else []),
+        "-o", "StrictHostKeyChecking=accept-new",
+        # vbox reuses 127.0.0.1:<port> across rebuilds — pinned known_hosts
+        # would trip a host-key mismatch; discard it (matches exec).
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        scp_src,
+        scp_dst,
+    ]
+    try:
+        completed = subprocess.run(scp_argv, check=False)  # noqa: S603
+    except FileNotFoundError as exc:
+        _exit_with_diagnostic(
+            Diagnostic(
+                id="runtime.cp.scp_binary_missing",
+                severity="error",
+                message=f"failed to launch scp: {exc}",
+                source=SourceLocation(path="scp"),
+                suggestion="install openssh-client",
+            ),
+            OutputFormat.human,
+            json_errors=False,
+        )
+    raise typer.Exit(code=completed.returncode)
+
+
 @app.command("status")
 def status_command(
     lab: Annotated[
@@ -1540,6 +1783,75 @@ def _warnings_in(diagnostics: list[Diagnostic]) -> list[Diagnostic]:
 _PROVISIONING_ONLY_WARNING_IDS = frozenset(
     {"config.backend.per_vm_resources_unsupported"}
 )
+
+
+def _cloud_credential_warnings(resolved: ResolvedLab) -> list[Diagnostic]:
+    """Best-effort DigitalOcean credential preflight for read-only commands.
+
+    Returns *warning* diagnostics (never errors — the caller is read-only)
+    when the cloud token is missing or rejected, so ``plan`` flags an
+    unusable credential before the user spends an ``apply``. No-op for
+    non-cloud labs. A valid token, or a transport blip we can't classify,
+    yields nothing — a read-only plan shouldn't be blocked by the network.
+    Never logs or echoes the token value. See Group 3 / NOTE-6; ``apply``
+    enforces the same check as a hard preflight in the cloud runner.
+    """
+    if resolved.backend != "cloud-digitalocean":
+        return []
+    from playground.backend.cloud_digitalocean.do import (
+        read_token,
+        token_env_name,
+        verify_token,
+    )
+
+    env = token_env_name(resolved)
+    token = read_token(resolved)
+    if not token:
+        return [
+            Diagnostic(
+                id="runtime.plan.cloud_token_missing",
+                severity="warning",
+                message=(
+                    f"${env} is not set — `apply {resolved.lab_name}` will fail "
+                    "to authenticate with DigitalOcean."
+                ),
+                source=SourceLocation(path="environment"),
+                suggestion=(
+                    f"export {env}=<token>  # generate at "
+                    "https://cloud.digitalocean.com/account/api/tokens"
+                ),
+            )
+        ]
+    status = verify_token(token)
+    if status == 401:
+        return [
+            Diagnostic(
+                id="runtime.plan.cloud_token_unauthorized",
+                severity="warning",
+                message=(
+                    f"DigitalOcean rejected ${env} (401) — the token is expired "
+                    "or revoked; `apply` will fail until it is regenerated."
+                ),
+                source=SourceLocation(path="environment"),
+                suggestion=(
+                    "regenerate at "
+                    "https://cloud.digitalocean.com/account/api/tokens"
+                ),
+            )
+        ]
+    if status == 403:
+        return [
+            Diagnostic(
+                id="runtime.plan.cloud_token_forbidden",
+                severity="warning",
+                message=(
+                    f"DigitalOcean rejected ${env} (403) — the token lacks the "
+                    "required scope; recreate it with read+write scopes."
+                ),
+                source=SourceLocation(path="environment"),
+            )
+        ]
+    return []
 
 
 def _print_warnings(
