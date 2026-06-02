@@ -15,6 +15,7 @@ from playground.backend.cloud_digitalocean.do import (
     read_token,
     token_env_name,
     token_present,
+    verify_token,
 )
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
@@ -383,3 +384,70 @@ def test_delete_droplet_transport_error_0_returns_warning(monkeypatch):
     # Suggestion must guide operator to the console (no token value)
     assert "digitalocean.com" in (diags[0].suggestion or "").lower() or \
            "manually" in (diags[0].suggestion or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# verify_token — monkeypatched _request; token must never appear in return value
+# ---------------------------------------------------------------------------
+
+
+def test_verify_token_returns_200_on_success(monkeypatch):
+    """verify_token returns the HTTP status code on a 200 response."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (200, {"account": {}}),
+    )
+    assert verify_token("tok") == 200
+
+
+def test_verify_token_returns_401_on_unauthorized(monkeypatch):
+    """verify_token returns 401 when the API rejects the credential."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (401, {}),
+    )
+    assert verify_token("tok") == 401
+
+
+def test_verify_token_returns_403_on_forbidden(monkeypatch):
+    """verify_token returns 403 when the token lacks required scope."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (403, {}),
+    )
+    assert verify_token("tok") == 403
+
+
+def test_verify_token_returns_0_on_transport_error(monkeypatch):
+    """verify_token returns 0 on a transport error (mirrors _request behaviour)."""
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (0, {}),
+    )
+    assert verify_token("tok") == 0
+
+
+def test_verify_token_calls_get_account_endpoint(monkeypatch):
+    """verify_token must probe GET /v2/account (not a different path)."""
+    calls: list[tuple[str, str]] = []
+
+    def recording_request(method, path, token, *, params=None):
+        calls.append((method, path))
+        return (200, {})
+
+    monkeypatch.setattr(do_module, "_request", recording_request)
+    verify_token("tok")
+    assert len(calls) == 1
+    assert calls[0] == ("GET", "/v2/account")
+
+
+def test_verify_token_return_value_is_int_not_token(monkeypatch):
+    """The return value must be the status int — never the token value."""
+    secret = "dop_v1_" + "s" * 64
+    monkeypatch.setattr(
+        do_module, "_request",
+        lambda method, path, token, *, params=None: (200, {}),
+    )
+    result = verify_token(secret)
+    assert isinstance(result, int)
+    assert secret not in str(result)

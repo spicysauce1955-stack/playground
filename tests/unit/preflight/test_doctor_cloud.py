@@ -18,7 +18,6 @@ from typer.testing import CliRunner
 
 from playground.preflight import doctor
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -440,3 +439,146 @@ def test_cli_doctor_cloud_backend_includes_ssh_open_warning(
     assert "runtime.doctor.cloud_ssh_open" in ids
     ssh_diag = next(d for d in payload["diagnostics"] if d["id"] == "runtime.doctor.cloud_ssh_open")
     assert ssh_diag["severity"] == "warning"
+
+
+# ---------------------------------------------------------------------------
+# check_cloud_do_token_auth
+# ---------------------------------------------------------------------------
+
+
+def _patch_verify_token(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    """Replace verify_token inside doctor.py's import scope."""
+    import playground.backend.cloud_digitalocean.do as do_mod
+    monkeypatch.setattr(do_mod, "verify_token", lambda token: status)
+
+
+def test_token_auth_absent_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Token absent → [] (check_cloud_do_token handles the missing-token error)."""
+    monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    _patch_verify_token(monkeypatch, 200)
+    diags = doctor.check_cloud_do_token_auth()
+    assert diags == []
+
+
+def test_token_auth_200_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Valid token → no diagnostic."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_" + "a" * 64)
+    _patch_verify_token(monkeypatch, 200)
+    diags = doctor.check_cloud_do_token_auth()
+    assert diags == []
+
+
+def test_token_auth_401_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """401 → cloud_token_unauthorized error; token value must not leak."""
+    secret = "dop_v1_" + "x" * 64
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", secret)
+    _patch_verify_token(monkeypatch, 401)
+    diags = doctor.check_cloud_do_token_auth()
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.id == "runtime.doctor.cloud_token_unauthorized"
+    assert d.severity == "error"
+    assert "DIGITALOCEAN_TOKEN" in d.message
+    assert secret not in d.message
+    assert secret not in (d.suggestion or "")
+
+
+def test_token_auth_403_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """403 → cloud_token_forbidden error; token value must not leak."""
+    secret = "dop_v1_" + "y" * 64
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", secret)
+    _patch_verify_token(monkeypatch, 403)
+    diags = doctor.check_cloud_do_token_auth()
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.id == "runtime.doctor.cloud_token_forbidden"
+    assert d.severity == "error"
+    assert "DIGITALOCEAN_TOKEN" in d.message
+    assert secret not in d.message
+    assert secret not in (d.suggestion or "")
+
+
+def test_token_auth_transport_error_returns_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Status 0 → cloud_token_check_failed warning (transient; do not hard-fail)."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_" + "z" * 64)
+    _patch_verify_token(monkeypatch, 0)
+    diags = doctor.check_cloud_do_token_auth()
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.id == "runtime.doctor.cloud_token_check_failed"
+    assert d.severity == "warning"
+    assert "DIGITALOCEAN_TOKEN" in d.message
+
+
+def test_token_auth_unexpected_status_returns_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unexpected non-2xx status → cloud_token_check_failed warning."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_" + "w" * 64)
+    _patch_verify_token(monkeypatch, 503)
+    diags = doctor.check_cloud_do_token_auth()
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.id == "runtime.doctor.cloud_token_check_failed"
+    assert d.severity == "warning"
+    assert "503" in d.message
+
+
+def test_token_auth_wrong_prefix_emits_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-dop_v1_ token → cloud_token_wrong_prefix warning (and still does live check)."""
+    secret = "doo_v1_" + "r" * 64
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", secret)
+    _patch_verify_token(monkeypatch, 200)
+    diags = doctor.check_cloud_do_token_auth()
+    ids = [d.id for d in diags]
+    assert "runtime.doctor.cloud_token_wrong_prefix" in ids
+    wrong_prefix_diag = next(d for d in diags if d.id == "runtime.doctor.cloud_token_wrong_prefix")
+    assert wrong_prefix_diag.severity == "warning"
+    # Must reference the env var name, never the token value
+    assert "DIGITALOCEAN_TOKEN" in wrong_prefix_diag.message
+    assert secret not in wrong_prefix_diag.message
+
+
+def test_token_auth_wrong_prefix_plus_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-dop_v1_ token + 401 → both wrong_prefix warning and unauthorized error."""
+    secret = "doo_v1_" + "q" * 64
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", secret)
+    _patch_verify_token(monkeypatch, 401)
+    diags = doctor.check_cloud_do_token_auth()
+    ids = [d.id for d in diags]
+    assert "runtime.doctor.cloud_token_wrong_prefix" in ids
+    assert "runtime.doctor.cloud_token_unauthorized" in ids
+    # No token value in any diagnostic
+    for d in diags:
+        assert secret not in (d.message or "")
+        assert secret not in (d.suggestion or "")
+
+
+def test_token_auth_no_token_value_in_any_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Belt-and-braces: the token value must never appear in any diagnostic message."""
+    secret = "dop_v1_" + "t" * 64
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", secret)
+    for status in (200, 401, 403, 0, 503):
+        _patch_verify_token(monkeypatch, status)
+        diags = doctor.check_cloud_do_token_auth()
+        for d in diags:
+            assert secret not in (d.message or ""), (
+                f"Token leaked in message for status {status}: {d.message!r}"
+            )
+            assert secret not in (d.suggestion or ""), (
+                f"Token leaked in suggestion for status {status}: {d.suggestion!r}"
+            )
+
+
+def test_run_all_checks_cloud_includes_auth_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_all_checks with cloud backend includes the auth check results."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_" + "a" * 64)
+    import playground.backend.cloud_digitalocean.do as do_mod
+    monkeypatch.setattr(do_mod, "verify_token", lambda token: 401)
+    diags = doctor.run_all_checks(
+        backend="cloud-digitalocean",
+        config_dir=_REPO_CONFIG_DIR,
+        state_dir=tmp_path,
+    )
+    ids = [d.id for d in diags]
+    assert "runtime.doctor.cloud_token_unauthorized" in ids

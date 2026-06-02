@@ -132,6 +132,7 @@ def _install_shims(
     vm_ips: dict[str, str] | None = None,
     list_droplets_return: list[dict[str, Any]] | None = None,
     list_droplets_survivors: list[dict[str, Any]] | None = None,
+    verify_token_status: int = 200,
 ) -> list[str]:
     """Install shimmed versions of all runner-imported callables.
 
@@ -219,6 +220,10 @@ def _install_shims(
     def fake_stage_workload_files(scheduled, *, source_base, stage_dir):
         return {}, []
 
+    def fake_verify_token(token: str) -> int:
+        return verify_token_status
+
+    monkeypatch.setattr(f"{MOD}.verify_token", fake_verify_token)
     monkeypatch.setattr(f"{MOD}.run_tofu_init", fake_run_tofu_init)
     monkeypatch.setattr(f"{MOD}.run_tofu_apply", fake_run_tofu_apply)
     monkeypatch.setattr(f"{MOD}.run_tofu_destroy", fake_run_tofu_destroy)
@@ -1135,3 +1140,147 @@ def test_teardown_uses_merged_provider_settings(
     assert tfvars.get("region") == "nyc3", (
         f"expected region='nyc3' from merged provider settings; got {tfvars.get('region')!r}"
     )
+
+
+# ===========================================================================
+# Credential preflight — cloud-preflight step before tofu-init
+# ===========================================================================
+
+
+def test_apply_with_401_fails_before_tofu_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """When verify_token returns 401, execute_apply must return a failed run
+    with runtime.cloud.token_unauthorized and must NOT call run_tofu_init or
+    run_tofu_apply."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch, verify_token_status=401)
+
+    state_dir = tmp_path / ".playground"
+    bus = EventBus()
+
+    run, diags = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=state_dir,
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=bus,
+    )
+
+    assert run is not None
+    assert run.status == "failed"
+
+    # Actionable diagnostic must be present
+    diag_ids = [d.id for d in diags]
+    assert "runtime.cloud.token_unauthorized" in diag_ids
+
+    # tofu-init and tofu-apply must NOT have been called
+    assert "tofu-init" not in steps_called, (
+        "tofu-init must not run when credential preflight fails"
+    )
+    assert "tofu-apply" not in steps_called, (
+        "tofu-apply must not run when credential preflight fails"
+    )
+
+    # cloud-preflight step must be recorded in the run
+    step_names = [s.name for s in run.steps]
+    assert "cloud-preflight" in step_names
+    preflight_step = next(s for s in run.steps if s.name == "cloud-preflight")
+    assert preflight_step.exit_code != 0
+
+    # Token value must not appear in any diagnostic
+    for d in diags:
+        assert FAKE_TOKEN not in (d.message or "")
+        assert FAKE_TOKEN not in (d.suggestion or "")
+
+
+def test_apply_with_403_fails_before_tofu_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """When verify_token returns 403, execute_apply must return a failed run
+    with runtime.cloud.token_forbidden and must NOT call run_tofu_init."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch, verify_token_status=403)
+
+    run, diags = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+    assert run is not None
+    assert run.status == "failed"
+
+    diag_ids = [d.id for d in diags]
+    assert "runtime.cloud.token_forbidden" in diag_ids
+    assert "tofu-init" not in steps_called
+    assert "tofu-apply" not in steps_called
+
+
+def test_apply_token_missing_fails_before_tofu_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """When token is absent, execute_apply must return a failed run with
+    runtime.cloud.token_missing and must NOT call run_tofu_init."""
+    monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    steps_called = _install_shims(monkeypatch, verify_token_status=200)
+
+    run, diags = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+    assert run is not None
+    assert run.status == "failed"
+
+    diag_ids = [d.id for d in diags]
+    assert "runtime.cloud.token_missing" in diag_ids
+    assert "tofu-init" not in steps_called
+    assert "tofu-apply" not in steps_called
+
+
+def test_apply_transport_error_proceeds_to_tofu_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """When verify_token returns 0 (transport error), execute_apply must NOT block
+    and must proceed to run tofu-init (might be a transient blip)."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch, verify_token_status=0)
+
+    run, diags = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+    assert run is not None
+    assert run.status == "succeeded"
+    assert "tofu-init" in steps_called
+    assert "tofu-apply" in steps_called

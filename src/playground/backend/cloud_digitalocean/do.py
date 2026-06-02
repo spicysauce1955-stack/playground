@@ -189,6 +189,21 @@ def delete_droplet(
     ]
 
 
+def verify_token(token: str) -> int:
+    """Probe ``GET /v2/account`` to verify the token is accepted by the API.
+
+    Returns the HTTP status code:
+    - 200–299 → token is valid.
+    - 401 → token is expired or revoked.
+    - 403 → token lacks required scope.
+    - 0 → transport error (treat as transient; caller decides whether to block).
+
+    The token value is **never** logged or returned — only the status code is.
+    """
+    status, _ = _request("GET", "/v2/account", token)
+    return status
+
+
 def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
     """Extract ``{name, id, status, public_ipv4}`` from a raw droplet dict.
 
@@ -220,4 +235,5 @@ __all__ = [
     "read_token",
     "token_env_name",
     "token_present",
+    "verify_token",
 ]

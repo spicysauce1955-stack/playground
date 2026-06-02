@@ -34,6 +34,7 @@ from playground.backend.cloud_digitalocean.do import (
     list_droplets_by_tag,
     read_token,
     token_env_name,
+    verify_token,
 )
 from playground.backend.cloud_digitalocean.plan import DoPlan, build_do_plan
 from playground.backend.cloud_digitalocean.settings import merge_provider_settings
@@ -330,6 +331,141 @@ def _provision(
         )
 
     steps: list[StepResult] = []
+
+    # ---- Step 0: cloud-preflight (credential check before any tofu run) ----
+    bus.publish(run.run_id, "step_started", {"step": "cloud-preflight"})
+    preflight_log = logs_dir / "cloud-preflight.log"
+    preflight_log.parent.mkdir(parents=True, exist_ok=True)
+    preflight_token = read_token(resolved)
+    env_name = token_env_name(resolved)
+    if not preflight_token:
+        preflight_log.write_text(
+            f"# cloud-preflight: {env_name} is not set\n"
+        )
+        preflight_step = _step(
+            "cloud-preflight", exit_code=1, log_path=preflight_log,
+            started=_iso_now(),
+        )
+        steps.append(preflight_step)
+        bus.publish(
+            run.run_id, "step_finished",
+            {"step": "cloud-preflight", "exit_code": 1},
+        )
+        return _finalize_failure(
+            run, run_dir, steps, bus,
+            [
+                Diagnostic(
+                    id="runtime.cloud.token_missing",
+                    severity="error",
+                    message=(
+                        f"set ${env_name} before applying a cloud lab"
+                    ),
+                    source=SourceLocation(path="environment"),
+                    suggestion=(
+                        f"export {env_name}=<your-token>  "
+                        "# generate at https://cloud.digitalocean.com/account/api/tokens"
+                    ),
+                )
+            ],
+            f"credential preflight failed: ${env_name} is not set",
+        )
+    else:
+        preflight_status = verify_token(preflight_token)
+        if preflight_status == 401:
+            preflight_log.write_text(
+                f"# cloud-preflight: {env_name} rejected with 401\n"
+            )
+            preflight_step = _step(
+                "cloud-preflight", exit_code=1, log_path=preflight_log,
+                started=_iso_now(),
+            )
+            steps.append(preflight_step)
+            bus.publish(
+                run.run_id, "step_finished",
+                {"step": "cloud-preflight", "exit_code": 1},
+            )
+            return _finalize_failure(
+                run, run_dir, steps, bus,
+                [
+                    Diagnostic(
+                        id="runtime.cloud.token_unauthorized",
+                        severity="error",
+                        message=(
+                            f"DigitalOcean rejected ${env_name} (401 Unable to "
+                            "authenticate) — the token is expired or revoked. "
+                            "Generate a new personal access token at "
+                            "https://cloud.digitalocean.com/account/api/tokens "
+                            "and re-export it."
+                        ),
+                        source=SourceLocation(path="environment"),
+                        suggestion=(
+                            f"export {env_name}=<new-token>  "
+                            "# generate at https://cloud.digitalocean.com/account/api/tokens"
+                        ),
+                    )
+                ],
+                f"credential preflight failed: ${env_name} rejected with 401",
+            )
+        elif preflight_status == 403:
+            preflight_log.write_text(
+                f"# cloud-preflight: {env_name} rejected with 403\n"
+            )
+            preflight_step = _step(
+                "cloud-preflight", exit_code=1, log_path=preflight_log,
+                started=_iso_now(),
+            )
+            steps.append(preflight_step)
+            bus.publish(
+                run.run_id, "step_finished",
+                {"step": "cloud-preflight", "exit_code": 1},
+            )
+            return _finalize_failure(
+                run, run_dir, steps, bus,
+                [
+                    Diagnostic(
+                        id="runtime.cloud.token_forbidden",
+                        severity="error",
+                        message=(
+                            f"DigitalOcean rejected ${env_name} (403) — the "
+                            "token lacks the required scope. Recreate it with "
+                            "read+write scopes."
+                        ),
+                        source=SourceLocation(path="environment"),
+                        suggestion=(
+                            "Delete and recreate the token at "
+                            "https://cloud.digitalocean.com/account/api/tokens "
+                            "with full read+write permissions."
+                        ),
+                    )
+                ],
+                f"credential preflight failed: ${env_name} rejected with 403",
+            )
+        else:
+            if preflight_status == 0:
+                # Transport error — transient blip, do not block; just log.
+                bus.publish(
+                    run.run_id, "log_line",
+                    {
+                        "step": "cloud-preflight",
+                        "line": (
+                            f"WARNING: could not reach DigitalOcean API to "
+                            f"verify ${env_name} (transport error); "
+                            "proceeding to tofu-init anyway"
+                        ),
+                    },
+                )
+            preflight_log.write_text(
+                f"# cloud-preflight: status={preflight_status}\n"
+            )
+            preflight_step = _step(
+                "cloud-preflight", exit_code=0, log_path=preflight_log,
+                started=_iso_now(),
+            )
+            steps.append(preflight_step)
+            bus.publish(
+                run.run_id, "step_finished",
+                {"step": "cloud-preflight", "exit_code": 0},
+            )
 
     # ---- Step 1: tofu-init ----
     bus.publish(run.run_id, "step_started", {"step": "tofu-init"})

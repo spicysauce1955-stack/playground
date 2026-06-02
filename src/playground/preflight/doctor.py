@@ -1354,6 +1354,134 @@ def check_cloud_do_token(token_env: str = "DIGITALOCEAN_TOKEN") -> list[Diagnost
     ]
 
 
+def check_cloud_do_token_auth(
+    token_env: str = "DIGITALOCEAN_TOKEN",
+) -> list[Diagnostic]:
+    """Probe the DigitalOcean API to verify the token is actually accepted.
+
+    Returns ``[]`` when the token is absent/empty (``check_cloud_do_token``
+    already surfaces that error — don't double-report).
+
+    Diagnostic IDs:
+    - ``runtime.doctor.cloud_token_wrong_prefix`` (warning) — token does not
+      start with ``dop_v1_``.
+    - ``runtime.doctor.cloud_token_unauthorized`` (error) — 401 response.
+    - ``runtime.doctor.cloud_token_forbidden`` (error) — 403 response.
+    - ``runtime.doctor.cloud_token_check_failed`` (warning) — transport error
+      or unexpected status; credential may still be valid.
+
+    The token VALUE is **never** echoed in any diagnostic message.
+    """
+    token = os.environ.get(token_env)
+    if not token:
+        return []
+
+    diagnostics: list[Diagnostic] = []
+
+    # Warn about non-personal-access-token prefixes before attempting the live
+    # probe — a doo_v1_ refresh token or OAuth token will be rejected.
+    if not token.startswith("dop_v1_"):
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_token_wrong_prefix",
+                severity="warning",
+                message=(
+                    f"${token_env} does not start with dop_v1_ "
+                    "(a personal access token) — a doo_v1_ refresh token or "
+                    "an OAuth token will be rejected."
+                ),
+                source=_host_source(),
+                suggestion=(
+                    f"Generate a new personal access token at "
+                    "https://cloud.digitalocean.com/account/api/tokens "
+                    f"and re-export it as {token_env}."
+                ),
+            )
+        )
+
+    # Local import to avoid a heavy module-load dependency at doctor import
+    # time (consistent with how _cloud_token_env lazily imports load_config).
+    from playground.backend.cloud_digitalocean.do import verify_token  # noqa: PLC0415
+
+    status = verify_token(token)
+
+    if 200 <= status <= 299:
+        # Auth OK — no diagnostic needed.
+        pass
+    elif status == 401:
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_token_unauthorized",
+                severity="error",
+                message=(
+                    f"DigitalOcean rejected ${token_env} (401 Unable to "
+                    "authenticate) — the token is expired or revoked. "
+                    "Generate a new personal access token at "
+                    "https://cloud.digitalocean.com/account/api/tokens "
+                    "and re-export it."
+                ),
+                source=_host_source(),
+                suggestion=(
+                    f"export {token_env}=<new-token>  "
+                    "# generate at https://cloud.digitalocean.com/account/api/tokens"
+                ),
+            )
+        )
+    elif status == 403:
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_token_forbidden",
+                severity="error",
+                message=(
+                    f"DigitalOcean rejected ${token_env} (403) — the token "
+                    "lacks the required scope. Recreate it with read+write "
+                    "scopes."
+                ),
+                source=_host_source(),
+                suggestion=(
+                    "Delete and recreate the token at "
+                    "https://cloud.digitalocean.com/account/api/tokens "
+                    "with full read+write permissions."
+                ),
+            )
+        )
+    elif status == 0:
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_token_check_failed",
+                severity="warning",
+                message=(
+                    f"could not reach DigitalOcean to verify ${token_env}: "
+                    "the credential may still be valid; check connectivity."
+                ),
+                source=_host_source(),
+                suggestion=(
+                    "Verify internet access and that "
+                    "https://api.digitalocean.com is reachable, then re-run "
+                    "`playground doctor`."
+                ),
+            )
+        )
+    else:
+        diagnostics.append(
+            Diagnostic(
+                id="runtime.doctor.cloud_token_check_failed",
+                severity="warning",
+                message=(
+                    f"DigitalOcean API returned status {status} when verifying "
+                    f"${token_env}; the credential may still be valid."
+                ),
+                source=_host_source(),
+                suggestion=(
+                    "Retry `playground doctor` or inspect the DigitalOcean "
+                    "status page at https://status.digitalocean.com."
+                ),
+            )
+        )
+
+    return diagnostics
+
+
 def check_cloud_do_token_not_committed(
     repo_root: Path | None = None,
 ) -> list[Diagnostic]:
@@ -1626,7 +1754,9 @@ def run_all_checks(
         diagnostics.extend(check_ansible_and_collections())
         diagnostics.extend(check_ansible_config())
         # Cloud-specific group
-        diagnostics.extend(check_cloud_do_token(_cloud_token_env(config_dir)))
+        token_env = _cloud_token_env(config_dir)
+        diagnostics.extend(check_cloud_do_token(token_env))
+        diagnostics.extend(check_cloud_do_token_auth(token_env))
         diagnostics.extend(check_cloud_do_token_not_committed())
         _state_dir = state_dir if state_dir is not None else Path(".playground")
         diagnostics.extend(check_cloud_do_state_writable(_state_dir))
