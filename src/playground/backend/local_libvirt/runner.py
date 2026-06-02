@@ -36,6 +36,7 @@ from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
+from playground.backend.local_libvirt.lock import clear_stale_lock
 from playground.backend.local_libvirt.scrub import scrub_lab
 from playground.backend.local_libvirt.tfvars import render_tfvars
 from playground.backend.local_libvirt.verify import verify_lab
@@ -357,12 +358,17 @@ def execute_reset(
        networks; remove per-VM disk volumes and cloud-init ISOs in the
        default pool. Skipped silently on "already gone". Fatal on
        missing virsh or unreachable libvirtd.
-    2. **tofu-destroy**: best-effort. tofu state may already match
+    2. **clear-stale-lock**: best-effort. An apply killed mid-run can
+       leave a tofu state lock that would make tofu-destroy (and any
+       later apply) fail with "resource temporarily unavailable". Clear
+       it — but only when no live process holds the lock, so a concurrent
+       apply is never clobbered. PAPERCUT-5.
+    3. **tofu-destroy**: best-effort. tofu state may already match
        reality (everything destroyed) or be irrecoverably out of sync.
        Non-zero exit attaches a warning diagnostic but does not fail
        the reset — the operator chose reset precisely because tofu
        was already unreliable.
-    3. **clean-state-files**: remove per-lab artifacts under
+    4. **clean-state-files**: remove per-lab artifacts under
        ``.playground/state/{tofu,inventory,workloads}/`` so the next
        ``playground apply`` starts from a clean slate. Shared
        artifacts (tofu/terraform.tfstate, ubuntu-noble.qcow2 base
@@ -414,7 +420,24 @@ def execute_reset(
             "reset aborted: virsh missing or libvirtd unreachable",
         )
 
-    # ---- Step 2: tofu-destroy (best-effort) ----
+    # ---- Step 2: clear-stale-lock (best-effort; before tofu-destroy) ----
+    # An apply killed mid-run can leave a tofu state lock that makes the
+    # following tofu-destroy (and any later apply) fail with "resource
+    # temporarily unavailable". Clear it, but only when no live process
+    # holds it — see clear_stale_lock for the liveness proof. PAPERCUT-5.
+    bus.publish(run.run_id, "step_started", {"step": "clear-stale-lock"})
+    lock_step, lock_diagnostics = clear_stale_lock(
+        tofu_dir, logs_dir / "clear-stale-lock.log",
+        bus=bus, run_id=run.run_id,
+    )
+    steps.append(lock_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "clear-stale-lock", "exit_code": lock_step.exit_code},
+    )
+    all_diagnostics.extend(lock_diagnostics)
+
+    # ---- Step 3: tofu-destroy (best-effort) ----
     bus.publish(run.run_id, "step_started", {"step": "tofu-destroy"})
     tofu_step, tofu_diagnostics = run_tofu_destroy(
         tofu_dir, tfvars_path.resolve(), logs_dir / "tofu-destroy.log",
@@ -445,7 +468,7 @@ def execute_reset(
             )
         )
 
-    # ---- Step 3: clean-state-files (warnings only on per-file failure) ----
+    # ---- Step 4: clean-state-files (warnings only on per-file failure) ----
     bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
     cleanup_step, cleanup_diagnostics = _clean_state_files(
         lab=lab,

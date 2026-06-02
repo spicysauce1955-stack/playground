@@ -210,6 +210,7 @@ def test_reset_full_pipeline_scrubs_and_cleans_state(
     assert payload["status"] == "succeeded"
     assert [s["name"] for s in payload["steps"]] == [
         "scrub-libvirt",
+        "clear-stale-lock",
         "tofu-destroy",
         "clean-state-files",
     ]

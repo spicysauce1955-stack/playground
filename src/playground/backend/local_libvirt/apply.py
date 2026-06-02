@@ -113,6 +113,32 @@ def run_tofu_destroy(
     )
 
 
+def run_tofu_force_unlock(
+    tofu_dir: Path,
+    lock_id: str,
+    log_path: Path,
+    *,
+    bus: EventBus | None = None,
+    run_id: str | None = None,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Invoke ``tofu force-unlock -force <lock_id>`` in ``tofu_dir``.
+
+    Used by reset to clear a stale state lock left by a dead process.
+    ``-force`` skips the interactive confirmation; the caller is
+    responsible for first confirming the lock is genuinely stale (no
+    live process holds it) before calling this.
+    """
+    return _run_step(
+        name="clear-stale-lock",
+        command=["tofu", "force-unlock", "-force", lock_id],
+        cwd=tofu_dir,
+        log_path=log_path,
+        missing_binary_id="runtime.apply.tofu_binary_missing",
+        bus=bus,
+        run_id=run_id,
+    )
+
+
 def run_ansible_playbook(
     playbook: Path,
     inventory: Path,
