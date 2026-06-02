@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from enum import StrEnum
 from pathlib import Path
@@ -211,7 +212,8 @@ def list_labs(
     if not _has_errors(diagnostics):
         diagnostics.extend(validate_loaded_config(loaded))
     _exit_on_errors(diagnostics, output, json_errors=False)
-    _print_warnings(diagnostics)
+    # lab list is a whole-config overview, so keep the provisioning warning.
+    _print_warnings(diagnostics, keep_provisioning=True)
 
     labs = [
         {
@@ -395,7 +397,7 @@ def plan_command(
         diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     warnings = _warnings_in(diagnostics)
-    _print_warnings(diagnostics)
+    _print_warnings(diagnostics, keep_provisioning=True)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
     # Pass the already-loaded config to avoid parsing the config tree a second
@@ -499,7 +501,8 @@ def render_tfvars_command(
     if not _has_errors(diagnostics):
         diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
-    _print_warnings(diagnostics)
+    # tofu render produces provisioning inputs, so keep the provisioning warning.
+    _print_warnings(diagnostics, keep_provisioning=True)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
 
@@ -573,7 +576,7 @@ def apply_command(
     if not _has_errors(diagnostics):
         diagnostics.extend(validate_loaded_config(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
-    _print_warnings(diagnostics)
+    _print_warnings(diagnostics, keep_provisioning=True)
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
     _exit_if_unsupported_backend(resolved, output)
@@ -592,9 +595,14 @@ def apply_command(
     )
 
     if finished is None:
-        # Pre-flight rejected the apply; no run record created.
-        _exit_on_errors(diagnostics, output, json_errors=False)
-        return
+        # Pre-flight rejected the apply; no run record created. Nothing was
+        # provisioned, so this is a failure — exit NON-ZERO deterministically
+        # (automation gates on the exit code), even if the rejecting
+        # diagnostics happen to be warnings rather than errors.
+        if _has_errors(diagnostics):
+            _exit_on_errors(diagnostics, output, json_errors=False)
+        _print_warnings(diagnostics, keep_provisioning=True)
+        raise typer.Exit(code=1)
 
     if finished.status == "failed":
         _present_apply_failure(output, finished, diagnostics, state_dir)
@@ -836,7 +844,10 @@ def runs_show_command(
 )
 def exec_command(
     ctx: typer.Context,
-    on: Annotated[str, typer.Option("--on", help="VM name within the lab.")],
+    on: Annotated[
+        str,
+        typer.Option("--on", "--host", help="VM name within the lab (alias: --host)."),
+    ],
     lab: Annotated[
         str | None,
         typer.Option(
@@ -949,6 +960,12 @@ def exec_command(
             json_errors=False,
         )
 
+    # Quote each token so the REMOTE shell reconstructs the exact argv we
+    # were given, then pass it as a single ssh argument. Without this, ssh
+    # joins the args with spaces and the remote shell re-parses them — so
+    # `-- bash -lc 'a && b'` would run `bash -lc a && b` (quoting lost) and
+    # `-- sh -c 'cat > f'` would mangle the redirect (BUG-7).
+    remote_command = " ".join(shlex.quote(arg) for arg in command)
     ssh_argv = [
         "ssh",
         # vbox NAT forwards put the guest on a non-22 host port; libvirt /
@@ -960,7 +977,7 @@ def exec_command(
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "LogLevel=ERROR",
         f"{user}@{ssh_host}",
-        *command,
+        remote_command,
     ]
     try:
         completed = subprocess.run(ssh_argv, check=False)  # noqa: S603
@@ -1252,9 +1269,12 @@ def suspend_command(
     )
 
     if finished is None:
-        # Backend does not support suspend (local backends).
-        _exit_on_errors(diagnostics, output, json_errors=False)
-        return
+        # Backend does not support suspend (local backends). The verb did not
+        # run, so exit non-zero deterministically.
+        if _has_errors(diagnostics):
+            _exit_on_errors(diagnostics, output, json_errors=False)
+        _print_warnings(diagnostics)
+        raise typer.Exit(code=1)
 
     if finished.status == "failed":
         _present_apply_failure(output, finished, diagnostics, state_dir)
@@ -1329,9 +1349,12 @@ def resume_command(
     )
 
     if finished is None:
-        # Backend does not support resume (local backends).
-        _exit_on_errors(diagnostics, output, json_errors=False)
-        return
+        # Backend does not support resume (local backends). The verb did not
+        # run, so exit non-zero deterministically.
+        if _has_errors(diagnostics):
+            _exit_on_errors(diagnostics, output, json_errors=False)
+        _print_warnings(diagnostics)
+        raise typer.Exit(code=1)
 
     if finished.status == "failed":
         _present_apply_failure(output, finished, diagnostics, state_dir)
@@ -1510,8 +1533,23 @@ def _warnings_in(diagnostics: list[Diagnostic]) -> list[Diagnostic]:
     return [d for d in diagnostics if d.severity == "warning"]
 
 
-def _print_warnings(diagnostics: list[Diagnostic]) -> None:
+# Warnings that only matter when provisioning (they describe how `apply`
+# will translate the lab), so they're pure noise on read-only / teardown
+# commands like status / exec / destroy / reset. Dropped by default;
+# `apply` and `plan` opt back in via keep_provisioning=True.
+_PROVISIONING_ONLY_WARNING_IDS = frozenset(
+    {"config.backend.per_vm_resources_unsupported"}
+)
+
+
+def _print_warnings(
+    diagnostics: list[Diagnostic], *, keep_provisioning: bool = False
+) -> None:
     warnings = _warnings_in(diagnostics)
+    if not keep_provisioning:
+        warnings = [
+            w for w in warnings if w.id not in _PROVISIONING_ONLY_WARNING_IDS
+        ]
     if warnings:
         _print_diagnostics(warnings, err=True)
 

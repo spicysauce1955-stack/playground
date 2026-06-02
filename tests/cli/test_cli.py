@@ -1423,7 +1423,116 @@ def test_exec_vbox_uses_nat_port_and_loopback(
     argv = (tmp_path / "ssh.log").read_text().splitlines()
     assert "ubuntu@127.0.0.1" in argv          # loopback host, not a libvirt IP
     assert "-p" in argv and "2222" in argv      # the NAT-forwarded port
-    assert argv[-2:] == ["docker", "ps"]        # remote command at the tail
+    assert argv[-1] == "docker ps"             # remote command, shlex-joined
+
+
+def _fake_vbox_status():
+    from playground.models.status import LabStatus, VmStatus
+
+    return LabStatus(
+        lab="vbox-smoke", backend="local-vbox", expected_vms=1, provisioned_vms=1,
+        vms=[
+            VmStatus(
+                name="node1", role="docker-host", ip=None, state="running",
+                ssh_host="127.0.0.1", ssh_port=2222,
+            )
+        ],
+    )
+
+
+def test_exec_preserves_quoting_of_compound_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BUG-7: a quoted compound remote command must reach the guest as ONE
+    shell string with quoting intact. `-- bash -lc 'a && b'` must not become
+    `bash -lc a && b` (which would run the script `a`). exec shlex-quotes each
+    token and passes a single ssh argument.
+    """
+    ssh_bin = _write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv("PATH", f"{ssh_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(
+        "playground.cli.main.query_status",
+        lambda resolved, tofu_dir: (_fake_vbox_status(), []),
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec", "--lab", "vbox-smoke", "--on", "node1",
+            "--config-dir", str(CONFIG_DIR),
+            # `--` ends option parsing so a remote command containing dashes
+            # (here `-lc`, which would otherwise collide with exec's own -c)
+            # is passed through verbatim.
+            "--", "bash", "-lc", "rm -rf /tmp/x && mkdir /tmp/x",
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    argv = (tmp_path / "ssh.log").read_text().splitlines()
+    # The whole remote command is a single argv entry, compound part quoted.
+    assert argv[-1] == "bash -lc 'rm -rf /tmp/x && mkdir /tmp/x'"
+
+
+def test_exec_accepts_host_alias_for_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--host` is an accepted alias for `--on` (saves a round-trip)."""
+    ssh_bin = _write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv("PATH", f"{ssh_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(
+        "playground.cli.main.query_status",
+        lambda resolved, tofu_dir: (_fake_vbox_status(), []),
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec", "--lab", "vbox-smoke", "--host", "node1",
+            "--config-dir", str(CONFIG_DIR), "uptime",
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "uptime" in (tmp_path / "ssh.log").read_text()
+
+
+def test_apply_exits_nonzero_when_preflight_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit-code contract: a rejected pre-flight (no run record created) must
+    exit non-zero even if the rejecting diagnostics are warnings — automation
+    gates on the exit code.
+    """
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    warn = Diagnostic(
+        id="runtime.apply.preflight_warn", severity="warning",
+        message="pre-flight warning", source=SourceLocation(path="x"),
+    )
+    monkeypatch.setattr(
+        "playground.cli.main.execute_apply", lambda **kwargs: (None, [warn])
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply", "vbox-smoke", "--config-dir", str(CONFIG_DIR),
+            "--state-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_read_only_command_demotes_provisioning_warning(tmp_path: Path) -> None:
+    """The per-VM-resources warning is provisioning-only noise on read-only
+    commands. `lab show` drops it; `lab list` (whole-config overview) keeps it.
+    """
+    shown = CliRunner().invoke(
+        app, ["lab", "show", "generic-infra", "--config-dir", str(CONFIG_DIR)]
+    )
+    assert shown.exit_code == 0
+    assert "per_vm_resources_unsupported" not in shown.stderr  # demoted
+
+    listed = CliRunner().invoke(
+        app, ["lab", "list", "--config-dir", str(CONFIG_DIR)]
+    )
+    assert listed.exit_code == 0
+    assert "per_vm_resources_unsupported" in listed.stderr  # kept
 
 
 def test_status_reports_all_vms_provisioned(
