@@ -65,11 +65,14 @@ def _request(
     token: str,
     *,
     params: dict[str, Any] | None = None,
+    timeout: float = 15,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one HTTP request against the DigitalOcean API.
 
     Returns ``(status_code, parsed_body)``.  On any transport error or JSON
-    decode failure returns ``(0, {})``.
+    decode failure returns ``(0, {})``.  ``timeout`` bounds the call so a
+    stalled network can never hang a caller indefinitely (a preflight uses
+    a short value so ``apply``/``plan``/``doctor`` fail fast — NOTE-6).
 
     The ``Authorization: Bearer <token>`` header is set here and NEVER
     logged.  Callers must not log the ``token`` argument either.
@@ -77,7 +80,7 @@ def _request(
     try:
         with httpx.Client(
             base_url="https://api.digitalocean.com",
-            timeout=15,
+            timeout=timeout,
         ) as client:
             response = client.request(
                 method,
@@ -199,8 +202,12 @@ def verify_token(token: str) -> int:
     - 0 → transport error (treat as transient; caller decides whether to block).
 
     The token value is **never** logged or returned — only the status code is.
+
+    Used as a fail-fast preflight, so it bounds the call to 8s: a rejected
+    token answers 401/403 in well under that, and a stalled network returns
+    0 quickly instead of feeling like a hang (NOTE-6).
     """
-    status, _ = _request("GET", "/v2/account", token)
+    status, _ = _request("GET", "/v2/account", token, timeout=8)
     return status
 
 

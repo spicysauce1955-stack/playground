@@ -134,7 +134,7 @@ _FAKE_DROPLET = {
 def test_list_droplets_by_tag_returns_droplets_on_200(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (
+        lambda method, path, token, *, params=None, timeout=15: (
             200, {"droplets": [_FAKE_DROPLET]}
         ),
     )
@@ -148,7 +148,7 @@ def test_list_droplets_by_tag_returns_droplets_on_200(monkeypatch):
 def test_list_droplets_by_tag_returns_empty_list_on_401(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (401, {}),
+        lambda method, path, token, *, params=None, timeout=15: (401, {}),
     )
     droplets, diags, ok = list_droplets_by_tag("bad-tok", "lab:cloud-smoke")
     assert droplets == []
@@ -160,7 +160,7 @@ def test_list_droplets_by_tag_returns_empty_list_on_401(monkeypatch):
 def test_list_droplets_by_tag_returns_warning_on_transport_error(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (0, {}),
+        lambda method, path, token, *, params=None, timeout=15: (0, {}),
     )
     droplets, diags, ok = list_droplets_by_tag("tok", "lab:x")
     assert droplets == []
@@ -172,7 +172,7 @@ def test_list_droplets_by_tag_returns_warning_on_transport_error(monkeypatch):
 def test_list_droplets_by_tag_empty_droplets_on_200_no_matching(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (200, {"droplets": []}),
+        lambda method, path, token, *, params=None, timeout=15: (200, {"droplets": []}),
     )
     droplets, diags, ok = list_droplets_by_tag("tok", "lab:empty-lab")
     assert droplets == []
@@ -188,7 +188,7 @@ def test_list_droplets_by_tag_empty_droplets_on_200_no_matching(monkeypatch):
 def test_delete_droplet_204_is_success(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (204, {}),
+        lambda method, path, token, *, params=None, timeout=15: (204, {}),
     )
     diags = delete_droplet("tok", 99)
     assert diags == []
@@ -197,7 +197,7 @@ def test_delete_droplet_204_is_success(monkeypatch):
 def test_delete_droplet_404_is_success(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (404, {}),
+        lambda method, path, token, *, params=None, timeout=15: (404, {}),
     )
     diags = delete_droplet("tok", 99)
     assert diags == []
@@ -206,7 +206,7 @@ def test_delete_droplet_404_is_success(monkeypatch):
 def test_delete_droplet_500_returns_warning(monkeypatch):
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (500, {}),
+        lambda method, path, token, *, params=None, timeout=15: (500, {}),
     )
     diags = delete_droplet("tok", 99)
     assert len(diags) == 1
@@ -221,7 +221,7 @@ def test_delete_droplet_transport_error_returns_warning(monkeypatch):
     """
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (0, {}),
+        lambda method, path, token, *, params=None, timeout=15: (0, {}),
     )
     diags = delete_droplet("tok", 99)
     assert len(diags) == 1
@@ -239,7 +239,7 @@ def test_list_droplets_by_tag_no_token_in_diagnostics(monkeypatch):
     secret = "super-secret-api-token-xyz"
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (403, {}),
+        lambda method, path, token, *, params=None, timeout=15: (403, {}),
     )
     _, diags, ok = list_droplets_by_tag(secret, "lab:x")
     assert ok is False
@@ -256,7 +256,7 @@ def test_delete_droplet_no_token_in_diagnostics(monkeypatch):
     secret = "super-secret-api-token-xyz"
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (500, {}),
+        lambda method, path, token, *, params=None, timeout=15: (500, {}),
     )
     diags = delete_droplet(secret, 42)
     for d in diags:
@@ -311,7 +311,7 @@ def test_list_droplets_by_tag_genuine_empty_ok_true(monkeypatch):
     """200 response with empty droplets list → ok=True (not a failure)."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (200, {"droplets": []}),
+        lambda method, path, token, *, params=None, timeout=15: (200, {"droplets": []}),
     )
     droplets, diags, ok = list_droplets_by_tag("tok", "lab:empty")
     assert ok is True
@@ -323,7 +323,7 @@ def test_list_droplets_by_tag_transport_failure_ok_false(monkeypatch):
     """Transport error (status 0) → ok=False; caller must not treat as empty."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (0, {}),
+        lambda method, path, token, *, params=None, timeout=15: (0, {}),
     )
     droplets, diags, ok = list_droplets_by_tag("tok", "lab:x")
     assert ok is False
@@ -335,7 +335,7 @@ def test_list_droplets_by_tag_http_error_ok_false(monkeypatch):
     """Non-2xx HTTP response → ok=False; caller must not treat as empty."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (500, {}),
+        lambda method, path, token, *, params=None, timeout=15: (500, {}),
     )
     droplets, diags, ok = list_droplets_by_tag("tok", "lab:x")
     assert ok is False
@@ -352,7 +352,7 @@ def test_delete_droplet_204_ok_no_warning(monkeypatch):
     """204 Deleted is unambiguous success — no warning."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (204, {}),
+        lambda method, path, token, *, params=None, timeout=15: (204, {}),
     )
     assert delete_droplet("tok", 42) == []
 
@@ -361,7 +361,7 @@ def test_delete_droplet_404_ok_no_warning(monkeypatch):
     """404 Not Found means already gone — no warning."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (404, {}),
+        lambda method, path, token, *, params=None, timeout=15: (404, {}),
     )
     assert delete_droplet("tok", 42) == []
 
@@ -375,7 +375,7 @@ def test_delete_droplet_transport_error_0_returns_warning(monkeypatch):
     """
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (0, {}),
+        lambda method, path, token, *, params=None, timeout=15: (0, {}),
     )
     diags = delete_droplet("tok", 99)
     assert len(diags) == 1
@@ -395,7 +395,7 @@ def test_verify_token_returns_200_on_success(monkeypatch):
     """verify_token returns the HTTP status code on a 200 response."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (200, {"account": {}}),
+        lambda method, path, token, *, params=None, timeout=15: (200, {"account": {}}),
     )
     assert verify_token("tok") == 200
 
@@ -404,7 +404,7 @@ def test_verify_token_returns_401_on_unauthorized(monkeypatch):
     """verify_token returns 401 when the API rejects the credential."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (401, {}),
+        lambda method, path, token, *, params=None, timeout=15: (401, {}),
     )
     assert verify_token("tok") == 401
 
@@ -413,7 +413,7 @@ def test_verify_token_returns_403_on_forbidden(monkeypatch):
     """verify_token returns 403 when the token lacks required scope."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (403, {}),
+        lambda method, path, token, *, params=None, timeout=15: (403, {}),
     )
     assert verify_token("tok") == 403
 
@@ -422,7 +422,7 @@ def test_verify_token_returns_0_on_transport_error(monkeypatch):
     """verify_token returns 0 on a transport error (mirrors _request behaviour)."""
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (0, {}),
+        lambda method, path, token, *, params=None, timeout=15: (0, {}),
     )
     assert verify_token("tok") == 0
 
@@ -431,7 +431,7 @@ def test_verify_token_calls_get_account_endpoint(monkeypatch):
     """verify_token must probe GET /v2/account (not a different path)."""
     calls: list[tuple[str, str]] = []
 
-    def recording_request(method, path, token, *, params=None):
+    def recording_request(method, path, token, *, params=None, timeout=15):
         calls.append((method, path))
         return (200, {})
 
@@ -441,12 +441,26 @@ def test_verify_token_calls_get_account_endpoint(monkeypatch):
     assert calls[0] == ("GET", "/v2/account")
 
 
+def test_verify_token_uses_short_timeout(monkeypatch):
+    """As a fail-fast preflight, verify_token bounds the call to 8s so a
+    stalled network can't make `apply`/`plan`/`doctor` hang (NOTE-6)."""
+    seen: dict[str, object] = {}
+
+    def recording_request(method, path, token, *, params=None, timeout=15):
+        seen["timeout"] = timeout
+        return (200, {})
+
+    monkeypatch.setattr(do_module, "_request", recording_request)
+    verify_token("tok")
+    assert seen["timeout"] == 8
+
+
 def test_verify_token_return_value_is_int_not_token(monkeypatch):
     """The return value must be the status int — never the token value."""
     secret = "dop_v1_" + "s" * 64
     monkeypatch.setattr(
         do_module, "_request",
-        lambda method, path, token, *, params=None: (200, {}),
+        lambda method, path, token, *, params=None, timeout=15: (200, {}),
     )
     result = verify_token(secret)
     assert isinstance(result, int)
