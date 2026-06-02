@@ -1,0 +1,28 @@
+{
+  "skill_name": "playground-labs",
+  "evals": [
+    {
+      "id": "quick-box",
+      "prompt": "i just need a quick throwaway linux box to poke at — spin one up, run `uname -a` and `cat /etc/os-release` on it, then tear it down.",
+      "expected_output": "Uses the playground CLI to apply a SINGLE-VM lab (ideally vbox-smoke, not the 3-VM generic-infra), runs uname -a and /etc/os-release inside via `playground exec`, then destroys/reset the lab. Captures the command output.",
+      "files": [],
+      "assertions": [
+        {"text": "Used the playground CLI (`playground apply ...`) rather than another VM tool (multipass/qemu/docker directly)"},
+        {"text": "Chose a single-VM lab appropriate for a 'quick box' (e.g. vbox-smoke), not the heavier 3-VM generic-infra"},
+        {"text": "Ran both `uname -a` and `cat /etc/os-release` inside the guest via `playground exec` and captured their output"},
+        {"text": "Tore the VM down afterwards (`playground destroy` or `playground reset`), as the prompt asked"}
+      ]
+    },
+    {
+      "id": "vbox-ssh",
+      "prompt": "bring up the vbox-smoke lab and show me exactly how I'd SSH into the VM, and confirm docker is running inside it.",
+      "expected_output": "Applies vbox-smoke, then reports the correct SSH endpoint (host 127.0.0.1 + the NAT-forwarded port, e.g. 2222 — NOT an empty/bogus address), and confirms docker is running inside via `playground exec ... docker info/ps`.",
+      "files": [],
+      "assertions": [
+        {"text": "Ran `playground apply vbox-smoke`"},
+        {"text": "Reported a usable SSH endpoint: host 127.0.0.1 with the actual NAT-forwarded port (e.g. 2222), not a null/empty address"},
+        {"text": "Confirmed docker is running inside the VM (e.g. `playground exec --lab vbox-smoke --on node1 -- docker info` or `docker ps` succeeded)"}
+      ]
+    }
+  ]
+}

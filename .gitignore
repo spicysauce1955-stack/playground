@@ -34,3 +34,6 @@ htmlcov/
 
 # Stray tool artifact (not project content)
 .superset/
+
+# skill-creator eval scratch (regenerable)
+.claude/skills/*-workspace/
