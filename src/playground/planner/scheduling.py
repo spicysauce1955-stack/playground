@@ -167,7 +167,13 @@ def stage_workload_files(
                     )
                 )
                 continue
-            dest = stage_dir / vm_name / f"{workload.name}{src.suffix}"
+            # Resolve to an ABSOLUTE path: this string is handed to the
+            # workload_compose/swarm roles as the `copy` task's `src`, and
+            # Ansible resolves a *relative* src against the role/play
+            # `files/` search dirs — not the controller CWD — so a relative
+            # `.playground/state/...` (the default state_dir is relative)
+            # is never found and the stage step fails (BUG-8).
+            dest = (stage_dir / vm_name / f"{workload.name}{src.suffix}").resolve()
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dest)
             staged[vm_name][workload.name] = dest

@@ -187,6 +187,34 @@ def test_stage_workload_files_copies_compose_source(
     assert staged["router1"] == {}
 
 
+def test_stage_workload_files_records_absolute_path(
+    resolved_generic_infra, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BUG-8: the recorded staged_source must be ABSOLUTE even when stage_dir
+    is relative (the default state_dir is the relative `.playground`). Ansible's
+    `copy` resolves a relative src against the role `files/` dirs, not the
+    controller CWD, so a relative staged path is never found on the target."""
+    source_base = tmp_path / "src"
+    (source_base / "compose").mkdir(parents=True)
+    (source_base / "compose" / "demo.yaml").write_text("services: {}\n")
+
+    # Run with cwd=tmp_path and a *relative* stage_dir, mirroring the real
+    # `state_dir=Path(".playground")` default.
+    monkeypatch.chdir(tmp_path)
+    scheduled, _ = schedule_workloads(resolved_generic_infra)
+
+    staged, diagnostics = stage_workload_files(
+        scheduled, source_base=source_base, stage_dir=Path(".playground/stage")
+    )
+
+    assert diagnostics == []
+    docker_staged = staged["docker1"]["demo-compose"]
+    assert docker_staged.is_absolute(), (
+        f"staged_source must be absolute for Ansible copy; got {docker_staged}"
+    )
+    assert docker_staged.exists()
+
+
 def test_stage_workload_files_reports_missing_source(
     resolved_generic_infra, tmp_path: Path
 ) -> None:
