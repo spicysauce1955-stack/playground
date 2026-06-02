@@ -1384,6 +1384,48 @@ def test_exec_requires_lab_when_multiple_configured(tmp_path: Path) -> None:
     assert "config.exec.lab_required" in result.stderr
 
 
+def test_exec_vbox_uses_nat_port_and_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BUG-5 regression: exec resolves the SSH endpoint from the
+    backend-neutral status (ssh_host/ssh_port), so a local-vbox VM reached
+    at 127.0.0.1:<NAT port> works. The old code read libvirt-only
+    `tofu output vm_ips` and built `ssh user@<ip>` on port 22 — which failed
+    on vbox (`config.inventory.tofu_no_state`) and used the wrong host/port.
+    """
+    from playground.models.status import LabStatus, VmStatus
+
+    ssh_bin = _write_ssh_shim(tmp_path, exit_code=0, stdout="ok")
+    monkeypatch.setenv("PATH", f"{ssh_bin}{os.pathsep}{os.environ['PATH']}")
+
+    fake = LabStatus(
+        lab="vbox-smoke", backend="local-vbox", expected_vms=1, provisioned_vms=1,
+        vms=[
+            VmStatus(
+                name="node1", role="docker-host", ip=None, state="running",
+                ssh_host="127.0.0.1", ssh_port=2222,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "playground.cli.main.query_status", lambda resolved, tofu_dir: (fake, [])
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "exec", "--lab", "vbox-smoke", "--on", "node1",
+            "--config-dir", str(CONFIG_DIR), "docker", "ps",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    argv = (tmp_path / "ssh.log").read_text().splitlines()
+    assert "ubuntu@127.0.0.1" in argv          # loopback host, not a libvirt IP
+    assert "-p" in argv and "2222" in argv      # the NAT-forwarded port
+    assert argv[-2:] == ["docker", "ps"]        # remote command at the tail
+
+
 def test_status_reports_all_vms_provisioned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

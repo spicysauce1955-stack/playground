@@ -921,20 +921,28 @@ def exec_command(
             json_errors=False,
         )
 
-    vm_ips, fetch_diagnostics = fetch_vm_ips(tofu_dir)
-    _exit_on_errors(fetch_diagnostics, OutputFormat.human, json_errors=False)
+    # Resolve the VM's SSH endpoint through the backend-neutral status
+    # query, NOT libvirt's `tofu output vm_ips`. vbox reaches VMs over a
+    # 127.0.0.1 NAT port-forward and cloud over a public IP — neither lives
+    # in the libvirt tofu state, so the old fetch_vm_ips path errored with
+    # `config.inventory.tofu_no_state` on those backends. VmStatus.ssh_host /
+    # ssh_port are uniform across all three backends.
+    status, query_diagnostics = query_status(resolved, tofu_dir)
+    _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
 
-    ip = vm_ips.get(on)
-    if ip is None:
+    vm_status = next((v for v in status.vms if v.name == on), None)
+    ssh_host = vm_status.ssh_host if vm_status else None
+    ssh_port = vm_status.ssh_port if vm_status else None
+    if not ssh_host:
         _exit_with_diagnostic(
             Diagnostic(
                 id="config.exec.vm_ip_not_found",
                 severity="error",
                 message=(
-                    f"VM {on!r} has no IP in tofu state — "
+                    f"VM {on!r} has no reachable SSH endpoint — "
                     "has the lab been applied?"
                 ),
-                source=SourceLocation(path=str(tofu_dir)),
+                source=SourceLocation(path=str(config_dir / "labs" / f"{lab}.yaml")),
                 suggestion=f"run `playground apply {lab}` first",
             ),
             OutputFormat.human,
@@ -943,9 +951,15 @@ def exec_command(
 
     ssh_argv = [
         "ssh",
+        # vbox NAT forwards put the guest on a non-22 host port; libvirt /
+        # cloud use 22 (omit -p so the command line is unchanged for them).
+        *(["-p", str(ssh_port)] if ssh_port and ssh_port != 22 else []),
         "-o", "StrictHostKeyChecking=accept-new",
+        # vbox reuses 127.0.0.1:<port> across VM rebuilds, so a pinned
+        # known_hosts entry would trip host-key-mismatch; discard it.
+        "-o", "UserKnownHostsFile=/dev/null",
         "-o", "LogLevel=ERROR",
-        f"{user}@{ip}",
+        f"{user}@{ssh_host}",
         *command,
     ]
     try:
