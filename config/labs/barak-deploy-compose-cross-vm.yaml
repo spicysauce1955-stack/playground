@@ -1,0 +1,63 @@
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: barak-deploy-compose-cross-vm
+  description: >-
+    Cross-VM ship-and-deploy lab for barak-deploy's multi-service docker-compose
+    deploy path: one tunneler source/staging host plus two docker-host targets
+    (frontend + backend) so a single self-describing compose delivery can be
+    shipped to two physically distinct hosts and deploy per-host config.
+  tags: [barak-deploy, cross-vm, compose]
+
+spec:
+  backend: local-libvirt
+  # Provisioning needs apt/pip/docker reachability; the deploy path itself is
+  # closed-network (images arrive as tars inside the wrapper, loaded from tar).
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 12
+    max_memory_mb: 16384
+    max_disk_gb: 180
+    max_vms: 4
+    max_containers: 30
+
+  networks:
+    - name: deploy-net
+      profile: nat
+      cidr: 10.20.40.0/24
+
+  vms:
+    # VMs are addressed by their pinned IPs throughout the test (matching the
+    # existing barak-deploy-cross-vm lab); no extra_hosts/etc-hosts wiring is
+    # needed. (The extra_hosts role in this playground is also currently broken
+    # — `pg_extra_hosts | from_json` on an already-list value — see the upstream
+    # note appended to PLAYGROUND-REQUEST-barak-deploy.md.)
+    - name: source
+      role: docker-host
+      networks:
+        - { name: deploy-net, ip: 10.20.40.20 }
+      tags: [tunneler-source, staging]
+
+    - name: target-a
+      role: docker-host
+      networks:
+        - { name: deploy-net, ip: 10.20.40.21 }
+      tags: [barak-target, frontend]
+
+    - name: target-b
+      role: docker-host
+      networks:
+        - { name: deploy-net, ip: 10.20.40.22 }
+      tags: [barak-target, backend]
+
+  commands:
+    enabled:
+      - check-docker
+      - ping-network
+
+  providers:
+    local-libvirt:
+      uri: qemu:///system
+      pool: default

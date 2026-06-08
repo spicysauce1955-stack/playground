@@ -166,3 +166,31 @@ harder. Suggest: emit it on `apply`/`plan` only, or gate it behind a verbosity f
 
 Happy to provide full run records (`.playground/runs/…`) or repro steps for any of these.
 Thanks — playground saved us a lot of manual VM wrangling.
+
+---
+
+## Follow-up (2026-06-07): `extra_hosts` role crashes on a list-shaped payload
+
+**Context:** building a new 3-VM lab (`barak-deploy-compose-cross-vm`: 1 source + 2
+docker-host targets) for barak-deploy's multi-service docker-compose cross-VM deploy test.
+We used the per-VM `extra_hosts:` lab field to give each VM `/etc/hosts` entries for the
+others.
+
+**What we saw** (`playground apply barak-deploy-compose-cross-vm`): VMs provisioned fine, then
+Ansible failed on every host:
+```
+TASK [extra_hosts : Parse pg_extra_hosts JSON payload]
+fatal: [source]: FAILED! => {"msg": "Unexpected templating type error occurred on
+  ({{ pg_extra_hosts | from_json }}): the JSON object must be str, bytes or bytearray,
+  not list."}
+```
+`pg_extra_hosts` is already a list by the time the role runs, so `| from_json` on it raises.
+This is the **same `from_json` list-vs-string class** as ask #3 (`workload_container from_json`)
+in the original request — the role should accept an already-decoded list (or only `from_json`
+when the value is a string).
+
+**Repro:** any lab VM with `extra_hosts: ["10.20.40.21 target-a"]`.
+
+**Our workaround (no playground change needed by us):** we dropped `extra_hosts` from the lab
+and address VMs by their pinned IPs instead — the existing `barak-deploy-cross-vm` lab already
+works that way. Filing this so the `extra_hosts` field works for the next user. Not blocking us.
