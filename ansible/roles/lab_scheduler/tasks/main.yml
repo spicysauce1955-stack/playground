@@ -3,7 +3,20 @@
 # `playground apply` on a converged host reports changed=0 except the
 # repo-update task when upstream moved).
 
-- name: Assert controller-side secrets resolved (values never logged)
+# The defaults are lazy lookups re-evaluated at every reference; freeze
+# them once so each controller-side file is read a single time per run.
+- name: Resolve controller-side secrets once (values never logged)
+  ansible.builtin.set_fact:
+    lab_scheduler_vast_api_key: "{{ lab_scheduler_vast_api_key }}"
+    lab_scheduler_r2_endpoint: "{{ lab_scheduler_r2_endpoint }}"
+    lab_scheduler_r2_bucket: "{{ lab_scheduler_r2_bucket }}"
+    lab_scheduler_aws_access_key_id: "{{ lab_scheduler_aws_access_key_id }}"
+    lab_scheduler_aws_secret_access_key: "{{ lab_scheduler_aws_secret_access_key }}"
+  no_log: yes
+
+# No no_log here: the assert handles no secret VALUES (a failed `that:`
+# prints the expression, not the data), and censoring would hide fail_msg.
+- name: Assert controller-side secrets resolved
   ansible.builtin.assert:
     that:
       - lab_scheduler_vast_api_key | length > 0
@@ -12,42 +25,38 @@
       - lab_scheduler_aws_secret_access_key | length > 0
     fail_msg: >-
       Missing scheduler secrets on the controller: need
-      ~/.config/vastai/vast_api_key, ~/.cloudflare/r2.credentials and
-      $LAB_R2_ENDPOINT exported before `playground apply lab-scheduler`.
-    quiet: yes
-  no_log: yes
+      {{ lab_scheduler_vast_key_file }}, {{ lab_scheduler_r2_credentials_file }}
+      and $LAB_R2_ENDPOINT exported before `playground apply lab-scheduler`.
 
+# curl/ca-certificates come from the common role's baseline play.
 - name: Install prerequisites
   ansible.builtin.apt:
-    name: [git, curl, ca-certificates, rsync]
+    name: [git, rsync]
     state: present
-    update_cache: yes
     cache_valid_time: 3600
 
-- name: Create swapfile (skypilot import headroom on a 1GB droplet)
+- name: Create and activate swapfile (skypilot import headroom on a 1GB droplet)
   ansible.builtin.shell: |
+    set -e
     fallocate -l {{ lab_scheduler_swap_mb }}M /swapfile
     chmod 600 /swapfile
     mkswap /swapfile
+    swapon /swapfile
   args:
     creates: /swapfile
 
-- name: Enable swapfile now (idempotent)
-  ansible.builtin.shell: |
-    swapon --show=NAME --noheadings | grep -qx /swapfile || { swapon /swapfile && echo ACTIVATED; }
-  register: _swapon
-  changed_when: "'ACTIVATED' in _swapon.stdout"
-
 - name: Persist swapfile across reboots
-  ansible.builtin.lineinfile:
-    path: /etc/fstab
-    line: "/swapfile none swap sw 0 0"
+  ansible.posix.mount:
+    src: /swapfile
+    path: none
+    fstype: swap
+    opts: sw
+    state: present
 
 - name: Create service user
   ansible.builtin.user:
     name: "{{ lab_scheduler_user }}"
     shell: /bin/bash
-    create_home: yes
 
 - name: Install uv to /usr/local/bin
   ansible.builtin.shell: |
@@ -70,13 +79,22 @@
     version: "{{ lab_scheduler_repo_version }}"
     force: yes
   become_user: "{{ lab_scheduler_user }}"
+  register: _repo
 
+- name: Check for an existing venv
+  ansible.builtin.stat:
+    path: "{{ lab_scheduler_home }}/.venv/pyvenv.cfg"
+  register: _venv
+
+# Re-sync when the repo moved, or when a previous sync never completed —
+# gating on _repo.changed alone would skip a half-built venv forever.
 - name: Sync the environment (uv sync --extra skypilot --extra r2)
   ansible.builtin.command:
     cmd: /usr/local/bin/uv sync --extra skypilot --extra r2
     chdir: "{{ lab_scheduler_home }}"
-    creates: "{{ lab_scheduler_home }}/.venv/pyvenv.cfg"
   become_user: "{{ lab_scheduler_user }}"
+  when: _repo.changed or not _venv.stat.exists
+  register: _sync
 
 - name: Vast key directory
   ansible.builtin.file:
@@ -109,6 +127,7 @@
     group: root
     mode: "0600"
   no_log: yes
+  register: _env
 
 - name: Install systemd units from the laboratory repo
   ansible.builtin.copy:
@@ -121,15 +140,14 @@
     - lab-scheduler.timer
   register: _units
 
-- name: Reload systemd when units changed
-  ansible.builtin.systemd:
-    daemon_reload: yes
-  when: _units.changed
-
-- name: Run one synchronous tick now (fail fast if the env is broken)
+# Steady-state ticks come from the 60s timer; only re-validate
+# synchronously when this run actually changed the deployment.
+- name: Run one synchronous tick when the deployment changed (fail fast)
   ansible.builtin.systemd:
     name: lab-scheduler.service
     state: started
+    daemon_reload: yes
+  when: _sync.changed or _env.changed or _units.changed
 
 - name: Enable + start the 60s timer
   ansible.builtin.systemd:

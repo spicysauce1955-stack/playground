@@ -13,15 +13,24 @@ lab_scheduler_user: lab
 lab_scheduler_swap_mb: 2048
 
 # --- secrets, resolved on the controller ---------------------------------
+lab_scheduler_vast_key_file: "{{ lookup('env', 'HOME') }}/.config/vastai/vast_api_key"
+lab_scheduler_r2_credentials_file: "{{ lookup('env', 'HOME') }}/.cloudflare/r2.credentials"
+
+# errors='ignore' turns a missing controller file into an empty value so
+# the role's assert can report it with a readable message instead of a
+# censored lookup traceback.
 lab_scheduler_vast_api_key: >-
-  {{ lookup('file', lookup('env', 'HOME') + '/.config/vastai/vast_api_key') | trim }}
+  {{ lookup('file', lab_scheduler_vast_key_file, errors='ignore')
+     | default('', true) | trim }}
 lab_scheduler_r2_endpoint: "{{ lookup('env', 'LAB_R2_ENDPOINT') }}"
 lab_scheduler_r2_bucket: "{{ lookup('env', 'LAB_R2_BUCKET') | default('lab-artifacts', true) }}"
 lab_scheduler_aws_access_key_id: >-
   {{ lookup('ini', 'aws_access_key_id',
             section='default',
-            file=lookup('env', 'HOME') + '/.cloudflare/r2.credentials') }}
+            file=lab_scheduler_r2_credentials_file,
+            errors='ignore') | default('', true) }}
 lab_scheduler_aws_secret_access_key: >-
   {{ lookup('ini', 'aws_secret_access_key',
             section='default',
-            file=lookup('env', 'HOME') + '/.cloudflare/r2.credentials') }}
+            file=lab_scheduler_r2_credentials_file,
+            errors='ignore') | default('', true) }}

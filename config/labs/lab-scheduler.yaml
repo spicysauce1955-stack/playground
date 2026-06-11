@@ -40,10 +40,7 @@ spec:
     - name: scheduler
       role: lab-scheduler-host
       networks: [lab-net]
-      resources:
-        vcpu: 1
-        memory_mb: 1024
-        disk_gb: 25
+      # resources come from the lab-scheduler-host role (1 vcpu / 1 GB / 25 GB)
 
   providers:
     cloud-digitalocean:
