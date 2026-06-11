@@ -1,0 +1,18 @@
+apiVersion: playground/v1
+kind: VmRole
+metadata:
+  name: lab-scheduler-host
+  description: |
+    Always-on host for the laboratory deferred-scheduler: clones the
+    laboratory repo, installs uv + the skypilot/r2 extras, and runs
+    `lab scheduler tick` every 60s via a systemd timer. Stateless —
+    all queue state lives in R2 (see laboratory deploy/scheduler/README.md).
+
+spec:
+  extends: generic-node
+  resources:
+    vcpu: 1
+    memory_mb: 1024
+    disk_gb: 25
+  provisioners:
+    - ansible_role: lab_scheduler

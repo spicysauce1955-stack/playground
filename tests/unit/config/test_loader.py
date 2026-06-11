@@ -20,7 +20,7 @@ def test_load_committed_config_is_clean() -> None:
     assert loaded.artifacts is not None
     assert set(loaded.networks) == {"nat", "isolated", "routed"}
     assert set(loaded.roles) == {
-        "generic-node", "docker-host", "router", "redroid-host",
+        "generic-node", "docker-host", "router", "redroid-host", "lab-scheduler-host",
     }
     assert set(loaded.commands) == {"check-docker", "ping-network"}
     # Committed providers/labs are asserted as a *subset* rather than an

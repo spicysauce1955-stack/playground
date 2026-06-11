@@ -1,0 +1,51 @@
+# lab-scheduler — always-on droplet running the laboratory deferred-scheduler.
+#
+# Requires before apply:
+#   export DIGITALOCEAN_TOKEN=<token>
+#   export LAB_R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+# plus, on the controller: ~/.config/vastai/vast_api_key and
+# ~/.cloudflare/r2.credentials (read at configure time, never committed).
+#
+# Cost note: this lab is meant to STAY UP (it is the scheduler). `playground
+# suspend lab-scheduler` destroys the Droplet when the queue is idle; the
+# scheduler is stateless (R2), so recreate is always safe.
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: lab-scheduler
+  description: |
+    Single smallest-size Droplet running the laboratory deferred-scheduler
+    (`lab scheduler tick` via systemd timer, skypilot backend). Contract:
+    laboratory repo deploy/scheduler/README.md.
+  tags: [cloud, digitalocean, laboratory, scheduler]
+
+spec:
+  backend: cloud-digitalocean
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 1
+    max_memory_mb: 1024
+    max_disk_gb: 25
+    max_vms: 1
+    max_containers: 0
+
+  networks:
+    - name: lab-net
+      profile: nat
+      cidr: 10.61.0.0/24
+
+  vms:
+    - name: scheduler
+      role: lab-scheduler-host
+      networks: [lab-net]
+      resources:
+        vcpu: 1
+        memory_mb: 1024
+        disk_gb: 25
+
+  providers:
+    cloud-digitalocean:
+      region: nyc3
+      size: s-1vcpu-1gb

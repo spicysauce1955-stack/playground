@@ -99,3 +99,13 @@
     - ansible.builtin.include_role:
         name: workload_swarm
         tasks_from: deploy
+
+- name: Deploy the laboratory deferred-scheduler host
+  hosts: needs_lab_scheduler
+  become: yes
+  gather_facts: no
+  roles:
+    # Stateless scheduler for the laboratory repo: uv + repo clone +
+    # /etc/lab/scheduler.env (secrets from the controller) + 60s systemd
+    # timer running `lab scheduler tick --backend skypilot`.
+    - lab_scheduler

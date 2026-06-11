@@ -1,0 +1,131 @@
+---
+# Deploy the laboratory deferred-scheduler (idempotent; re-running
+# `playground apply` on a converged host reports changed=0 except the
+# repo-update task when upstream moved).
+
+- name: Assert controller-side secrets resolved (values never logged)
+  ansible.builtin.assert:
+    that:
+      - lab_scheduler_vast_api_key | length > 0
+      - lab_scheduler_r2_endpoint | length > 0
+      - lab_scheduler_aws_access_key_id | length > 0
+      - lab_scheduler_aws_secret_access_key | length > 0
+    fail_msg: >-
+      Missing scheduler secrets on the controller: need
+      ~/.config/vastai/vast_api_key, ~/.cloudflare/r2.credentials and
+      $LAB_R2_ENDPOINT exported before `playground apply lab-scheduler`.
+    quiet: yes
+  no_log: yes
+
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name: [git, curl, ca-certificates, rsync]
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Create swapfile (skypilot import headroom on a 1GB droplet)
+  ansible.builtin.shell: |
+    fallocate -l {{ lab_scheduler_swap_mb }}M /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+  args:
+    creates: /swapfile
+
+- name: Enable swapfile now (idempotent)
+  ansible.builtin.shell: |
+    swapon --show=NAME --noheadings | grep -qx /swapfile || { swapon /swapfile && echo ACTIVATED; }
+  register: _swapon
+  changed_when: "'ACTIVATED' in _swapon.stdout"
+
+- name: Persist swapfile across reboots
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "/swapfile none swap sw 0 0"
+
+- name: Create service user
+  ansible.builtin.user:
+    name: "{{ lab_scheduler_user }}"
+    shell: /bin/bash
+    create_home: yes
+
+- name: Install uv to /usr/local/bin
+  ansible.builtin.shell: |
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+  args:
+    creates: /usr/local/bin/uv
+
+- name: Create repo dir owned by the service user
+  ansible.builtin.file:
+    path: "{{ lab_scheduler_home }}"
+    state: directory
+    owner: "{{ lab_scheduler_user }}"
+    group: "{{ lab_scheduler_user }}"
+    mode: "0755"
+
+- name: Clone / update the laboratory repo
+  ansible.builtin.git:
+    repo: "{{ lab_scheduler_repo_url }}"
+    dest: "{{ lab_scheduler_home }}"
+    version: "{{ lab_scheduler_repo_version }}"
+    force: yes
+  become_user: "{{ lab_scheduler_user }}"
+
+- name: Sync the environment (uv sync --extra skypilot --extra r2)
+  ansible.builtin.command:
+    cmd: /usr/local/bin/uv sync --extra skypilot --extra r2
+    chdir: "{{ lab_scheduler_home }}"
+    creates: "{{ lab_scheduler_home }}/.venv/pyvenv.cfg"
+  become_user: "{{ lab_scheduler_user }}"
+
+- name: Vast API key for the service user (sky reads the file, the sdk reads the env)
+  ansible.builtin.copy:
+    content: "{{ lab_scheduler_vast_api_key }}\n"
+    dest: "/home/{{ lab_scheduler_user }}/.config/vastai/vast_api_key"
+    owner: "{{ lab_scheduler_user }}"
+    group: "{{ lab_scheduler_user }}"
+    mode: "0600"
+    directory_mode: "0700"
+  no_log: yes
+
+- name: /etc/lab directory
+  ansible.builtin.file:
+    path: /etc/lab
+    state: directory
+    mode: "0755"
+
+- name: Render scheduler.env (secrets; root-only)
+  ansible.builtin.template:
+    src: scheduler.env.j2
+    dest: /etc/lab/scheduler.env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: yes
+
+- name: Install systemd units from the laboratory repo
+  ansible.builtin.copy:
+    src: "{{ lab_scheduler_home }}/deploy/scheduler/{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    remote_src: yes
+    mode: "0644"
+  loop:
+    - lab-scheduler.service
+    - lab-scheduler.timer
+  register: _units
+
+- name: Reload systemd when units changed
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  when: _units.changed
+
+- name: Run one synchronous tick now (fail fast if the env is broken)
+  ansible.builtin.systemd:
+    name: lab-scheduler.service
+    state: started
+
+- name: Enable + start the 60s timer
+  ansible.builtin.systemd:
+    name: lab-scheduler.timer
+    enabled: yes
+    state: started
