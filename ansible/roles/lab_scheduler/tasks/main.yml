@@ -78,6 +78,14 @@
     creates: "{{ lab_scheduler_home }}/.venv/pyvenv.cfg"
   become_user: "{{ lab_scheduler_user }}"
 
+- name: Vast key directory
+  ansible.builtin.file:
+    path: "/home/{{ lab_scheduler_user }}/.config/vastai"
+    state: directory
+    owner: "{{ lab_scheduler_user }}"
+    group: "{{ lab_scheduler_user }}"
+    mode: "0700"
+
 - name: Vast API key for the service user (sky reads the file, the sdk reads the env)
   ansible.builtin.copy:
     content: "{{ lab_scheduler_vast_api_key }}\n"
@@ -85,7 +93,6 @@
     owner: "{{ lab_scheduler_user }}"
     group: "{{ lab_scheduler_user }}"
     mode: "0600"
-    directory_mode: "0700"
   no_log: yes
 
 - name: /etc/lab directory
