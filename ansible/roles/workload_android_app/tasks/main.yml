@@ -5,10 +5,21 @@
 # copy it to `pg_apk_root/<workload>/` on the target, wait for Android to
 # finish booting, then install with adb and optionally launch it.
 #
-# Idempotent by construction: install is skipped once `pm list packages`
-# already shows the package (unless `reinstall` is set), and launch is
-# ensure-running — it checks `pidof` before starting anything. A second
-# `playground apply` against a converged host must report `changed=0`.
+# Idempotent EXCEPT for two documented cases:
+#   * `android.reinstall: true` makes install run unconditionally --
+#     `adb install -r` executes, and this task reports changed, on every
+#     apply. Use it only for workloads that must always pick up the
+#     latest local build.
+#   * `android.launch: true` means "ensure a process named <package>
+#     exists" (via `pidof`), which is a property of the APP, not of this
+#     role. An app whose launcher activity finishes immediately
+#     (splash-and-exit / one-shot), or one reaped by Android's
+#     low-memory killer, has no matching process by the time the next
+#     apply runs -- the launch task fires, and reports changed, EVERY
+#     time. That is not a bug being silenced here; it is what
+#     "ensure-running" means for an app that does not stay running.
+# With `reinstall: false` (the default) and a long-running app, a second
+# `playground apply` against a converged host reports `changed=0`.
 
 - name: Parse pg_workloads JSON payload
   ansible.builtin.set_fact:
@@ -23,12 +34,33 @@
 
 - name: Compute android_app workloads only
   ansible.builtin.set_fact:
+    # Also requires an `android:` block: a `type: android_app` workload
+    # with no `android:` key would otherwise reach the install/grant/launch
+    # tasks below and blow up on `item.android.package` instead of being
+    # skipped with an explanation.
     pg_android_workloads: >-
       {{
         (pg_workloads_parsed | default([]))
           | selectattr('type', 'equalto', 'android_app')
+          | selectattr('android', 'defined')
           | list
       }}
+    pg_android_workloads_missing_config: >-
+      {{
+        (pg_workloads_parsed | default([]))
+          | selectattr('type', 'equalto', 'android_app')
+          | rejectattr('android', 'defined')
+          | map(attribute='name')
+          | list
+      }}
+
+- name: Warn about android_app workloads with no android block
+  ansible.builtin.debug:
+    msg: >-
+      Skipping workload(s) {{ pg_android_workloads_missing_config }}:
+      type is android_app but no `android:` block was declared (at least
+      `package` is required), so there is nothing to install or launch.
+  when: pg_android_workloads_missing_config | length > 0
 
 - name: Skip when no android_app workloads scheduled
   ansible.builtin.meta: end_host
@@ -43,6 +75,38 @@
   loop_control:
     label: "{{ item.name }}"
 
+- name: Find existing split APKs already staged on the target
+  ansible.builtin.find:
+    paths: "{{ pg_apk_root }}/{{ item.name }}"
+    patterns: "*.apk"
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.staged_source is defined and not (item.staged_source | lower).endswith('.apk')
+  register: pg_split_dir_listing
+
+- name: Purge stale split APKs dropped from the current staged source
+  # ansible.builtin.copy never deletes. If a split is renamed or dropped
+  # upstream, the stale file on the guest survives and the
+  # `install-multiple ... *.apk` glob below sweeps it back in, producing
+  # INSTALL_FAILED_INVALID_APK for a file nothing in the current lab
+  # config even references any more. `lookup('fileglob', ...)` runs on
+  # the CONTROLLER against item.staged_source, so this compares "what's
+  # on disk on the guest" against "what the controller currently wants
+  # to stage" and removes anything not in the latter -- before staging.
+  ansible.builtin.file:
+    path: "{{ item.1.path }}"
+    state: absent
+  loop: >-
+    {{ pg_split_dir_listing.results | default([])
+       | subelements('files', skip_missing=True) }}
+  loop_control:
+    label: "{{ item.1.path }}"
+  when: >-
+    (item.1.path | basename) not in
+    (lookup('fileglob', item.0.item.staged_source + '/*') | map('basename') | list)
+
 - name: Stage a single staged APK file on the target
   ansible.builtin.copy:
     src: "{{ item.staged_source }}"
@@ -52,7 +116,8 @@
   loop_control:
     label: "{{ item.name }}"
   when: >-
-    item.staged_source is defined and item.staged_source.endswith('.apk')
+    item.staged_source is defined and (item.staged_source | lower).endswith('.apk')
+  register: pg_apk_file_copy
 
 - name: Stage a staged split-APK directory on the target
   ansible.builtin.copy:
@@ -67,7 +132,8 @@
   loop_control:
     label: "{{ item.name }}"
   when: >-
-    item.staged_source is defined and not item.staged_source.endswith('.apk')
+    item.staged_source is defined and not (item.staged_source | lower).endswith('.apk')
+  register: pg_apk_split_copy
 
 - name: Wait for Android to report boot completed
   ansible.builtin.shell: |
@@ -85,7 +151,6 @@
     exit 1
   args:
     executable: /bin/bash
-  register: pg_android_booted
   changed_when: false
 
 - name: Query installed packages on the guest
@@ -108,9 +173,13 @@
   loop_control:
     label: "{{ item.name }}"
   when: >-
-    item.staged_source is defined and item.staged_source.endswith('.apk')
+    item.staged_source is defined and (item.staged_source | lower).endswith('.apk')
     and (("package:" ~ item.android.package) not in pg_installed.stdout.split()
-         or item.android.reinstall | default(false))
+         or item.android.reinstall | default(false)
+         or ((pg_apk_file_copy.results | default([])
+              | selectattr('item.name', 'equalto', item.name)
+              | map(attribute='changed', default=false)
+              | list | first) | default(false)))
 
 - name: Install split APKs
   ansible.builtin.shell: >-
@@ -123,9 +192,13 @@
   loop_control:
     label: "{{ item.name }}"
   when: >-
-    item.staged_source is defined and not item.staged_source.endswith('.apk')
+    item.staged_source is defined and not (item.staged_source | lower).endswith('.apk')
     and (("package:" ~ item.android.package) not in pg_installed.stdout.split()
-         or item.android.reinstall | default(false))
+         or item.android.reinstall | default(false)
+         or ((pg_apk_split_copy.results | default([])
+              | selectattr('item.name', 'equalto', item.name)
+              | map(attribute='changed', default=false)
+              | list | first) | default(false)))
 
 - name: Grant declared permissions
   ansible.builtin.shell: >-
@@ -140,6 +213,15 @@
   # machine-readable signal of a state change, so this never reports
   # changed — the alternative is reporting changed on every apply.
   changed_when: false
+  # pm grant exits non-zero for a permission that is install-time-only
+  # (e.g. android.permission.INTERNET) or simply not declared in the
+  # app's manifest -- both are common and neither is this role's problem
+  # to fix. Failing here would abort the play AFTER the APK is already
+  # installed, leaving the host half-converged and skipping the launch
+  # step below entirely. Tolerate it, matching the `failed_when: false`
+  # idiom used throughout the redroid role; a bad permission name is
+  # still visible in `-vvv` output.
+  failed_when: false
 
 - name: Check whether the app is already running
   ansible.builtin.shell: >-
@@ -155,32 +237,64 @@
   changed_when: false
   failed_when: false
 
+# `am start` prints "Error: Activity not started, unable to resolve
+# Intent" on stderr with an exit code that varies by Android release, so
+# its status is not a launch oracle -- exactly the trap that made the
+# monkey path fail a live apply. End on pidof so the rc means "is it
+# running now", and tolerate failure the same way the fallback does: a
+# lab should not lose an otherwise-converged host because one app would
+# not come to the foreground.
 - name: Launch the app via its declared activity
   ansible.builtin.shell: >-
     adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
     adb -s 127.0.0.1:5555 shell am start -n
-    {{ item.item.android.package }}/{{ item.item.android.activity }}
+    {{ (item.item.android.package ~ '/' ~ item.item.android.activity) | quote }}
+    >/dev/null 2>&1;
+    n=0; while [ "$n" -lt 10 ]; do
+    adb -s 127.0.0.1:5555 shell pidof {{ item.item.android.package | quote }}
+    >/dev/null 2>&1 && exit 0; n=$((n + 1)); sleep 1; done; exit 1
   args:
     executable: /bin/bash
   loop: "{{ pg_pidof.results | default([]) }}"
   loop_control:
     label: "{{ item.item.name }}"
+  failed_when: false
   when: >-
     item.item.android.launch | default(false)
     and item.rc is defined and item.rc != 0
     and item.item.android.activity
 
-# monkey returns 251 on Redroid 11 even on a successful launch (verified
-# live 2026-08-31), so its exit status must not decide the task result --
-# without this the whole apply fails for any lab declaring launch: true
-# without an activity. `pidof` is the real signal.
-- name: Launch the app via monkey (no declared activity)
+# Launch discovery, mirroring
+# src/playground/android/commands.py::launch_cmd. monkey is NOT a
+# reliable PRIMARY launcher -- verified live on Redroid 11
+# (DigitalOcean, 2026-08-31): it returned 251 on a successful launch,
+# and later stopped launching the app at all while still reporting the
+# same output. `cmd package resolve-activity --brief` resolves the
+# app's real launcher component; `am start -n` on it gives an honest
+# 0/non-0. monkey survives only as the last-resort fallback when
+# resolution fails, and its own exit status is discarded in favour of
+# the trailing `pidof` -- "did it launch" is a question about the
+# process, not about which command started it.
+#
+# The device-side script is quoted as ONE argument to `adb shell` so
+# `$(...)`, `;` and the `if` run on the DEVICE (Android's
+# /system/bin/sh), not on the guest invoking adb.
+#
+# failed_when: false -- see the idempotency note at the top of this
+# file: whether the app ends up with a running process is a property of
+# the APP (splash-and-exit apps never leave one behind), not of this
+# role, so a non-zero rc here must not abort the play.
+- name: Launch the app via launcher discovery (no declared activity)
   ansible.builtin.shell: >-
     adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
-    adb -s 127.0.0.1:5555 shell monkey -p {{ item.item.android.package }}
-    -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;
-    adb -s 127.0.0.1:5555 shell pidof {{ item.item.android.package }}
-    >/dev/null 2>&1
+    adb -s 127.0.0.1:5555 shell
+    'ACT=$(cmd package resolve-activity --brief {{ item.item.android.package }} | tail -n 1);
+    if [ -n "$ACT" ] && [ "${ACT#*/}" != "$ACT" ]; then
+    am start -n "$ACT" >/dev/null 2>&1;
+    else
+    monkey -p {{ item.item.android.package }} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;
+    fi;
+    pidof {{ item.item.android.package }} >/dev/null 2>&1'
   args:
     executable: /bin/bash
   loop: "{{ pg_pidof.results | default([]) }}"
@@ -190,3 +304,4 @@
     item.item.android.launch | default(false)
     and item.rc is defined and item.rc != 0
     and not item.item.android.activity
+  failed_when: false

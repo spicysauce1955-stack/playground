@@ -41,6 +41,7 @@ from playground.android.commands import (
     stop_cmd,
     ui_dump_cmd,
     uninstall_cmd,
+    wait_booted_cmd,
 )
 from playground.android.runner import TargetResult, run_on_targets
 from playground.android.targets import AndroidTarget, resolve_targets
@@ -80,10 +81,21 @@ app_app = typer.Typer(
 )
 
 _DEFAULT_TIMEOUT = 30.0
-_INSTALL_TIMEOUT = 120.0
-_SCP_TIMEOUT = 60.0
+# Raised from 120.0/60.0: both were sized for a small APK on a local
+# libvirt guest and are tight for a large (100+MB) split install or a
+# slow cloud-VM upload link — see BUG note in the audit that introduced
+# this comment. `install` now also pays for a boot-wait round trip before
+# either of these ever runs (see _BOOT_WAIT_TIMEOUT below).
+_INSTALL_TIMEOUT = 300.0
+_SCP_TIMEOUT = 180.0
 _CAPTURE_TIMEOUT = 30.0
 _PUSH_PULL_TIMEOUT = 60.0
+_BOOT_WAIT_SECONDS = 120
+"""Passed to `wait_booted_cmd`: how long the GUEST-side poll loop waits."""
+_BOOT_WAIT_TIMEOUT = float(_BOOT_WAIT_SECONDS + 30)
+"""ssh/subprocess timeout for the boot-wait call itself — must exceed the
+guest-side loop's own budget or we would time out the ssh call before the
+loop has a chance to give up on its own and report a clean failure."""
 
 # Shared targeting/connection flags, reused verbatim across every verb.
 LabOpt = Annotated[
@@ -241,7 +253,13 @@ def _scp_one(
     local: Path, target: AndroidTarget, remote_path: str, *, timeout: float = _SCP_TIMEOUT
 ) -> bool:
     """scp ``local`` to ``remote_path`` on ``target``. Prints and returns False on failure."""
-    dst = f"{target.ssh_user}@{target.ssh_host}:{remote_path}"
+    # scp's `host:path` operand IS shell-interpreted on the remote side
+    # (legacy scp protocol execs a remote shell; even the SFTP-based
+    # default still tokenizes it for some servers/older clients). Without
+    # quoting, a filename with a space is "ambiguous target" and one with
+    # a backtick or `$(...)` runs on the guest. Only the path half is
+    # quoted -- the user@host half must stay bare.
+    dst = f"{target.ssh_user}@{target.ssh_host}:{shlex.quote(remote_path)}"
     argv = build_scp_argv(str(local), dst, port=target.ssh_port)
     try:
         completed = subprocess.run(  # noqa: S603
@@ -263,6 +281,7 @@ def _capture_to_local(
     local_path: Path,
     *,
     timeout: float = _CAPTURE_TIMEOUT,
+    clean_device_path_first: bool = True,
 ) -> bool:
     """Run ``capture_cmd``, `adb pull` its output onto the guest, then stream
     it back to the controller over the SAME ssh session.
@@ -272,11 +291,56 @@ def _capture_to_local(
     guest-local file through this ssh call's stdout covers the third hop
     without a second network round trip or a dependency on a separately
     invoked `scp` for what is, from the guest's point of view, a `cat`.
+
+    ``adb_prefix()`` is NOT a single command — it is
+    ``adb connect ... || true; adb -s ...`` — so interpolating it after a
+    bare ``&&`` splits the chain at that embedded ``;``: bash treats
+    everything from there on as a NEW, unconditional statement list, and
+    ``capture_cmd``'s exit status stops gating anything. Because
+    ``device_path`` is a fixed, reused filename for screenshot/ui-dump,
+    that let a failed capture silently `adb pull` (and `cat` back) a
+    STALE file from a previous run while reporting success. Every step
+    that is itself built from ``adb_prefix()`` is therefore wrapped in a
+    `{ ...; }` group before being used as an `&&` operand, so its own
+    internal `;` cannot escape the group and its exit status is what the
+    surrounding `&&` actually sees.
+
+    ``clean_device_path_first`` deletes ``device_path`` on the device
+    before running ``capture_cmd`` so a capture that fails partway can
+    never leave a stale file to be mistaken for a fresh one. It defaults
+    to True for screenshot/ui-dump (synthetic, CLI-owned paths that get
+    overwritten every call) and must be False for the generic `pull`
+    verb, where ``device_path`` is an arbitrary, pre-existing file the
+    caller wants to read — deleting it before "capturing" would destroy
+    the very thing being pulled.
     """
     guest_tmp = f"/tmp/playground-pull-{uuid4().hex}"
+    prefix = adb_prefix()
+    capture_group = f"{{ {capture_cmd}; }}"
+    pull_group = (
+        f"{{ {prefix} pull {shlex.quote(device_path)} "
+        f"{shlex.quote(guest_tmp)} >/dev/null 2>&1; }}"
+    )
+    chain = f"{capture_group} && {pull_group}"
+    if clean_device_path_first:
+        # `adb_shell`, not a hand-rolled `{prefix} shell rm -f ...`: it
+        # quotes the whole device-side command as ONE token so `adb shell`
+        # (which re-joins multi-word argv with spaces before the device's
+        # own sh -c reparses it) cannot split or mis-parse it -- the same
+        # double-hop hazard every other device-shell command in this
+        # module is built to avoid.
+        clean_group = f"{{ {adb_shell(f'rm -f {shlex.quote(device_path)}')}; }}"
+        chain = f"{clean_group} && {chain}"
+    # `[ -s guest_tmp ]` rejects a capture that exited 0 but wrote zero
+    # bytes (observed live: `screencap` can do this). The trailing
+    # `status=$?; rm -f guest_tmp; exit $status` runs unconditionally
+    # (outside the `&&` chain, after a plain `;`) so the guest-side temp
+    # file is always removed — success or failure — without disturbing
+    # the exit code the chain produced. See BUG D: nothing else in this
+    # verb previously cleaned up its `/tmp` files.
     remote_cmd = (
-        f"{capture_cmd} && {adb_prefix()} pull {shlex.quote(device_path)} "
-        f"{shlex.quote(guest_tmp)} >/dev/null 2>&1 && cat {shlex.quote(guest_tmp)}"
+        f"{chain} && [ -s {shlex.quote(guest_tmp)} ] && cat {shlex.quote(guest_tmp)}; "
+        f"status=$?; rm -f {shlex.quote(guest_tmp)}; exit $status"
     )
     argv = build_ssh_argv(
         target.ssh_host,
@@ -296,7 +360,27 @@ def _capture_to_local(
         stderr = completed.stderr.decode(errors="replace").strip()
         typer.echo(f"[{target.vm_name}] capture failed: {stderr}", err=True)
         return False
-    local_path.write_bytes(completed.stdout)
+    if not completed.stdout:
+        # Belt-and-suspenders on top of the remote `[ -s ... ]` check --
+        # never write a zero-byte file and call it a screenshot/dump.
+        typer.echo(f"[{target.vm_name}] capture failed: no data received", err=True)
+        return False
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        typer.echo(f"[{target.vm_name}] cannot create {local_path.parent}: {exc}", err=True)
+        return False
+    if local_path.is_dir():
+        typer.echo(
+            f"[{target.vm_name}] {local_path} is a directory, expected a file path",
+            err=True,
+        )
+        return False
+    try:
+        local_path.write_bytes(completed.stdout)
+    except OSError as exc:
+        typer.echo(f"[{target.vm_name}] failed to write {local_path}: {exc}", err=True)
+        return False
     typer.echo(f"[{target.vm_name}] wrote {local_path}")
     return True
 
@@ -349,6 +433,24 @@ def install_command(
 
     failed: list[str] = []
     for target in targets:
+        # Right after `apply` the Redroid container is up but Android is
+        # still booting; installing against it intermittently fails with
+        # `device offline` / `INSTALL_FAILED_PACKAGE_MANAGER_NOT_READY` /
+        # `Can't find service: package`. Gate on a real boot signal instead
+        # of racing it, and report plainly rather than surfacing whatever
+        # raw adb error the race happened to produce.
+        boot = run_on_targets(
+            [target], wait_booted_cmd(_BOOT_WAIT_SECONDS), timeout=_BOOT_WAIT_TIMEOUT
+        )[0]
+        if not boot.ok:
+            typer.echo(
+                f"[{target.vm_name}] Android did not finish booting within "
+                f"{_BOOT_WAIT_SECONDS}s; not installing",
+                err=True,
+            )
+            failed.append(target.vm_name)
+            continue
+
         # Stage on the VM's own filesystem, NOT /data/local/tmp: that is an
         # ANDROID path, and scp's destination is the Ubuntu guest, which has
         # no such directory. `adb install` reads the APK from the machine
@@ -359,7 +461,7 @@ def install_command(
         stage_dir = f"/tmp/playground-apk-{uuid4().hex}"
         remote_paths = [f"{stage_dir}/{apk.name}" for apk in apks]
         mkdir = run_on_targets(
-            [target], f"mkdir -p {stage_dir}", timeout=_DEFAULT_TIMEOUT
+            [target], f"mkdir -p {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
         )[0]
         if not mkdir.ok:
             _echo_target_output(mkdir)
@@ -369,14 +471,28 @@ def install_command(
             _scp_one(apk, target, remote_path)
             for apk, remote_path in zip(apks, remote_paths, strict=True)
         ):
+            # Best-effort: some APKs may have already landed on the guest
+            # even though the whole install did not go ahead (BUG D — this
+            # stage_dir is otherwise never removed and fills the disk).
+            run_on_targets(
+                [target], f"rm -rf {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
+            )
             failed.append(target.vm_name)
             continue
-        command = (
+        install_command_str = (
             install_multiple_cmd(remote_paths)
             if len(remote_paths) > 1
             else install_cmd(remote_paths[0])
         )
-        result = run_on_targets([target], command, timeout=_INSTALL_TIMEOUT)[0]
+        # Fold stage_dir cleanup into the SAME ssh round trip as the
+        # install (rather than a separate call) so a failed install still
+        # removes the staged APK(s), and the real install exit status is
+        # still what decides pass/fail.
+        full_command = (
+            f"{install_command_str}; status=$?; "
+            f"rm -rf {shlex.quote(stage_dir)}; exit $status"
+        )
+        result = run_on_targets([target], full_command, timeout=_INSTALL_TIMEOUT)[0]
         _echo_target_output(result)
         if not result.ok:
             failed.append(target.vm_name)
@@ -661,7 +777,12 @@ def push_command(
         if not _scp_one(src, target, guest_tmp):
             failed.append(target.vm_name)
             continue
-        command = f"{adb_prefix()} push {shlex.quote(guest_tmp)} {shlex.quote(dest)}"
+        # BUG D: guest_tmp was never removed. Clean it up in the same ssh
+        # round trip, after the push attempt, regardless of outcome
+        # (`; status=$?; rm -f ...; exit $status`, plain sequencing after
+        # a `;` — not `&&` — is exactly what makes the cleanup unconditional).
+        push_cmd = f"{adb_prefix()} push {shlex.quote(guest_tmp)} {shlex.quote(dest)}"
+        command = f"{push_cmd}; status=$?; rm -f {shlex.quote(guest_tmp)}; exit $status"
         result = run_on_targets([target], command, timeout=_PUSH_PULL_TIMEOUT)[0]
         _echo_target_output(result)
         if not result.ok:
@@ -699,7 +820,13 @@ def pull_command(
             )
         )
     target = targets[0]
-    if not _capture_to_local(target, "true", src, dest, timeout=_PUSH_PULL_TIMEOUT):
+    # `pull`'s device_path is an arbitrary, pre-existing file the caller
+    # wants to read, not a synthetic path this CLI owns and recreates
+    # every call (unlike screenshot/ui-dump) — deleting it first would
+    # destroy the very file being pulled.
+    if not _capture_to_local(
+        target, "true", src, dest, timeout=_PUSH_PULL_TIMEOUT, clean_device_path_first=False
+    ):
         raise typer.Exit(code=1)
 
 
