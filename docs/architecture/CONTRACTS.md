@@ -531,6 +531,21 @@ idempotent (`changed=0` on re-run), Redroid 11 boots
 (`sys.boot_completed=1`), ADB works through `playground adb`, and the whole
 stack survives a graceful reboot.
 
+### Redroid image tags: pin the date-stamped one
+
+`redroid/redroid:<version>-latest` is a MOVING tag -- upstream repoints it
+on every new build of that version. A lab pinned to it is not reproducible:
+two applies weeks apart can boot different Android builds from identical
+committed config, and an app-test result cannot be attributed to a specific
+build.
+
+`ansible/roles/redroid/defaults/main.yml` pins the date-stamped tag
+(`11.0.0-240527`) that `11.0.0-latest` resolved to on 2026-08-31 --
+identical digest, so the pin changed nothing at the time it was made.
+`tests/unit/ansible/test_redroid_image_pin.py` fails if a `-latest` tag is
+reintroduced. Choose new versions from
+https://hub.docker.com/r/redroid/redroid/tags, always a date-stamped tag.
+
 ### Two live-only failures this role exists to avoid
 
 Both were invisible to static tests and to a first apply. They only

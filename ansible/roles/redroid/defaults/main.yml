@@ -1,5 +1,19 @@
 ---
-redroid_image: redroid/redroid:11.0.0-latest
+# Pinned to an IMMUTABLE date-stamped tag, not `11.0.0-latest`. Upstream
+# repoints the `-latest` suffix on every new 11.0.0 build, so two applies
+# weeks apart would produce different Android builds from identical
+# committed config -- and an app-test result could not be attributed to a
+# specific build.
+#
+# 11.0.0-240527 is the tag `11.0.0-latest` currently resolves to:
+#   sha256:60b0810684be4578733a847be3314c50b70f73bc92405b5a627ebe9b633ebb5e
+# (verified 2026-08-31; identical digest, so this pin changed no behavior --
+# it is the exact image the live DigitalOcean validation booted).
+#
+# To move Android versions, pick another date-stamped tag from
+# https://hub.docker.com/r/redroid/redroid/tags -- never a `-latest` one.
+# tests/unit/ansible/test_redroid_image_pin.py enforces this.
+redroid_image: redroid/redroid:11.0.0-240527
 
 # Ubuntu cloud images build binder as a module and ship it in
 # linux-modules-extra-<kernel>, which is not installed by default. Set
