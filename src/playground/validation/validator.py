@@ -32,6 +32,13 @@ Diagnostic IDs:
   network)
 - ``config.network.dns_domain_invalid`` (``Lab.spec.dns_domain`` doesn't
   look like an RFC-1035-ish domain name)
+- ``config.workload.android_options_missing`` (``type: android_app`` with
+  no ``android:`` block — ``package`` cannot be inferred)
+- ``config.workload.android_options_ignored`` (warning; an ``android:``
+  block on a non-``android_app`` workload)
+- ``config.workload.android_target_not_capable`` (warning; an
+  ``android_app`` workload's placement matches no VM with the ``redroid``
+  capability)
 """
 
 from __future__ import annotations
@@ -298,6 +305,7 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
 
     for idx, wl in enumerate(lab.spec.workloads):
         diagnostics.extend(_check_workload_placement(lab, idx, source, loaded))
+        diagnostics.extend(_check_android_workload(lab, idx, source, loaded))
         for net_idx, net_name in enumerate(wl.networks):
             if net_name not in declared_network_names:
                 diagnostics.append(
@@ -564,6 +572,90 @@ def _check_workload_placement(
             suggestion="update the workload placement or add a matching VM to the lab",
         )
     ]
+
+
+def _check_android_workload(
+    lab: Lab,
+    workload_idx: int,
+    source: SourceLocation,
+    loaded: LoadedConfig,
+) -> list[Diagnostic]:
+    """Validate `type: android_app` workloads and their options block.
+
+    Placement itself is checked by ``_check_workload_placement``, which is
+    type-agnostic; this covers only the Android-specific shape.
+    """
+    workload = lab.spec.workloads[workload_idx]
+    key = f"spec.workloads[{workload_idx}]"
+
+    if workload.type != "android_app":
+        if workload.android is not None:
+            return [
+                Diagnostic(
+                    id="config.workload.android_options_ignored",
+                    severity="warning",
+                    message=(
+                        f"workload {workload.name!r} is type "
+                        f"{workload.type!r} but declares an `android:` block, "
+                        "which only applies to type: android_app"
+                    ),
+                    source=source,
+                    key_path=f"{key}.android",
+                    suggestion="remove the android: block, or set type: android_app",
+                )
+            ]
+        return []
+
+    if workload.android is None:
+        return [
+            Diagnostic(
+                id="config.workload.android_options_missing",
+                severity="error",
+                message=(
+                    f"workload {workload.name!r} is type android_app but has "
+                    "no `android:` block; `package` is required"
+                ),
+                source=source,
+                key_path=f"{key}.android",
+                suggestion=(
+                    "add `android: {package: com.example.app}` — the package "
+                    "name drives install idempotency, launch, and verify"
+                ),
+            )
+        ]
+
+    # Warn (principle 10) when placement resolves only to VMs whose role
+    # chain lacks the redroid capability.
+    placement = workload.placement
+    candidates = [
+        vm for vm in lab.spec.vms
+        if (placement.target_vm == vm.name)
+        or (placement.target_role is not None
+            and placement.target_role in _role_ancestors(loaded, vm.role))
+        or (placement.target_tag is not None and placement.target_tag in vm.tags)
+        or (placement.auto is True)
+    ]
+    capable = [
+        vm for vm in candidates
+        if _capabilities_for_vm(loaded, vm).get("redroid")
+    ]
+    if candidates and not capable:
+        return [
+            Diagnostic(
+                id="config.workload.android_target_not_capable",
+                severity="warning",
+                message=(
+                    f"workload {workload.name!r} installs an APK but its "
+                    "placement matches no VM with the `redroid` capability"
+                ),
+                source=source,
+                key_path=f"{key}.placement",
+                suggestion=(
+                    "target a VM whose role is redroid-host (or extends it)"
+                ),
+            )
+        ]
+    return []
 
 
 def _check_budget(
