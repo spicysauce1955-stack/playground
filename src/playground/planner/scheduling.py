@@ -30,7 +30,8 @@ def schedule_workloads(
     - ``target_vm``: exact match
     - ``target_role``: first VM whose ``role`` matches (lab declaration order)
     - ``target_tag``: first VM whose ``tags`` include the tag
-    - ``auto``: first VM whose ``capabilities['docker']`` is truthy
+    - ``auto``: first VM with the capability the workload type needs
+      (``redroid`` for ``android_app``, ``docker`` for everything else)
 
     Workloads with no matching VM produce
     ``config.workload.no_target`` diagnostics and are skipped (not
@@ -85,9 +86,12 @@ def _pick_target_vm(
         return next(
             (vm for vm in vms if placement.target_tag in vm.tags), None
         )
-    # auto: any docker-capable VM
+    # `auto` means "any VM that can actually run this". Which capability
+    # that is depends on the workload type: an APK needs a Redroid device,
+    # everything else needs Docker.
+    capability = "redroid" if workload.type == "android_app" else "docker"
     return next(
-        (vm for vm in vms if vm.capabilities.get("docker")), None
+        (vm for vm in vms if vm.capabilities.get(capability)), None
     )
 
 
@@ -149,6 +153,69 @@ def stage_workload_files(
             if workload.type == "container":
                 continue
             src = (source_base / workload.source).resolve()
+
+            if src.suffix in (".aab", ".apks"):
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.workload.bundle_unsupported",
+                        severity="error",
+                        message=(
+                            f"workload {workload.name!r} declares source "
+                            f"{workload.source!r}, which is an Android App "
+                            "Bundle — Redroid installs APKs, not bundles"
+                        ),
+                        source=SourceLocation(path=str(src)),
+                        suggestion=(
+                            "convert the bundle to device-specific APKs "
+                            "with `bundletool build-apks` / `install-apks` "
+                            "(or ship the split APKs directly); see "
+                            "docs/research/android-emulation/"
+                            "app-install-launch.md"
+                        ),
+                    )
+                )
+                continue
+
+            if src.is_dir() and workload.type == "android_app":
+                apks = sorted(src.glob("*.apk"))
+                has_base = any(p.name == "base.apk" for p in apks)
+                if not apks or not has_base:
+                    diagnostics.append(
+                        Diagnostic(
+                            id="config.workload.split_apk_invalid",
+                            severity="error",
+                            message=(
+                                f"workload {workload.name!r} declares "
+                                f"source {workload.source!r} ({src}), a "
+                                "directory that must contain a base.apk "
+                                "plus any split APKs, but "
+                                + (
+                                    "no *.apk files were found"
+                                    if not apks
+                                    else "no base.apk was found"
+                                )
+                            ),
+                            source=SourceLocation(path=str(src)),
+                            suggestion=(
+                                "name the main APK base.apk and place "
+                                "config/language/density splits alongside it"
+                            ),
+                        )
+                    )
+                    continue
+                # Stage into a DIRECTORY (not a single file) so the return
+                # type stays dict[str, dict[str, Path]] — compose and swarm
+                # thread that shape through render_inventory unchanged. The
+                # workload_android_app role globs *.apk inside it.
+                dest_dir = (stage_dir / vm_name / workload.name).resolve()
+                if dest_dir.exists():
+                    shutil.rmtree(dest_dir)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                for apk in apks:
+                    shutil.copyfile(apk, dest_dir / apk.name)
+                staged[vm_name][workload.name] = dest_dir
+                continue
+
             if not src.is_file():
                 diagnostics.append(
                     Diagnostic(
