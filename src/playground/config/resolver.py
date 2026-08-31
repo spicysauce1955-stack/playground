@@ -126,6 +126,7 @@ def _resolve_workload(wl: Any) -> ResolvedWorkload:
             else None
         ),
         tags=list(wl.tags),
+        android=wl.android,
     )
 
 
