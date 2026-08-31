@@ -1,0 +1,24 @@
+# Managed by the playground redroid Ansible role.
+#
+# binderfs must NOT go in /etc/fstab. Systemd attempts fstab mounts at
+# local-fs.target, which is BEFORE systemd-modules-load.service has loaded
+# binder_linux, and /dev is a devtmpfs so the mountpoint does not exist yet.
+# The mount fails, the boot degrades to `maintenance`, and sshd never
+# starts -- the VM is unreachable until a hard power-cycle.
+#
+# This unit does the same job in the correct order instead.
+[Unit]
+Description=Load binder_linux and mount binderfs for Redroid
+After=systemd-modules-load.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# `-` so a kernel without the module fails the mount below with a clear
+# message rather than masking it as a unit-start failure.
+ExecStartPre=-/sbin/modprobe binder_linux
+ExecStart=/bin/sh -c 'mkdir -p /dev/binderfs && (mountpoint -q /dev/binderfs || mount -t binder binder /dev/binderfs)'
+
+[Install]
+WantedBy=multi-user.target

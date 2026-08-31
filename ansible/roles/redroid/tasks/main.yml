@@ -7,6 +7,19 @@
 # which cloud-init does not install. Redroid needs binder in
 # /proc/filesystems; it does NOT need nested virtualization.
 #
+# Two live-only failures shape this role (both hit on DigitalOcean,
+# 2026-08-31 -- see docs/architecture/CONTRACTS.md):
+#
+#   1. binderfs must NEVER be persisted in /etc/fstab. fstab mounts run
+#      before systemd-modules-load.service, and /dev is a devtmpfs whose
+#      contents are gone at boot, so the mount fails and the box boots
+#      into `maintenance` with no sshd. redroid-binderfs.service does the
+#      job in the correct order instead.
+#   2. `package_upgrade: true` in cloud-init stages a NEWER kernel than
+#      the one running at apply time. Installing modules-extra only for
+#      the running kernel means the next reboot boots a kernel with no
+#      binder. So we install it for every kernel present in /lib/modules.
+#
 # ashmem_linux was removed from staging in kernels >= 5.18 and Redroid
 # uses memfd instead, so its modprobe is best-effort forever.
 
@@ -18,15 +31,26 @@
   # VmRole opt-out path instead of a bare grep exit-1.
   failed_when: false
 
-- name: Install kernel modules-extra for the running kernel
+- name: Enumerate every installed kernel
+  ansible.builtin.command: find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
+  register: installed_kernels
+  changed_when: false
+
+- name: Install kernel modules-extra for every installed kernel
   ansible.builtin.apt:
-    name: "linux-modules-extra-{{ ansible_kernel }}"
+    name: "linux-modules-extra-{{ item }}"
     state: present
     update_cache: yes
     cache_valid_time: 3600
-  when:
-    - binder_check.rc != 0
-    - redroid_install_kernel_modules | bool
+  loop: "{{ installed_kernels.stdout_lines | sort }}"
+  loop_control:
+    label: "{{ item }}"
+  when: redroid_install_kernel_modules | bool
+  # A kernel with no modules-extra package in the archive must not abort
+  # the play; the binder re-probe below is the real gate for the RUNNING
+  # kernel, and a staged kernel is only best-effort.
+  failed_when: false
+  register: modules_extra
 
 - name: Load binder_linux with the three standard device nodes
   community.general.modprobe:
@@ -63,6 +87,36 @@
     group: root
     mode: "0644"
 
+# Undo the fstab entry earlier versions of this role wrote via
+# `ansible.posix.mount: state: mounted`. Leaving it in place boots the
+# host into `maintenance` with no sshd.
+- name: Remove any stale binderfs fstab entry (it breaks boot)
+  ansible.posix.mount:
+    path: /dev/binderfs
+    state: absent_from_fstab
+
+- name: Install the binderfs mount unit (correct boot ordering)
+  ansible.builtin.template:
+    src: redroid-binderfs.service.j2
+    dest: /etc/systemd/system/redroid-binderfs.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: binderfs_unit
+
+- name: Enable and start the binderfs mount unit
+  ansible.builtin.systemd:
+    name: redroid-binderfs.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Restart the binderfs unit when its definition changed
+  ansible.builtin.systemd:
+    name: redroid-binderfs.service
+    state: restarted
+  when: binderfs_unit.changed
+
 - name: Re-probe binder after remediation
   ansible.builtin.command: grep -qw binder /proc/filesystems
   register: binder_recheck
@@ -82,16 +136,20 @@
       binder in /proc/filesystems. Redroid requires binder; without it the
       rest of this role would create a non-functional container.
 
-      Already attempted: installing linux-modules-extra for this kernel
-      (redroid_install_kernel_modules =
+      Already attempted: installing linux-modules-extra for every kernel in
+      /lib/modules (redroid_install_kernel_modules =
       {{ redroid_install_kernel_modules | default(true) }}) and
       `modprobe binder_linux`.
 
+      Kernels present on this host: {{ installed_kernels.stdout_lines | join(', ') }}
+      Kernel actually running:      {{ ansible_kernel | default('<unknown>') }}
+
       To resolve:
-        - Confirm the package exists for THIS kernel:
+        - Confirm the package exists for the RUNNING kernel:
           `apt-cache policy linux-modules-extra-{{ ansible_kernel | default('$(uname -r)') }}`.
-          A kernel upgraded by cloud-init but not yet booted is the usual
-          cause — reboot the host and re-run, OR
+          Ubuntu cloud images ship `linux-image-virtual`, which carries no
+          modules-extra; if the archive has no matching version, the kernel
+          is newer than the package set, OR
         - Run on an Android-capable kernel (mainline >= 5.10 with
           CONFIG_ANDROID_BINDER_IPC built in or available as a module), OR
         - Remove `redroid` from this VM's VmRole. The conventional opt-out
@@ -103,19 +161,6 @@
       inventory group, so removing the provisioner drops this host from the
       play entirely on the next apply.
   when: binder_recheck.rc != 0
-
-- name: Create binderfs mountpoint
-  ansible.builtin.file:
-    path: /dev/binderfs
-    state: directory
-    mode: '0755'
-
-- name: Mount binderfs
-  ansible.posix.mount:
-    path: /dev/binderfs
-    src: binder
-    fstype: binder
-    state: mounted
 
 - name: Pull redroid image
   community.docker.docker_image:

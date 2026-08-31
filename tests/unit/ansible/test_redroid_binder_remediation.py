@@ -29,21 +29,28 @@ def test_opt_out_variable_defaults_to_true() -> None:
     assert defaults["redroid_install_kernel_modules"] is True
 
 
-def test_installs_modules_extra_for_the_running_kernel() -> None:
-    """The package must be pinned to ansible_kernel, not 'latest'."""
-    text = TASKS.read_text()
-    assert "linux-modules-extra-{{ ansible_kernel }}" in text
-
-
-def test_modules_extra_install_is_gated_on_the_opt_out_and_a_missing_binder() -> None:
+def test_installs_modules_extra_for_every_installed_kernel() -> None:
+    """LIVE BUG 2026-08-31: cloud-init's package_upgrade stages a NEWER
+    kernel than the one running at apply time. Installing modules-extra
+    only for the running kernel means the next reboot boots a kernel with
+    no binder at all."""
     install = [
         t for t in _tasks()
         if "linux-modules-extra" in str(t.get("ansible.builtin.apt", ""))
     ]
     assert len(install) == 1, "expected exactly one modules-extra install task"
-    when = str(install[0]["when"])
-    assert "redroid_install_kernel_modules" in when, "must honor the air-gap opt-out"
-    assert "binder_check" in when, "must only run when binder is actually missing"
+    task = install[0]
+    assert "loop" in task, "must loop over every installed kernel, not just ansible_kernel"
+    assert "installed_kernels" in str(task["loop"])
+    assert "redroid_install_kernel_modules" in str(task["when"]), (
+        "must honor the air-gap opt-out"
+    )
+
+
+def test_enumerates_installed_kernels_from_lib_modules() -> None:
+    text = TASKS.read_text()
+    assert "/lib/modules" in text
+    assert "installed_kernels" in text
 
 
 def test_module_load_is_persisted_across_reboot() -> None:
@@ -76,3 +83,45 @@ def test_ashmem_modprobe_stays_best_effort() -> None:
     assert "ashmem_linux" in text
     ashmem_tasks = [t for t in _tasks() if "ashmem" in str(t)]
     assert any(t.get("ignore_errors") is True for t in ashmem_tasks)
+
+
+def test_binderfs_is_never_persisted_in_fstab() -> None:
+    """LIVE BUG 2026-08-31, high severity: an fstab entry for /dev/binderfs
+    is attempted at local-fs.target, BEFORE systemd-modules-load has loaded
+    binder_linux, and /dev is a devtmpfs so the mountpoint does not exist.
+    The mount fails, the boot degrades to `maintenance`, and sshd never
+    starts -- the VM is unreachable until a hard power-cycle."""
+    mount_tasks = [t for t in _tasks() if "ansible.posix.mount" in t]
+    for task in mount_tasks:
+        state = task["ansible.posix.mount"].get("state")
+        assert state == "absent_from_fstab", (
+            "the only permitted ansible.posix.mount use is removing a stale "
+            f"fstab entry; got state={state!r}"
+        )
+
+
+def test_binderfs_mount_unit_is_ordered_after_module_load_and_before_docker() -> None:
+    unit = (
+        REPO_ROOT / "ansible" / "roles" / "redroid" / "templates"
+        / "redroid-binderfs.service.j2"
+    ).read_text()
+    assert "After=systemd-modules-load.service" in unit, (
+        "the mount must not race module loading"
+    )
+    assert "Before=docker.service" in unit, (
+        "binderfs must be mounted before the redroid container starts"
+    )
+    assert "RemainAfterExit=yes" in unit
+
+
+def test_mount_unit_is_enabled_so_it_survives_reboot() -> None:
+    systemd_tasks = [t for t in _tasks() if "ansible.builtin.systemd" in t]
+    # ruamel's safe loader is YAML 1.2, where `yes` is the STRING "yes";
+    # Ansible parses YAML 1.1, where it is boolean true. Accept both.
+    truthy = (True, "yes", "true")
+    enabled = [
+        t for t in systemd_tasks
+        if t["ansible.builtin.systemd"].get("enabled") in truthy
+        and "binderfs" in str(t["ansible.builtin.systemd"].get("name", ""))
+    ]
+    assert enabled, "the binderfs unit must be enabled, not just started"

@@ -520,21 +520,47 @@ instance kernel.
 
 Ubuntu builds binder as a MODULE (`CONFIG_ANDROID_BINDER_IPC=m`,
 `CONFIG_ANDROID_BINDERFS=m`) and ships it in
-`linux-modules-extra-$(uname -r)`, which cloud images do not install. The
-`redroid` Ansible role installs it for the running kernel, loads
-`binder_linux` with `devices=binder,hwbinder,vndbinder`, and persists both
-via `/etc/modules-load.d/` and `/etc/modprobe.d/`. Set
+`linux-modules-extra-<kernel>`, which cloud images do not install. The
+`redroid` Ansible role installs it for **every kernel in `/lib/modules`**,
+loads `binder_linux` with `devices=binder,hwbinder,vndbinder`, and mounts
+binderfs through a `redroid-binderfs.service` systemd unit. Set
 `redroid_install_kernel_modules: false` to opt out on air-gapped hosts.
 
-Verified live on DigitalOcean `ubuntu-24-04-x64`, kernel
-`6.8.0-124-generic`: Redroid 11 booted (`sys.boot_completed=1`) and served
-ADB.
+Verified live on DigitalOcean `ubuntu-24-04-x64` (2026-08-31): apply is
+idempotent (`changed=0` on re-run), Redroid 11 boots
+(`sys.boot_completed=1`), ADB works through `playground adb`, and the whole
+stack survives a graceful reboot.
 
-**The failure mode to expect** is kernel/package skew. The package must
-match the RUNNING kernel. DigitalOcean's cloud-init sets
-`package_upgrade: true`, so an upgrade can install a newer kernel whose
-modules only take effect after a reboot. The role aborts with both versions
-named rather than building a non-functional container.
+### Two live-only failures this role exists to avoid
+
+Both were invisible to static tests and to a first apply. They only
+appeared on the first reboot.
+
+**1. NEVER put binderfs in `/etc/fstab`.** This is an availability bug, not
+a cosmetic one. `ansible.posix.mount: state: mounted` writes
+`binder /dev/binderfs binder defaults 0 0`. Systemd attempts fstab mounts at
+`local-fs.target` — *before* `systemd-modules-load.service` has loaded
+`binder_linux` — and `/dev` is a devtmpfs, so the mountpoint does not exist
+yet either. The mount fails, the boot degrades to `maintenance`, and **sshd
+never starts**: the VM is unreachable until a hard power-cycle
+(`doctl compute droplet-action power-cycle`). `redroid-binderfs.service`
+does the same work ordered `After=systemd-modules-load.service` and
+`Before=docker.service`. The role also runs
+`ansible.posix.mount: state: absent_from_fstab` to clean up hosts that
+already carry the bad entry. A unit test
+(`test_binderfs_is_never_persisted_in_fstab`) fails if anyone reintroduces
+it.
+
+**2. Kernel/package skew is real, not theoretical.** DigitalOcean's
+cloud-init sets `package_upgrade: true`, which stages a NEWER kernel than
+the one running at apply time. Observed: applied on `6.8.0-124-generic`,
+rebooted into `6.8.0-138-generic`, and
+`modprobe: FATAL: Module binder_linux not found in /lib/modules/6.8.0-138-generic`.
+Ubuntu cloud images ship `linux-image-virtual`, which deliberately carries
+no modules-extra. Installing for the running kernel alone is therefore not
+enough — the role loops over every directory in `/lib/modules`. Per-kernel
+installs are best-effort (`failed_when: false`); the binder re-probe is the
+real gate for the running kernel.
 
 **ADB has no authentication.** Never open 5555 to a network. The
 `cloud-digitalocean` firewall (`tofu/cloud_digitalocean/main.tf`) opens port

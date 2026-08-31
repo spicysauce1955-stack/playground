@@ -198,3 +198,67 @@ break rather than only adding a backend. This is a hypothesis from the DO
 probe, not a verified claim; verify it on a libvirt guest early, because a
 confirmed answer changes how the change is described and may warrant its own
 note in `docs/roadmap.md`.
+
+## Live validation, 2026-08-31
+
+Run against DigitalOcean `s-4vcpu-8gb` / `ubuntu-24-04-x64` in nyc3, Droplet
+`redroid-cloud-droid1`, destroyed afterwards.
+
+| Step | Result |
+|---|---|
+| `playground validate` / `plan` | 0 errors, 0 warnings from `redroid-cloud`; cost estimate ~$0.0714/hr |
+| `playground apply redroid-cloud` | exit 0; every pipeline step green (cloud-preflight, tofu-init, tofu-apply, wait-for-vms-ready, ansible-playbook, verify-lab) |
+| redroid role, first apply | probe found binder missing -> installed modules-extra -> loaded `binder_linux` -> re-probe passed -> abort tasks skipped. `ashmem_linux` failed and was ignored, correct on kernel 6.8 |
+| Android boot via `playground adb` | `sys.boot_completed=1`, `ro.product.model=redroid11_x86_64`, 142 packages |
+| Port 5555 from the public internet | filtered (port 22 open) — the tunnel-only decision holds |
+| Second apply (idempotency, principle 7) | `changed=0` |
+| **Graceful reboot (first attempt)** | **FAILED — see below** |
+| Graceful reboot after fix | ssh back in 40s, `is-system-running=running`, 0 failed units, binder present, binderfs mounted, container up, `sys.boot_completed=1` in ~5s |
+
+### Two bugs found, both reboot-only
+
+Neither appeared in static tests, in the first apply, or in the idempotency
+re-run. Both are now covered by regression tests in
+`tests/unit/ansible/test_redroid_binder_remediation.py`.
+
+**Bug 1 — binderfs in `/etc/fstab` bricks the boot (high severity).**
+`ansible.posix.mount: state: mounted` wrote
+`binder /dev/binderfs binder defaults 0 0`. Systemd attempts fstab mounts at
+`local-fs.target`, before `systemd-modules-load.service` loads
+`binder_linux`, and `/dev` is a devtmpfs so the mountpoint is gone at boot.
+The mount failed, the boot degraded to `maintenance`, and sshd never
+started — the Droplet was unreachable until a hard power-cycle. Removing
+that single line restored a clean `running` boot, which isolated it from
+Bug 2.
+
+This line predated this work; the change to the role is what made it
+reachable, because previously the role aborted at the binder assertion
+before ever mounting.
+
+*Fix:* a `redroid-binderfs.service` unit ordered
+`After=systemd-modules-load.service` / `Before=docker.service` performs
+modprobe -> mkdir -> mount, and is enabled so it runs every boot. The role
+now uses `ansible.posix.mount` only as `state: absent_from_fstab`, to clean
+up hosts already carrying the bad entry.
+
+**Bug 2 — kernel/package skew, the risk this spec predicted.** Applied on
+`6.8.0-124-generic`; cloud-init's `package_upgrade: true` had staged
+`6.8.0-138-generic`, which the reboot booted into:
+`modprobe: FATAL: Module binder_linux not found in /lib/modules/6.8.0-138-generic`.
+Ubuntu cloud images ship `linux-image-virtual`, which carries no
+modules-extra for any kernel.
+
+*Fix:* install `linux-modules-extra-<kernel>` for every directory in
+`/lib/modules` rather than for `ansible_kernel` alone. Per-kernel installs
+are best-effort; the binder re-probe remains the gate for the running
+kernel. Confirmed live: the loop reported `ok` for `6.8.0-124-generic` and
+`changed` for `6.8.0-138-generic`.
+
+### Correction to this spec's earlier text
+
+The design section originally described persistence as
+"`/etc/modules-load.d/` and `/etc/modprobe.d/`". Those files are still
+written, but they are not sufficient on their own — `modules-load.d` cannot
+run early enough to satisfy an fstab mount, and it silently no-ops when the
+booted kernel has no matching module. The systemd unit is what actually
+makes the stack reboot-safe.
