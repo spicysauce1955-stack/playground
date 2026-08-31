@@ -1,0 +1,56 @@
+# redroid-cloud — containerized Android on a DigitalOcean Droplet
+#
+# Requires:  export DIGITALOCEAN_TOKEN=<your-token>   before apply.
+#
+# Redroid needs `binder` in the Droplet's own kernel — NOT nested
+# virtualization; there is no nesting on a cloud VM. Ubuntu images build
+# binder as a module in linux-modules-extra, which the `redroid` Ansible
+# role installs and persists.
+#
+# ADB has no authentication, so the DigitalOcean firewall opens port 22
+# only. Reach the device through an SSH tunnel:
+#
+#     playground apply redroid-cloud
+#     playground adb --lab redroid-cloud --on droid1
+#     adb connect 127.0.0.1:5555
+#
+# This Droplet size bills at roughly $0.07/hr. Run
+# `playground destroy redroid-cloud` when you are done.
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: redroid-cloud
+  description: |
+    Single-VM DigitalOcean lab running Redroid (containerized Android 11)
+    reachable over ADB through an SSH tunnel.
+  tags: [cloud, digitalocean, redroid, android]
+
+spec:
+  backend: cloud-digitalocean
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 8
+    max_memory_mb: 16384
+    max_disk_gb: 120
+    max_vms: 2
+    max_containers: 10
+
+  networks:
+    - name: lab-net
+      profile: nat
+      cidr: 10.70.0.0/24
+
+  vms:
+    - name: droid1
+      role: redroid-host
+      networks: [lab-net]
+
+  providers:
+    cloud-digitalocean:
+      region: nyc3
+      # The redroid-host role asks for 4 vCPU / 8 GB / 60 GB. DigitalOcean
+      # applies ONE size slug to every Droplet in the lab, so this slug —
+      # not the role's resources block — is what actually provisions.
+      size: s-4vcpu-8gb

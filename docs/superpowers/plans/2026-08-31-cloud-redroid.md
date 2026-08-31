@@ -901,8 +901,10 @@ Expected: all pass, INCLUDING `test_validate_committed_config_succeeds`, which a
 
 **If that CLI test now fails on the warning count, your new lab emitted a warning.** Diagnose with:
 ```bash
-uv run playground validate --config-dir config --lab redroid-cloud
+uv run playground validate --config-dir config
 ```
+(NOTE: `validate` has no `--lab` flag. To scope to one lab, call the API:
+`validate(loaded, Path('ansible/roles'), lab='redroid-cloud')`.)
 Fix the lab (most likely the budget is too tight — raise it), not the assertion. The lab is expected to validate with ZERO diagnostics.
 
 - [ ] **Step 5: Confirm the baseline failure set is unchanged, then commit**
@@ -1426,7 +1428,7 @@ Save this output. There is an unrelated `lab-scheduler-scheduler` Droplet that m
 - [ ] **Step 2: Validate and plan without spending anything**
 
 ```bash
-uv run playground validate --config-dir config --lab redroid-cloud
+uv run playground validate --config-dir config
 uv run playground plan redroid-cloud
 ```
 Expected: zero errors, zero warnings from `redroid-cloud`.
