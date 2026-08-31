@@ -20,8 +20,38 @@ under "Deferred But Designed For". This is that layer.
 permissions, screenshots, logcat, key/text/tap input, file push/pull, and a
 raw `adb shell` escape hatch.
 
-**Out:** uiautomator / Appium-style element finding and scripted UI flows.
-That is a separate project, not a section of this one.
+**Out:**
+
+- uiautomator / Appium-style element *finding* and scripted UI flows, and
+  Maestro. A separate project. Note the cheap half of that layer IS in
+  scope: `uiautomator dump` is a plain adb command, and a UI hierarchy dump
+  gives element inspection without adopting any framework.
+- Network proxying, TLS interception, and packet capture — including
+  `adb forward` / `adb reverse`. These get their own spec; see
+  `docs/research/android-emulation/network-proxy-tunneling.md` and the
+  packet-capture line in `docs/product/mvp_scope.md`.
+- `.aab` / `.apks` bundle installation via `bundletool`. The artifact schema
+  is designed so this can be added without breaking lab YAML (see
+  "Artifacts" below), but bundletool is a Java dependency and its split
+  selection is device-spec-aware, which is real work.
+
+## Research alignment
+
+`docs/research/android-emulation/` surveys this problem space. This design
+follows its recommended stack: Redroid as runtime, ADB as the lifecycle
+API, direct adb subprocess calls first with `adbutils` as the named escape
+hatch if that code grows, and SSH-forwarded ADB rather than exposed 5555.
+
+Where it corrected an earlier draft of this spec:
+
+- `app-install-launch.md` — split APKs need `adb install-multiple` or a
+  `pm install-create` session; a single-file `source:` cannot express them.
+- `app-install-launch.md` — launch is richer than `monkey`:
+  `cmd package resolve-activity --brief` discovers the launcher activity,
+  `am start -n` targets a specific one, `am start -a VIEW -d <url>` fires a
+  deep link.
+- `recommended-stack.md` Phase 1 — `pm clear` belongs in the baseline verb
+  set; resetting app state is what makes a flow re-runnable.
 
 ## Decisions
 
@@ -34,14 +64,19 @@ That is a separate project, not a section of this one.
 2. **Two layers, one foundation.** A declarative `android_app` workload for
    reproducible labs (principle 2), and a `playground app` verb group for
    interactive work. Both drive the same on-VM adb.
-3. **APKs are local files only.** `source: ./apks/foo.apk`, staged and
-   pushed exactly as compose files already are. No new `ArtifactSources`
-   category, no fetch step, no checksum handling — air-gap-safe by
-   construction. A URL/cache category can be added later if a real need
-   appears; nothing here forecloses it.
-4. **Fan-out from the start.** `--on VM` / `--role ROLE` / `--all`, because
+3. **APKs are local files only**, staged and pushed exactly as compose
+   files already are. No new `ArtifactSources` category, no fetch step, no
+   checksum handling — air-gap-safe by construction. A URL/cache category
+   can be added later; nothing here forecloses it.
+   `app-install-launch.md` warns against committing binary APKs into the
+   repo: a lab references a path, which need not live inside the repo, and
+   `.gitignore` should keep stray `*.apk` out.
+4. **The artifact schema is split-APK-shaped from day one**, even though
+   only single and split installs are implemented. Widening `source` later
+   would break every lab YAML already written.
+5. **Fan-out from the start.** `--on VM` / `--role ROLE` / `--all`, because
    the existing labs are fleet-shaped.
-5. **Idempotency is a design constraint, not a nice-to-have** (principle 7).
+6. **Idempotency is a design constraint, not a nice-to-have** (principle 7).
    See "Idempotency" below — it is the subtlest part of this design.
 
 ## Design
@@ -78,9 +113,15 @@ go in an optional sub-model rather than widening the shared schema:
 class AndroidAppOptions(StrictModel):
     package: str            # required; drives idempotency and verify
     launch: bool = False    # "ensure running", not "start every apply"
+    activity: str | None = None   # `am start -n pkg/activity`; else monkey
     permissions: list[str] = Field(default_factory=list)
-    reinstall: bool = False # force `adb install -r` even when present
+    reinstall: bool = False # force reinstall even when present
 ```
+
+`activity` is optional because the launcher activity is discoverable at
+runtime: `cmd package resolve-activity --brief <pkg>`. When it is unset the
+role launches via `monkey -p <pkg> -c android.intent.category.LAUNCHER 1`,
+which needs no activity name.
 
 `LabWorkload` and `ResolvedWorkload` both gain
 `android: AndroidAppOptions | None = None`.
@@ -91,14 +132,42 @@ Lab syntax:
 workloads:
   - name: my-app
     type: android_app
-    source: ./apks/my-app.apk
+    source: ./apks/my-app.apk          # single APK
     placement:
       target_role: redroid-host
     android:
       package: com.example.app
       launch: true
       permissions: [android.permission.CAMERA]
+
+  - name: split-app
+    type: android_app
+    source: ./apks/split-app/          # a DIRECTORY of split APKs
+    placement:
+      target_role: redroid-host
+    android:
+      package: com.example.split
 ```
+
+### Artifacts: single, split, and (later) bundles
+
+`source` resolves to one of three shapes, decided by inspecting the path —
+not by a separate `kind:` field the operator has to keep in sync:
+
+| `source` | Install path | Status |
+|---|---|---|
+| a single `*.apk` file | `adb install -r` | implemented |
+| a directory containing `*.apk` files | `adb install-multiple -r <all>` | implemented |
+| `*.aab` / `*.apks` | `bundletool build-apks` / `install-apks` | **not implemented** — rejected with a diagnostic naming bundletool |
+
+A split directory must contain exactly one `base.apk` alongside its
+`split_config.*.apk` siblings; the validator checks this statically so a
+malformed split set fails at `validate` rather than mid-apply.
+
+`pm install-create` / `install-write` / `install-commit` session installs
+are the documented fallback when `install-multiple` is insufficient. Keep
+that path in docs and a helper, not inlined as string concatenation in
+business logic — the research is explicit about this.
 
 **Validator additions:**
 
@@ -145,16 +214,29 @@ existing `lab` / `inventory` / `tofu` / `runs` groups.
 
 | Subcommand | Behavior |
 |---|---|
-| `install APK [APK...]` | copy to VM, `adb install -r` |
+| `install PATH` | single APK, or a directory of splits via `install-multiple` |
 | `uninstall PACKAGE` | `adb uninstall` |
-| `launch PACKAGE` | `monkey -p PKG -c android.intent.category.LAUNCHER 1` |
+| `launch PACKAGE [--activity A] [--url U]` | `am start -n` / `am start -a VIEW -d` / `monkey` |
 | `stop PACKAGE` | `am force-stop` |
-| `list [--pattern P]` | `pm list packages` |
+| `clear PACKAGE` | `pm clear` — reset app data so a flow re-runs from a known state |
+| `list [--pattern P] [--third-party]` | `pm list packages` |
 | `screenshot [--out DIR]` | `screencap -p`, pulled to the controller |
+| `ui-dump [--out FILE]` | `uiautomator dump`, pulled to the controller |
 | `logcat [--follow] [--lines N]` | `logcat -d` or streaming |
 | `input text\|tap\|key ARGS` | `input <subcommand>` |
 | `push SRC DEST` / `pull SRC DEST` | `adb push` / `adb pull` |
 | `shell -- CMD` | raw `adb shell`, escape hatch |
+
+`launch` resolves its three forms in order: `--url` fires a deep link
+(`am start -a android.intent.action.VIEW -d <url>`); `--activity` targets a
+component (`am start -n <pkg>/<activity>`); neither falls back to `monkey`.
+The two flags are mutually exclusive.
+
+`ui-dump` is the one piece of the UI-automation layer that is in scope. It
+is a plain adb command that returns the view hierarchy as XML, so it costs
+nothing and answers "what is on screen right now" without Appium or
+Maestro. It is explicitly NOT element finding, gesture synthesis, or flow
+scripting.
 
 **Targeting**, shared by every subcommand: `--lab`, plus exactly one of
 `--on VM`, `--role ROLE`, `--all`. `--all` selects every VM whose resolved
@@ -274,10 +356,32 @@ clearly on timeout rather than emitting a raw adb error.
 not be lost in interleaved output. Per-device prefixes plus an explicit
 end-of-run summary of failures.
 
+**Split installs are device-aware in ways a static schema cannot see.** A
+split set built for one ABI or density may not match the Redroid image
+(`redroid11_x86_64`). `install-multiple` will fail at runtime with a
+package-manager error. Surface that error verbatim with the package and the
+split filenames named, rather than a generic "install failed" — the useful
+detail is always in the `pm` output.
+
+**Mutable Android image tag (pre-existing, adjacent).**
+`ansible/roles/redroid/defaults/main.yml` pins
+`redroid/redroid:11.0.0-latest`. `latest` is mutable, so two applies weeks
+apart can produce different Android builds, which undermines any
+reproducible app-testing claim. `recommended-stack.md` calls for a
+validation warning on mutable runtime image tags. Out of scope for this
+spec, but it should be fixed: a warning rather than a forced pin, so the
+operator chooses the digest.
+
 ## Open questions for implementation
 
 1. Is `adb` installable from `universe` on the DO Noble image without
    extra repositories? Determines whether the foundation task is one apt
    line or something larger.
 2. Which on-device package is the safest round-trip fixture? Decide by
-   inspection on a live device, not by guessing.
+   inspection on a live device (`pm list packages -3`, then `pm path`), not
+   by guessing.
+3. Does `install-multiple` need a split fixture that the round-trip trick
+   cannot produce? A device-resident app may be a single APK. If no split
+   app exists on the Redroid image, split install can only be unit-tested
+   against a synthesized directory, with the live path left unverified —
+   say so plainly rather than claiming coverage.
