@@ -323,6 +323,10 @@ def test_workload_payload_includes_staged_source_when_provided() -> None:
         ports: list[str] = []
         volumes: list[str] = []
         environment: dict[str, str] = {}
+        # ResolvedWorkload always has this (defaulting to None); the stub
+        # must too, or the payload builder needs a getattr() that would
+        # hide a genuine missing-attribute bug on the real model.
+        android = None
 
     payload = workload_to_ansible_payload(_Wl(), staged_source=Path("/abs/x.yaml"))
     assert payload["staged_source"] == "/abs/x.yaml"

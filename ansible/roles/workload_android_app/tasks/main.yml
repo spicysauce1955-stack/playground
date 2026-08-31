@@ -1,0 +1,186 @@
+---
+# Deploy `type: android_app` workloads scheduled on this host. The APK (or
+# split-APK directory) lives on the controller at `item.staged_source`
+# (see stage_workload_files in src/playground/planner/scheduling.py); we
+# copy it to `pg_apk_root/<workload>/` on the target, wait for Android to
+# finish booting, then install with adb and optionally launch it.
+#
+# Idempotent by construction: install is skipped once `pm list packages`
+# already shows the package (unless `reinstall` is set), and launch is
+# ensure-running — it checks `pidof` before starting anything. A second
+# `playground apply` against a converged host must report `changed=0`.
+
+- name: Parse pg_workloads JSON payload
+  ansible.builtin.set_fact:
+    # The rendered inventory may hand this over as a JSON STRING, or — when
+    # Ansible auto-parses the single-quoted `.ini` value — as an already
+    # decoded LIST. `from_json` only accepts a string, so guard it (BUG-6):
+    # parse a string, pass a list through unchanged.
+    pg_workloads_parsed: >-
+      {{ pg_workloads if (pg_workloads is not string)
+         else (pg_workloads | from_json) }}
+  when: pg_workloads is defined
+
+- name: Compute android_app workloads only
+  ansible.builtin.set_fact:
+    pg_android_workloads: >-
+      {{
+        (pg_workloads_parsed | default([]))
+          | selectattr('type', 'equalto', 'android_app')
+          | list
+      }}
+
+- name: Skip when no android_app workloads scheduled
+  ansible.builtin.meta: end_host
+  when: pg_android_workloads | length == 0
+
+- name: Ensure per-workload APK directories exist
+  ansible.builtin.file:
+    path: "{{ pg_apk_root }}/{{ item.name }}"
+    state: directory
+    mode: '0755'
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Stage a single staged APK file on the target
+  ansible.builtin.copy:
+    src: "{{ item.staged_source }}"
+    dest: "{{ pg_apk_root }}/{{ item.name }}/"
+    mode: '0644'
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.staged_source is defined and item.staged_source.endswith('.apk')
+
+- name: Stage a staged split-APK directory on the target
+  ansible.builtin.copy:
+    # A trailing '/' on src tells `copy` to copy the DIRECTORY'S CONTENTS
+    # (the base.apk plus splits) rather than the directory itself, so the
+    # *.apk glob used by install-multiple below finds them directly under
+    # pg_apk_root/<workload>/.
+    src: "{{ item.staged_source }}/"
+    dest: "{{ pg_apk_root }}/{{ item.name }}/"
+    mode: '0644'
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.staged_source is defined and not item.staged_source.endswith('.apk')
+
+- name: Wait for Android to report boot completed
+  ansible.builtin.shell: |
+    set -e
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true
+    adb -s 127.0.0.1:5555 wait-for-device >/dev/null 2>&1
+    for i in $(seq 1 {{ pg_android_boot_timeout }}); do
+      status="$(adb -s 127.0.0.1:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+      if [ "$status" = "1" ]; then
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "Android did not report boot_completed within {{ pg_android_boot_timeout }}s" >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  register: pg_android_booted
+  changed_when: false
+
+- name: Query installed packages on the guest
+  ansible.builtin.shell: |
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true
+    adb -s 127.0.0.1:5555 shell pm list packages
+  args:
+    executable: /bin/bash
+  register: pg_installed
+  changed_when: false
+
+- name: Install a single APK
+  ansible.builtin.shell: >-
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
+    adb -s 127.0.0.1:5555 install -r
+    {{ pg_apk_root }}/{{ item.name }}/{{ item.staged_source | basename }}
+  args:
+    executable: /bin/bash
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.staged_source is defined and item.staged_source.endswith('.apk')
+    and (("package:" ~ item.android.package) not in pg_installed.stdout.split()
+         or item.android.reinstall | default(false))
+
+- name: Install split APKs
+  ansible.builtin.shell: >-
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
+    adb -s 127.0.0.1:5555 install-multiple -r
+    {{ pg_apk_root }}/{{ item.name }}/*.apk
+  args:
+    executable: /bin/bash
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.staged_source is defined and not item.staged_source.endswith('.apk')
+    and (("package:" ~ item.android.package) not in pg_installed.stdout.split()
+         or item.android.reinstall | default(false))
+
+- name: Grant declared permissions
+  ansible.builtin.shell: >-
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
+    adb -s 127.0.0.1:5555 shell pm grant {{ item.0.android.package }} {{ item.1 }}
+  args:
+    executable: /bin/bash
+  loop: "{{ pg_android_workloads | subelements('android.permissions', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }}:{{ item.1 }}"
+  # pm grant is idempotent on an already-granted permission and gives no
+  # machine-readable signal of a state change, so this never reports
+  # changed — the alternative is reporting changed on every apply.
+  changed_when: false
+
+- name: Check whether the app is already running
+  ansible.builtin.shell: >-
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
+    adb -s 127.0.0.1:5555 shell pidof {{ item.android.package }}
+  args:
+    executable: /bin/bash
+  loop: "{{ pg_android_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.android.launch | default(false)
+  register: pg_pidof
+  changed_when: false
+  failed_when: false
+
+- name: Launch the app via its declared activity
+  ansible.builtin.shell: >-
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
+    adb -s 127.0.0.1:5555 shell am start -n
+    {{ item.item.android.package }}/{{ item.item.android.activity }}
+  args:
+    executable: /bin/bash
+  loop: "{{ pg_pidof.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: >-
+    item.item.android.launch | default(false)
+    and item.rc is defined and item.rc != 0
+    and item.item.android.activity
+
+- name: Launch the app via monkey (no declared activity)
+  ansible.builtin.shell: >-
+    adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
+    adb -s 127.0.0.1:5555 shell monkey -p {{ item.item.android.package }}
+    -c android.intent.category.LAUNCHER 1
+  args:
+    executable: /bin/bash
+  loop: "{{ pg_pidof.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: >-
+    item.item.android.launch | default(false)
+    and item.rc is defined and item.rc != 0
+    and not item.item.android.activity

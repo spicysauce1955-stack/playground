@@ -124,6 +124,11 @@ def workload_to_ansible_payload(
     }
     if staged_source is not None:
         payload["staged_source"] = str(staged_source)
+    # getattr (not a direct attribute access): some callers/tests pass a
+    # minimal duck-typed workload without an `android` field, and every
+    # real ResolvedWorkload already defaults it to None.
+    if workload.android is not None:
+        payload["android"] = workload.android.model_dump()
     return payload
 
 
