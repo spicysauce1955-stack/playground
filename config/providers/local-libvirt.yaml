@@ -28,3 +28,6 @@ spec:
   capabilities:
     nested_virtualization: true
     privileged_containers: true
+    # cpu mode host-passthrough in tofu/main.tf lets the guest kernel
+    # provide binder.
+    redroid: true

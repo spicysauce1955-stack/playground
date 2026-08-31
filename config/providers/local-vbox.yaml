@@ -31,3 +31,7 @@ spec:
     # expected to work here. Generic VM + Docker labs do.
     nested_virtualization: false
     privileged_containers: true
+    # VirtualBox does not pass through the CPU features the guest kernel
+    # needs for binderfs — see docs/architecture/CONTRACTS.md, "vbox: no
+    # nested virt -> Redroid won't work there".
+    redroid: false
