@@ -1,2 +1,9 @@
 ---
 redroid_image: redroid/redroid:11.0.0-latest
+
+# Ubuntu cloud images build binder as a module and ship it in
+# linux-modules-extra-<kernel>, which is not installed by default. Set
+# this to false for air-gapped hosts whose kernel already provides binder
+# (or whose packages come from a local mirror) — the role then probes and
+# aborts rather than reaching for apt.
+redroid_install_kernel_modules: true
