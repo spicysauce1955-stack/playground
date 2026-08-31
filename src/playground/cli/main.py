@@ -31,6 +31,7 @@ from playground.backend.local_libvirt import (
     render_tfvars,
     tail_log,
 )
+from playground.cli.app_commands import app_app
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
 from playground.events import EventBus
@@ -64,6 +65,7 @@ app.add_typer(lab_app, name="lab")
 app.add_typer(inventory_app, name="inventory")
 app.add_typer(tofu_app, name="tofu")
 app.add_typer(runs_app, name="runs")
+app.add_typer(app_app, name="app")
 
 
 @app.command("validate")
