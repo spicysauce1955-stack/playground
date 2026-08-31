@@ -232,8 +232,11 @@ def check_kvm_nested_enabled() -> list[Diagnostic]:
     Reads ``/sys/module/kvm_intel/parameters/nested`` (and the AMD
     counterpart). When neither vendor module is loaded the host either
     has no KVM at all (bare metal without virt extensions) or runs
-    KVM-as-the-only-vendor with nested off — both relevant to the
-    redroid-host lab, whose containers need nested-virt features.
+    KVM-as-the-only-vendor with nested off — both relevant to any lab
+    whose guests run nested hypervisors or virt-accelerated workloads.
+    (Redroid is NOT such a case: it is a container needing `binder` in
+    the guest kernel, which the redroid Ansible role installs. Do not
+    cite it as the reason for this check.)
 
     Warning-only: this never blocks apply outright, because the user
     may have legitimately chosen ``cpu_mode: host-model`` or
@@ -258,8 +261,8 @@ def check_kvm_nested_enabled() -> list[Diagnostic]:
             message=(
                 "KVM nested virtualization is disabled — kvm_intel "
                 f"({statuses['kvm_intel']}), kvm_amd ({statuses['kvm_amd']}). "
-                "Labs that require nested-virt features (e.g. redroid-host) "
-                "will fail to start their guest workloads."
+                "Labs whose guests run nested hypervisors or virt-accelerated "
+                "workloads will fail to start them."
             ),
             source=_host_source(),
             suggestion=(

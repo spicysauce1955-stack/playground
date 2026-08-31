@@ -59,6 +59,13 @@ The operator can define a generic infra lab in YAML, validate it, see a plan, ap
 ### Deferred But Designed For
 
 - Redroid/Android device lifecycle.
+
+  > Update (2026-08-31): Redroid now runs on `cloud-digitalocean` as well as
+  > `local-libvirt` — see `config/labs/redroid-cloud.yaml` and
+  > `docs/superpowers/specs/2026-08-31-cloud-redroid-design.md`. The
+  > *device lifecycle* items above (ADB automation, APK installation)
+  > remain deferred; what landed is host provisioning plus a tunnelled ADB
+  > endpoint.
 - ADB automation.
 - APK installation.
 - Packet capture and `.pcap` artifacts.

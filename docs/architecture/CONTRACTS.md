@@ -506,6 +506,41 @@ image default DHCP all NICs) and only emits it when there's an intnet
 NIC needing a static IP. NICs are matched by MAC (no `set-name`) to
 avoid depending on guest interface enumeration.
 
+### Redroid needs binder, not nested virtualization
+
+The recurring misstatement in this repo was that Redroid requires nested
+virt. It does not. Redroid is a container: it needs `binder` in
+`/proc/filesystems` on the kernel it runs on, plus a mounted binderfs.
+
+Nested virt matters on `local-libvirt` only, and only indirectly — Redroid
+runs inside a libvirt *guest*, so that guest's kernel must expose binder,
+which is what `cpu { mode = "host-passthrough" }` in `tofu/main.tf` buys.
+On a cloud VM there is no nesting at all: Redroid runs directly on the
+instance kernel.
+
+Ubuntu builds binder as a MODULE (`CONFIG_ANDROID_BINDER_IPC=m`,
+`CONFIG_ANDROID_BINDERFS=m`) and ships it in
+`linux-modules-extra-$(uname -r)`, which cloud images do not install. The
+`redroid` Ansible role installs it for the running kernel, loads
+`binder_linux` with `devices=binder,hwbinder,vndbinder`, and persists both
+via `/etc/modules-load.d/` and `/etc/modprobe.d/`. Set
+`redroid_install_kernel_modules: false` to opt out on air-gapped hosts.
+
+Verified live on DigitalOcean `ubuntu-24-04-x64`, kernel
+`6.8.0-124-generic`: Redroid 11 booted (`sys.boot_completed=1`) and served
+ADB.
+
+**The failure mode to expect** is kernel/package skew. The package must
+match the RUNNING kernel. DigitalOcean's cloud-init sets
+`package_upgrade: true`, so an upgrade can install a newer kernel whose
+modules only take effect after a reboot. The role aborts with both versions
+named rather than building a non-functional container.
+
+**ADB has no authentication.** Never open 5555 to a network. The
+`cloud-digitalocean` firewall (`tofu/cloud_digitalocean/main.tf`) opens port
+22 only; reach the device with `playground adb --lab <lab> --on <vm>`,
+which forwards a local port over SSH.
+
 ### vbox: no nested virt → Redroid won't work there
 
 The libvirt path uses `cpu { mode = "host-passthrough" }` so guests get
