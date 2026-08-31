@@ -47,6 +47,7 @@ from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedCommand, ResolvedLab, ResolvedVm
 from playground.runs.operation import StepResult
+from playground.ssh.argv import build_ssh_argv
 
 DEFAULT_PER_CHECK_TIMEOUT_SECONDS = 30.0
 """Per-VM, per-check SSH timeout. Each sub-check is a single
@@ -342,17 +343,13 @@ def _ssh(
     Matches the SSH option set used by wait-for-vms-ready so first-
     boot host-key prompts never block the run.
     """
-    cmd = [
-        "ssh",
-        *(["-p", str(target.ssh_port)] if target.ssh_port != 22 else []),
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        f"{target.ssh_user}@{target.ip}",
-        command,
-    ]
+    cmd = build_ssh_argv(
+        target.ip,
+        user=target.ssh_user,
+        port=target.ssh_port,
+        command=command,
+        batch=True,
+    )
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=timeout,

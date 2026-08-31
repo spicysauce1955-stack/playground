@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import stat
 from pathlib import Path
 
 import pytest
+from conftest import _write_apply_shims, _write_scp_shim, _write_ssh_shim
 from typer.testing import CliRunner
 
 from playground.cli.main import app
@@ -84,46 +84,6 @@ def _write_fake_tofu(tmp_path: Path, payload: str) -> Path:
     tofu = bin_dir / "tofu"
     tofu.write_text(f"#!/usr/bin/env bash\ncat <<'EOF'\n{payload}\nEOF\n")
     tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return bin_dir
-
-
-def _write_apply_shims(
-    tmp_path: Path,
-    *,
-    tofu_apply_exit: int = 0,
-    tofu_destroy_exit: int = 0,
-    ansible_exit: int = 0,
-    vm_ips_payload: str | None = None,
-) -> Path:
-    """Write tofu + ansible-playbook shims handling apply/destroy/output.
-
-    Each `tofu <verb>` returns the corresponding exit code; `tofu output
-    -json` returns ``vm_ips_payload``. ansible-playbook exits with
-    ``ansible_exit``.
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    default_ips = (
-        '{"vm_ips": {"sensitive": false, "type": ["map","string"], '
-        '"value": {"node1":"10.0.10.42","docker1":"10.0.10.43","router1":"10.0.10.44"}}}'
-    )
-    payload = vm_ips_payload if vm_ips_payload is not None else default_ips
-    tofu = bin_dir / "tofu"
-    tofu.write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f"  apply) echo 'tofu apply ok'; exit {tofu_apply_exit} ;;\n"
-        f"  destroy) echo 'tofu destroy ok'; exit {tofu_destroy_exit} ;;\n"
-        f"  output) cat <<'PAYLOAD'\n{payload}\nPAYLOAD\n   ;;\n"
-        "  *) exit 0 ;;\n"
-        "esac\n"
-    )
-    tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    ansible = bin_dir / "ansible-playbook"
-    ansible.write_text(
-        f"#!/usr/bin/env bash\necho ansible ran\nexit {ansible_exit}\n"
-    )
-    ansible.chmod(ansible.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return bin_dir
 
 
@@ -1212,24 +1172,6 @@ def test_runs_show_reports_recorded_run(
     assert "logs" in payload["logs_dir"]
 
 
-def _write_ssh_shim(
-    tmp_path: Path, *, exit_code: int = 0, stdout: str = ""
-) -> Path:
-    """PATH-shimmed `ssh` that records its argv to a log file."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    log_path = tmp_path / "ssh.log"
-    ssh = bin_dir / "ssh"
-    ssh.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" > {shlex.quote(str(log_path))}\n'
-        + (f'echo {shlex.quote(stdout)}\n' if stdout else "")
-        + f"exit {exit_code}\n"
-    )
-    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return bin_dir
-
-
 def test_exec_happy_path_invokes_ssh_with_resolved_ip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1510,21 +1452,6 @@ def test_exec_accepts_host_alias_for_on(
 # --------------------------------------------------------------------------- #
 # cp (file transfer over scp) — barak-deploy request item 6 / PAPERCUT-4
 # --------------------------------------------------------------------------- #
-
-
-def _write_scp_shim(tmp_path: Path, *, exit_code: int = 0) -> Path:
-    """PATH-shimmed `scp` that records its argv to a log file."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    log_path = tmp_path / "scp.log"
-    scp = bin_dir / "scp"
-    scp.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" > {shlex.quote(str(log_path))}\n'
-        f"exit {exit_code}\n"
-    )
-    scp.chmod(scp.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return bin_dir
 
 
 def _patch_vbox_status(monkeypatch: pytest.MonkeyPatch) -> None:

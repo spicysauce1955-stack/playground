@@ -40,6 +40,7 @@ from playground.models.status import LabStatus
 from playground.planner import Plan, PlanAction, render_plan
 from playground.preflight import run_all_checks as run_doctor_checks
 from playground.runs import OperationRun
+from playground.ssh.argv import build_scp_argv, build_ssh_argv
 from playground.validation import validate as validate_loaded_config
 
 
@@ -977,19 +978,9 @@ def exec_command(
     # `-- bash -lc 'a && b'` would run `bash -lc a && b` (quoting lost) and
     # `-- sh -c 'cat > f'` would mangle the redirect (BUG-7).
     remote_command = " ".join(shlex.quote(arg) for arg in command)
-    ssh_argv = [
-        "ssh",
-        # vbox NAT forwards put the guest on a non-22 host port; libvirt /
-        # cloud use 22 (omit -p so the command line is unchanged for them).
-        *(["-p", str(ssh_port)] if ssh_port and ssh_port != 22 else []),
-        "-o", "StrictHostKeyChecking=accept-new",
-        # vbox reuses 127.0.0.1:<port> across VM rebuilds, so a pinned
-        # known_hosts entry would trip host-key-mismatch; discard it.
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        f"{user}@{ssh_host}",
-        remote_command,
-    ]
+    ssh_argv = build_ssh_argv(
+        ssh_host, user=user, port=ssh_port, command=remote_command
+    )
     try:
         completed = subprocess.run(ssh_argv, check=False)  # noqa: S603
     except FileNotFoundError as exc:
@@ -1143,16 +1134,13 @@ def adb_command(
             json_errors=False,
         )
 
-    ssh_argv = [
-        "ssh",
-        *(["-p", str(ssh_port)] if ssh_port and ssh_port != 22 else []),
-        "-N",
-        "-L", f"{chosen}:127.0.0.1:{ADB_REMOTE_PORT}",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        f"{user}@{ssh_host}",
-    ]
+    ssh_argv = build_ssh_argv(
+        ssh_host,
+        user=user,
+        port=ssh_port,
+        local_forward=f"{chosen}:127.0.0.1:{ADB_REMOTE_PORT}",
+        no_remote_command=True,
+    )
 
     typer.echo(f"tunnel: 127.0.0.1:{chosen} -> {on}:{ADB_REMOTE_PORT} (via {ssh_host})")
     typer.echo(f"adb connect 127.0.0.1:{chosen}")
@@ -1381,18 +1369,9 @@ def cp_command(
     remote_operand = f"{user}@{ssh_host}:{remote.path}"
     scp_src = remote_operand if src_remote is not None else src
     scp_dst = remote_operand if dst_remote is not None else dst
-    scp_argv = [
-        "scp",
-        *(["-P", str(ssh_port)] if ssh_port and ssh_port != 22 else []),
-        *(["-r"] if recursive else []),
-        "-o", "StrictHostKeyChecking=accept-new",
-        # vbox reuses 127.0.0.1:<port> across rebuilds — pinned known_hosts
-        # would trip a host-key mismatch; discard it (matches exec).
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        scp_src,
-        scp_dst,
-    ]
+    scp_argv = build_scp_argv(
+        scp_src, scp_dst, port=ssh_port, recursive=recursive
+    )
     try:
         completed = subprocess.run(scp_argv, check=False)  # noqa: S603
     except FileNotFoundError as exc:

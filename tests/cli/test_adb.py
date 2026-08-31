@@ -1,85 +1,26 @@
 """Tests for the `playground adb` SSH-tunnel verb.
 
-``_write_apply_shims`` and ``_write_ssh_shim`` are copied verbatim from
-``tests/cli/test_cli.py`` (not imported) because ``tests/cli/`` has no
+``_write_apply_shims`` and ``_write_ssh_shim`` live in ``tests/cli/conftest.py``
+and are imported here as plain module functions (``tests/cli/`` has no
 ``__init__.py``, so `from .test_cli import ...` fails under pytest's
-collection (``ImportError: attempted relative import with no known
-parent package`` — verified before writing this file).
+collection — but pytest adds the rootless test directory to ``sys.path``,
+so a bare `from conftest import ...` works).
 """
 
 from __future__ import annotations
 
 import os
-import shlex
 import socket
-import stat
 from pathlib import Path
 
 import pytest
+from conftest import _write_apply_shims, _write_ssh_shim
 from typer.testing import CliRunner
 
 from playground.cli.main import app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
-
-
-def _write_apply_shims(
-    tmp_path: Path,
-    *,
-    tofu_apply_exit: int = 0,
-    tofu_destroy_exit: int = 0,
-    ansible_exit: int = 0,
-    vm_ips_payload: str | None = None,
-) -> Path:
-    """Write tofu + ansible-playbook shims handling apply/destroy/output.
-
-    Each `tofu <verb>` returns the corresponding exit code; `tofu output
-    -json` returns ``vm_ips_payload``. ansible-playbook exits with
-    ``ansible_exit``.
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    default_ips = (
-        '{"vm_ips": {"sensitive": false, "type": ["map","string"], '
-        '"value": {"node1":"10.0.10.42","docker1":"10.0.10.43","router1":"10.0.10.44"}}}'
-    )
-    payload = vm_ips_payload if vm_ips_payload is not None else default_ips
-    tofu = bin_dir / "tofu"
-    tofu.write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f"  apply) echo 'tofu apply ok'; exit {tofu_apply_exit} ;;\n"
-        f"  destroy) echo 'tofu destroy ok'; exit {tofu_destroy_exit} ;;\n"
-        f"  output) cat <<'PAYLOAD'\n{payload}\nPAYLOAD\n   ;;\n"
-        "  *) exit 0 ;;\n"
-        "esac\n"
-    )
-    tofu.chmod(tofu.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    ansible = bin_dir / "ansible-playbook"
-    ansible.write_text(
-        f"#!/usr/bin/env bash\necho ansible ran\nexit {ansible_exit}\n"
-    )
-    ansible.chmod(ansible.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return bin_dir
-
-
-def _write_ssh_shim(
-    tmp_path: Path, *, exit_code: int = 0, stdout: str = ""
-) -> Path:
-    """PATH-shimmed `ssh` that records its argv to a log file."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    log_path = tmp_path / "ssh.log"
-    ssh = bin_dir / "ssh"
-    ssh.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" > {shlex.quote(str(log_path))}\n'
-        + (f'echo {shlex.quote(stdout)}\n' if stdout else "")
-        + f"exit {exit_code}\n"
-    )
-    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return bin_dir
 
 
 def _invoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *args: str):

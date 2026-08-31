@@ -40,6 +40,7 @@ from typing import Literal
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.runs.operation import StepResult
+from playground.ssh.argv import build_ssh_argv
 
 DEFAULT_SSH_TIMEOUT_SECONDS = 300.0
 """Per-VM wait for sshd to accept TCP connections."""
@@ -412,17 +413,13 @@ def _wait_ssh_auth(*, target: VmTarget, timeout: float) -> tuple[bool, float]:
 def _ssh_probe(target: VmTarget, *, attempt_timeout: float = 15.0) -> int:
     """One ``ssh ... true`` attempt. Returns the process exit code
     (255 on transport failure; 124 if our per-attempt timeout fires)."""
-    cmd = [
-        "ssh",
-        *(["-p", str(target.ssh_port)] if target.ssh_port != SSH_PORT else []),
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        f"{target.ssh_user}@{target.ip}",
-        "true",
-    ]
+    cmd = build_ssh_argv(
+        target.ip,
+        user=target.ssh_user,
+        port=target.ssh_port,
+        command="true",
+        batch=True,
+    )
     try:
         return subprocess.run(  # noqa: S603 — explicit args, no shell
             cmd, capture_output=True, text=True, check=False,
@@ -455,17 +452,13 @@ def _wait_cloud_init(
     ``-p <port>`` is added only for non-default ports (vbox NAT
     forwards) so the libvirt command line is byte-for-byte unchanged.
     """
-    cmd = [
-        "ssh",
-        *(["-p", str(port)] if port != SSH_PORT else []),
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        f"{user}@{ip}",
-        "cloud-init status --wait",
-    ]
+    cmd = build_ssh_argv(
+        ip,
+        user=user,
+        port=port,
+        command="cloud-init status --wait",
+        batch=True,
+    )
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=timeout,
