@@ -17,7 +17,10 @@ after ansible finishes:
 2. **docker reachable** on every VM in `[needs_docker]`.
    `docker ps` must exit 0 — proves dockerd is up and the
    ansible user can talk to it via the docker socket.
-3. **`commands.enabled` smoke pass** for any preset that targets
+3. **declared `android_app` packages installed** on VMs that have
+   any scheduled onto them (see `planner.scheduling.schedule_workloads`).
+   Skipped entirely for VMs with no `android_app` workloads.
+4. **`commands.enabled` smoke pass** for any preset that targets
    `any` VM. Runs each one and asserts exit 0.
 
 **Severity: warning-only.** Failures attach
@@ -46,6 +49,7 @@ from pathlib import Path
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedCommand, ResolvedLab, ResolvedVm
+from playground.planner.scheduling import schedule_workloads
 from playground.runs.operation import StepResult
 from playground.ssh.argv import build_ssh_argv
 
@@ -68,6 +72,10 @@ class VmTarget:
     ssh_port: int = 22
     """SSH endpoint port. 22 for libvirt (DHCP IP); a per-VM NAT
     port-forward for vbox (``ip`` is then ``127.0.0.1``)."""
+    android_packages: tuple[str, ...] = ()
+    """Packages scheduled onto this VM by declarative ``android_app``
+    workloads (see ``planner.scheduling.schedule_workloads``). Empty
+    when the VM has none, which skips the sub-check entirely."""
 
 
 @dataclass
@@ -197,6 +205,15 @@ def _build_targets(
     wait-for-vms-ready phase too, no point double-reporting.
     """
     by_name: dict[str, ResolvedVm] = {vm.name: vm for vm in resolved.vms}
+    schedule, _ = schedule_workloads(resolved)
+    android_by_vm = {
+        vm_name: tuple(
+            wl.android.package
+            for wl in workloads
+            if wl.type == "android_app" and wl.android is not None
+        )
+        for vm_name, workloads in schedule.items()
+    }
     targets: list[VmTarget] = []
     for vm in resolved.vms:
         ip = vm_ips.get(vm.name)
@@ -213,6 +230,7 @@ def _build_targets(
                 ssh_user=vm.ssh.user,
                 has_docker=has_docker,
                 ssh_port=ssh_ports.get(vm.name, 22),
+                android_packages=android_by_vm.get(vm.name, ()),
             )
         )
     _ = by_name  # quiet unused-locals lint; kept for future per-name lookups
@@ -303,7 +321,40 @@ def _verify_one(
         else:
             outcome.log_lines.append(f"{target.name}: docker ps OK")
 
-    # 3. commands.enabled with target: any
+    # 3. declared android_app packages actually installed
+    if target.android_packages:
+        installed = _ssh(
+            target,
+            "adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true; "
+            "adb -s 127.0.0.1:5555 shell pm list packages",
+            timeout=timeout,
+        )
+        for package in target.android_packages:
+            if f"package:{package}" not in installed.stdout:
+                outcome.log_lines.append(
+                    f"[{target.name}] android package {package} NOT installed"
+                )
+                outcome.diagnostics.append(
+                    Diagnostic(
+                        id="runtime.apply.verify_failed",
+                        severity="error",
+                        message=(
+                            f"VM {target.name!r}: declared android_app "
+                            f"package {package!r} is not installed"
+                        ),
+                        source=SourceLocation(path=target.ip),
+                        suggestion=(
+                            "check the workload_android_app role output in "
+                            "the ansible log for this host"
+                        ),
+                    )
+                )
+            else:
+                outcome.log_lines.append(
+                    f"[{target.name}] android package {package} installed"
+                )
+
+    # 4. commands.enabled with target: any
     for cmd in any_commands:
         result = _ssh(target, cmd.shell, timeout=cmd.timeout_seconds or timeout)
         if result.returncode != 0:
