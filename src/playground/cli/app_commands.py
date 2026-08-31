@@ -425,6 +425,30 @@ def install_command(
                 source=SourceLocation(path=str(path)),
             )
         )
+    # Same split-set rule the declarative path enforces in
+    # planner/scheduling.py. Without it the two halves of this feature
+    # disagree about what a valid split set is: `playground apply` rejects
+    # a base-less directory at validate time, while `playground app
+    # install` happily ran install-multiple on it and let the device
+    # answer -- which it does with `INSTALL_FAILED_INVALID_APK`, a much
+    # worse place to find out.
+    if path.is_dir() and not any(a.name == "base.apk" for a in apks):
+        _fail(
+            Diagnostic(
+                id="config.app.split_apk_invalid",
+                severity="error",
+                message=(
+                    f"directory {str(path)!r} has no base.apk; a split set "
+                    "needs exactly one base.apk alongside its "
+                    "split_config.*.apk siblings"
+                ),
+                source=SourceLocation(path=str(path)),
+                suggestion=(
+                    "pass the single .apk file directly, or add the base.apk "
+                    "the splits belong to"
+                ),
+            )
+        )
 
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,

@@ -766,3 +766,23 @@ def test_pull_onto_an_existing_directory_is_a_clean_failure(
     assert result.exit_code == 1
     assert "Traceback" not in result.output
     assert "is a directory" in result.output
+
+
+def test_install_rejects_a_split_directory_with_no_base_apk(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """The declarative path (planner/scheduling.py) requires exactly one
+    base.apk in a split set. The CLI accepted a base-less directory and let
+    install-multiple fail on the device with INSTALL_FAILED_INVALID_APK --
+    verified live. Both halves must agree on what a valid split set is."""
+    splits = tmp_path / "splits"
+    splits.mkdir()
+    (splits / "split_config.en.apk").write_bytes(b"PK\x03\x04en")
+
+    result = _run(
+        tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+        "install", str(splits),
+    )
+
+    assert result.exit_code == 1
+    assert "config.app.split_apk_invalid" in result.output + result.stderr

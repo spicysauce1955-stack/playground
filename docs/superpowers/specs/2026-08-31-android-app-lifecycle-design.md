@@ -385,3 +385,80 @@ operator chooses the digest.
    app exists on the Redroid image, split install can only be unit-tested
    against a synthesized directory, with the live path left unverified —
    say so plainly rather than claiming coverage.
+
+## Live validation, 2026-08-31
+
+Run against two DigitalOcean Droplets (`s-4vcpu-8gb`, `ubuntu-24-04-x64`,
+nyc1), both destroyed afterwards. Inventory confirmed identical to the
+pre-run baseline.
+
+### Verified working
+
+| Path | Evidence |
+|---|---|
+| `shell`, `list` | 142 packages; `[droid1]` fan-out prefix |
+| `pull` | real 6.2 MB APK retrieved to the controller |
+| `install` (single) | `Performing Streamed Install` / `Success` |
+| `install` (split dir) | staged both APKs, ran `install-multiple`, surfaced the device's real error |
+| `launch` (discovery + `--activity`) | `Starting: Intent {...}`, process confirmed by pid |
+| `stop`, `clear`, `uninstall` | `Success` / process gone |
+| `screenshot` | 318 KB real PNG |
+| `ui-dump` | real view-hierarchy XML |
+| `logcat`, `input`, `push` | real log lines; pushed content read back off the device |
+| Declarative `android_app` workload | APK installed and launched by `playground apply` |
+| **Idempotency (principle 7)** | **second apply on a converged host: `changed=0`** |
+| `verify-lab` | `[droid1] android package org.fdroid.fdroid installed` |
+
+### Bugs found live, that static tests could not catch
+
+Twelve defects were found across live testing and two audits. Three were
+reachable ONLY through a real device, and the suite was green (844 tests)
+throughout:
+
+1. **`install` staged the APK to `/data/local/tmp`** — an Android path.
+   scp's destination is the Ubuntu guest, which has no such directory.
+   Every unit test passed because the scp shim accepts any path.
+2. **`monkey` is not a launcher.** It returned 251 on a SUCCESSFUL launch,
+   then later stopped launching at all while printing identical output.
+   The Ansible role made the same call with no `failed_when`, so a lab
+   with `launch: true` and no `activity` failed the entire apply. Both
+   now use launch discovery (`cmd package resolve-activity --brief`).
+3. **The `&&` guard in `_capture_to_local` was severed** by the `;` inside
+   `adb_prefix()`, so `pull && cat` ran unconditionally. With a fixed
+   device-side filename, a FAILED `screencap` silently returned the
+   PREVIOUS run's image as if it were current.
+
+Plus, from audit: `adb_shell` quoted for one shell while the command
+crosses two, so `input text "hello world"` typed only the first word and a
+command-substitution payload was expanded ON THE DEVICE; a rebuilt APK was
+staged but never installed, leaving the device on the old build forever;
+`pm grant` on an install-time permission aborted the apply mid-convergence;
+stale splits were never purged; `install` had no boot gate; scp's remote
+operand was unquoted; `stop` could not fail.
+
+### Open question 3, answered
+
+The spec asked whether split installs could be verified live. **Partly.**
+The Redroid image carries no third-party app and no split-installed app, so
+the round-trip fixture (`pm path` -> `adb pull`) yields only single APKs.
+The split PATH was exercised with a synthesized directory — staging as a
+directory, `install-multiple` invocation, and error surfacing all confirmed
+live — but a SUCCESSFUL split install remains unverified for want of a
+genuine split set. This is stated rather than implied.
+
+### Where idempotency does not hold
+
+`reinstall: true` is unconditionally non-idempotent by design.
+`launch: true` means "ensure a process exists", so an app whose launcher
+activity exits immediately, or one reaped by Android's low-memory killer,
+reports `changed` on every apply. That is a property of the app a lab
+ships, not of the role, and the role header says so.
+
+### Region/size availability is not static
+
+`redroid-cloud` originally pinned `nyc3` + `s-4vcpu-8gb`. That pairing
+provisioned successfully in the morning and was rejected hours later with a
+mid-apply `422 Size is not available in this region`, after `tofu-init` had
+run. The lab moved to `nyc1`. A `cloud-preflight` check that validates the
+region/size pairing against the DO API before provisioning would convert
+this into a clear pre-flight diagnostic; not implemented.
