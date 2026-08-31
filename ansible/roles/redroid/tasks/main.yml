@@ -162,6 +162,14 @@
       play entirely on the next apply.
   when: binder_recheck.rc != 0
 
+- name: Install the adb client on the guest
+  ansible.builtin.apt:
+    name: adb
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  when: redroid_install_adb | bool
+
 - name: Pull redroid image
   community.docker.docker_image:
     name: "{{ redroid_image }}"

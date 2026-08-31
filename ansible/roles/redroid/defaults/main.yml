@@ -21,3 +21,9 @@ redroid_image: redroid/redroid:11.0.0-240527
 # (or whose packages come from a local mirror) — the role then probes and
 # aborts rather than reaching for apt.
 redroid_install_kernel_modules: true
+
+# The app-lifecycle layer runs adb ON the guest (never on the operator's
+# machine and never over an exposed 5555), so the client must be present.
+# Ubuntu Noble ships it in universe as `adb`. Set false for air-gapped
+# hosts whose package source lacks it.
+redroid_install_adb: true
