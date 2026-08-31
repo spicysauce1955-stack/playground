@@ -55,10 +55,29 @@ def launch_cmd(package: str, *, activity: str | None, url: str | None) -> str:
         )
     if activity is not None:
         return adb_shell(f"am start -n {shlex.quote(package + '/' + activity)}")
-    return adb_shell(
-        f"monkey -p {shlex.quote(package)} "
-        "-c android.intent.category.LAUNCHER 1"
+    # Launch discovery, per docs/research/android-emulation/app-install-launch.md.
+    #
+    # monkey is NOT a reliable launcher, verified live on Redroid 11
+    # (DigitalOcean, 2026-08-31): it returned 251 on a successful launch,
+    # and later stopped starting the app at all while reporting the same
+    # output. `cmd package resolve-activity --brief` yields the real
+    # launcher component and `am start -n` on it returns an honest 0/non-0.
+    #
+    # monkey survives only as a last resort for packages whose launcher
+    # activity does not resolve, and there its exit status is discarded in
+    # favour of `pidof` -- "did it launch" is a question about the process.
+    #
+    # The device-side script is quoted as ONE argument so `$(...)`, `;` and
+    # the redirections run on the DEVICE, not on the guest invoking adb.
+    quoted = shlex.quote(package)
+    script = (
+        f"ACT=$(cmd package resolve-activity --brief {quoted} | tail -n 1); "
+        'if [ -n "$ACT" ] && [ "${ACT#*/}" != "$ACT" ]; then '
+        'am start -n "$ACT"; '
+        f"else monkey -p {quoted} -c android.intent.category.LAUNCHER 1 "
+        f">/dev/null 2>&1; pidof {quoted} >/dev/null 2>&1; fi"
     )
+    return f"{adb_prefix()} shell {shlex.quote(script)}"
 
 
 def stop_cmd(package: str) -> str:

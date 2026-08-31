@@ -65,8 +65,13 @@ def test_launch_with_activity_uses_am_start_n() -> None:
     assert "am start -n com.x/.Main" in cmd
 
 
-def test_launch_without_either_falls_back_to_monkey() -> None:
+def test_launch_without_either_resolves_the_launcher_activity() -> None:
+    """monkey is not a reliable launcher (see the live-bug test below), so
+    the default path discovers the real component first."""
     cmd = launch_cmd("com.x", activity=None, url=None)
+    assert "resolve-activity --brief" in cmd
+    assert "am start -n" in cmd
+    # monkey is kept only as the last-resort branch.
     assert "monkey -p com.x" in cmd
     assert "android.intent.category.LAUNCHER" in cmd
 
@@ -112,3 +117,26 @@ def test_wait_booted_polls_sys_boot_completed() -> None:
     cmd = wait_booted_cmd(60)
     assert "sys.boot_completed" in cmd
     assert "60" in cmd
+
+
+def test_monkey_launch_uses_pidof_as_the_success_signal() -> None:
+    """LIVE BUG 2026-08-31: monkey returns 251 on Redroid 11 even when the
+    app launches fine, while `am start` returns 0. Relying on monkey's exit
+    status made `playground app launch` report failure on every successful
+    launch, and would have failed the whole apply for any lab declaring
+    `launch: true` without an activity."""
+    cmd = launch_cmd("com.example.app", activity=None, url=None)
+    assert "resolve-activity --brief" in cmd, "prefer the real launcher component"
+    assert "monkey -p" in cmd, "monkey remains the last-resort branch"
+    assert "pidof" in cmd, "monkey's exit code must not decide success"
+    # The device-side script must be ONE quoted argument so `;` runs on the
+    # device, not on the guest that invokes adb.
+    assert cmd.count("shell ") == 1
+    tail = cmd.split("shell ", 1)[1]
+    assert tail.startswith("'"), "device script must be quoted as one arg"
+
+
+def test_activity_launch_needs_no_pidof_because_am_start_is_honest() -> None:
+    cmd = launch_cmd("com.example.app", activity=".Main", url=None)
+    assert "am start -n" in cmd
+    assert "pidof" not in cmd

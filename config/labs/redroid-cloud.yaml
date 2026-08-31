@@ -49,7 +49,13 @@ spec:
 
   providers:
     cloud-digitalocean:
-      region: nyc3
+      # nyc3 does NOT offer s-4vcpu-8gb. DigitalOcean rejects the pairing
+      # with a mid-apply 422 "Size is not available in this region", after
+      # tofu-init has already run. Region/size availability shifts over
+      # time -- this exact pairing provisioned successfully on 2026-08-31
+      # and was rejected hours later -- so confirm with
+      # `doctl compute size list --output json` before changing either.
+      region: nyc1
       # The redroid-host role asks for 4 vCPU / 8 GB / 60 GB. DigitalOcean
       # applies ONE size slug to every Droplet in the lab, so this slug —
       # not the role's resources block — is what actually provisions.

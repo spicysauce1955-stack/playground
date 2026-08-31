@@ -349,7 +349,22 @@ def install_command(
 
     failed: list[str] = []
     for target in targets:
-        remote_paths = [f"/data/local/tmp/{apk.name}" for apk in apks]
+        # Stage on the VM's own filesystem, NOT /data/local/tmp: that is an
+        # ANDROID path, and scp's destination is the Ubuntu guest, which has
+        # no such directory. `adb install` reads the APK from the machine
+        # running adb (the guest) and pushes it to the device itself.
+        # Found live -- the ssh/scp test shim accepts any path, so this
+        # passed every unit test while failing on a real VM with
+        # `scp: dest open "/data/local/tmp/...": No such file or directory`.
+        stage_dir = f"/tmp/playground-apk-{uuid4().hex}"
+        remote_paths = [f"{stage_dir}/{apk.name}" for apk in apks]
+        mkdir = run_on_targets(
+            [target], f"mkdir -p {stage_dir}", timeout=_DEFAULT_TIMEOUT
+        )[0]
+        if not mkdir.ok:
+            _echo_target_output(mkdir)
+            failed.append(target.vm_name)
+            continue
         if not all(
             _scp_one(apk, target, remote_path)
             for apk, remote_path in zip(apks, remote_paths, strict=True)

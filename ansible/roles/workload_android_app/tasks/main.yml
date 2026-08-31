@@ -170,11 +170,17 @@
     and item.rc is defined and item.rc != 0
     and item.item.android.activity
 
+# monkey returns 251 on Redroid 11 even on a successful launch (verified
+# live 2026-08-31), so its exit status must not decide the task result --
+# without this the whole apply fails for any lab declaring launch: true
+# without an activity. `pidof` is the real signal.
 - name: Launch the app via monkey (no declared activity)
   ansible.builtin.shell: >-
     adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
     adb -s 127.0.0.1:5555 shell monkey -p {{ item.item.android.package }}
-    -c android.intent.category.LAUNCHER 1
+    -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;
+    adb -s 127.0.0.1:5555 shell pidof {{ item.item.android.package }}
+    >/dev/null 2>&1
   args:
     executable: /bin/bash
   loop: "{{ pg_pidof.results | default([]) }}"
