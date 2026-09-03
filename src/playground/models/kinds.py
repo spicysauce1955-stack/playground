@@ -80,6 +80,43 @@ class RetentionPolicy(StrictModel):
 
 
 # ---------------------------------------------------------------------------
+# Capture (also used by Defaults.spec.capture)
+# ---------------------------------------------------------------------------
+
+
+class CaptureOptions(StrictModel):
+    """Bounds on packet capture for one device, per session.
+
+    ``max_file_mb * max_files`` is a hard ceiling on disk: 1 GB at these
+    defaults. It is not optional. pcaps grow without bound, `redroid-host`
+    asks for a 60 GB disk, and filling a guest's root filesystem takes
+    sshd down and therefore every other verb with it.
+
+    Two properties of that ceiling are deliberate and must not be
+    "corrected":
+
+    * ``max_file_mb`` maps to ``tcpdump -C``, which counts units of
+      1,000,000 bytes -- not MiB. The field name says ``mb`` and means
+      exactly what tcpdump does.
+    * ``-C`` with ``-W`` is a ring, so the OLDEST file is overwritten once
+      the ceiling is reached. A session that outlives its budget keeps the
+      most recent 1 GB and silently discards the beginning. That is better
+      than filling the disk, and `capture status` reports the file count so
+      a wrapping session is visible.
+
+    ``enabled: false`` is a PROVISIONING switch, not just a CLI gate: the
+    `needs_capture` play is skipped, so no package is installed and no unit
+    exists. It is the air-gap / lean-guest opt-out.
+    """
+
+    enabled: bool = True
+    max_file_mb: int = Field(default=100, ge=1)
+    max_files: int = Field(default=10, ge=1)
+    snaplen: int = Field(default=0, ge=0)
+    """``tcpdump -s``. 0 means the whole packet."""
+
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 
@@ -101,6 +138,7 @@ class DefaultsSpec(StrictModel):
     vm: DefaultsVm
     network: DefaultsNetwork
     retention: RetentionPolicy
+    capture: CaptureOptions = Field(default_factory=CaptureOptions)
 
 
 class Defaults(ResourceEnvelope):
@@ -431,6 +469,9 @@ class LabSpec(BaseModel):
     workloads: list[LabWorkload] = Field(default_factory=list)
     commands: LabCommands = Field(default_factory=LabCommands)
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    capture: CaptureOptions | None = None
+    """Per-lab capture bounds. When unset the resolver falls back to
+    ``Defaults.spec.capture``."""
 
     @field_validator("networks", "vms", "workloads")
     @classmethod
@@ -502,6 +543,7 @@ __all__ = [
     "ArtifactSourcesSpec",
     "AnsibleCollectionSource",
     "Budget",
+    "CaptureOptions",
     "CommandBody",
     "CommandEscalation",
     "CommandPreset",

@@ -222,3 +222,44 @@ def test_command_preset_rejects_zero_timeout() -> None:
     raw["spec"]["timeout_seconds"] = 0
     with pytest.raises(ValidationError):
         parse_resource(raw)
+
+
+def test_capture_options_defaults() -> None:
+    from playground.models.kinds import CaptureOptions
+
+    options = CaptureOptions()
+    assert options.enabled is True
+    assert options.max_file_mb == 100
+    assert options.max_files == 10
+    assert options.snaplen == 0
+
+
+def test_capture_options_reject_unknown_field() -> None:
+    from playground.models.kinds import CaptureOptions
+
+    with pytest.raises(ValidationError):
+        CaptureOptions(max_file_gb=1)
+
+
+def test_capture_options_reject_zero_files() -> None:
+    from playground.models.kinds import CaptureOptions
+
+    with pytest.raises(ValidationError):
+        CaptureOptions(max_files=0)
+
+
+def test_lab_capture_defaults_to_none_at_parse_time() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    lab = parse_resource(raw)
+    assert isinstance(lab, Lab)
+    assert lab.spec.capture is None
+
+
+def test_lab_capture_parses_when_set() -> None:
+    raw = _load_yaml(CONFIG_DIR / "labs" / "generic-infra.yaml")
+    raw["spec"]["capture"] = {"enabled": False, "max_files": 3}
+    lab = parse_resource(raw)
+    assert isinstance(lab, Lab)
+    assert lab.spec.capture.enabled is False
+    assert lab.spec.capture.max_files == 3
+    assert lab.spec.capture.max_file_mb == 100

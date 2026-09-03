@@ -261,3 +261,57 @@ def test_cloud_smoke_resolves_with_correct_backend_and_no_errors() -> None:
     assert resolved.vms[0].disk_gb == 25
     assert len(resolved.networks) == 1
     assert resolved.networks[0].name == "lab-net"
+
+
+def test_resolver_capture_falls_back_to_defaults(resolved_generic_infra) -> None:
+    lab = resolved_generic_infra
+    assert lab.capture.enabled is True
+    assert lab.capture.max_file_mb == 100
+    assert lab.capture.max_files == 10
+    assert lab.capture.snaplen == 0
+
+
+def test_resolver_capture_respects_lab_override(tmp_path) -> None:
+    from textwrap import dedent
+
+    config_dir = tmp_path / "config"
+    for sub in ("artifacts", "commands", "labs", "networks", "providers", "roles"):
+        (config_dir / sub).mkdir(parents=True, exist_ok=True)
+    import shutil as _shutil
+    for sub in ("artifacts", "commands", "networks", "providers", "roles"):
+        for f in (CONFIG_DIR / sub).iterdir():
+            _shutil.copy(f, config_dir / sub / f.name)
+    _shutil.copy(CONFIG_DIR / "defaults.yaml", config_dir / "defaults.yaml")
+    (config_dir / "labs" / "custom-capture.yaml").write_text(
+        dedent(
+            """
+            apiVersion: playground/v1
+            kind: Lab
+            metadata:
+              name: custom-capture
+            spec:
+              backend: local-libvirt
+              capture:
+                enabled: false
+                max_file_mb: 25
+                max_files: 4
+                snaplen: 96
+              networks:
+                - name: net-a
+                  profile: isolated
+                  cidr: 10.20.40.0/24
+              vms:
+                - name: vm-a
+                  role: generic-node
+                  networks: [net-a]
+            """
+        ).lstrip("\n")
+    )
+
+    loaded, diagnostics = load_config(config_dir)
+    assert diagnostics == []
+    resolved = resolve_lab(loaded, "custom-capture")
+    assert resolved.capture.enabled is False
+    assert resolved.capture.max_file_mb == 25
+    assert resolved.capture.max_files == 4
+    assert resolved.capture.snaplen == 96
