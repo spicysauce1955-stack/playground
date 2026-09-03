@@ -1089,7 +1089,28 @@ def test_defaults_declare_the_opt_out_and_paths() -> None:
     defaults = _yaml.load(DEFAULTS.read_text())
     assert defaults["capture_install_tcpdump"] is True
     assert defaults["capture_dir"] == "/var/lib/playground/capture"
+
+
+def test_ansible_and_python_agree_on_the_guest_contract() -> None:
+    """The pcap path and unit name are each written twice -- once here in
+    the Ansible role, once in `playground.capture.commands` -- because
+    Ansible cannot import Python. A value duplicated across layers is
+    exactly the "implicit cross-layer dependency hidden by a hardcoded
+    value" shape `docs/architecture/CONTRACTS.md` exists to catch: if
+    these drift, the guest writes pcaps where the CLI does not look and
+    `capture fetch` silently returns nothing at all. The duplication is
+    unavoidable; leaving it unenforced is not.
+    """
+    from playground.capture.commands import CAPTURE_DIR, unit_name
+
+    assert _yaml.load(DEFAULTS.read_text())["capture_dir"] == CAPTURE_DIR
+    # The template's filename IS the instance template the CLI names.
+    assert UNIT.name == "playground-capture@.service.j2"
+    assert unit_name("droid1") == "playground-capture@droid1.service"
 ```
+
+Note this test imports from `playground.capture.commands`, built in Task 2 —
+which is why Task 4 runs after it.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -2592,15 +2613,47 @@ def test_reset_removes_the_labs_capture_session_records(tmp_path) -> None:
     assert not capture_dir.exists()
     # Never another lab's state.
     assert (other / "droid1.json").is_file()
+
+
+def test_all_three_backends_wire_capture_into_clean_state_files() -> None:
+    """The test above calls `_clean_state_files` directly, so it passes
+    with or without this task's change — it documents the per-lab
+    isolation invariant, it does not gate the wiring. THIS is the gate:
+    each backend's `execute_reset` must both build the capture path and
+    hand it to the cleaner. Building it without passing it is a silent
+    no-op, which is the exact failure mode worth a test.
+
+    Source-text assertions follow the established house pattern in
+    `tests/unit/ansible/`.
+    """
+    from pathlib import Path as _Path
+
+    backend_root = (
+        _Path(__file__).resolve().parents[4] / "src" / "playground" / "backend"
+    )
+    for backend in ("local_libvirt", "local_vbox", "cloud_digitalocean"):
+        text = (backend_root / backend / "runner.py").read_text()
+        assert 'state_dir / "state" / "capture" / lab' in text, (
+            f"{backend}: never builds the per-lab capture state path"
+        )
+        target_lines = [ln for ln in text.splitlines() if "targets=[" in ln]
+        assert target_lines, f"{backend}: no _clean_state_files call found"
+        assert any("capture_dir" in ln for ln in target_lines), (
+            f"{backend}: capture_dir is built but never passed to "
+            "_clean_state_files, so reset would silently not scrub it"
+        )
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `$PYTEST tests/unit/backend/local_libvirt/test_scrub.py -k capture -v`
-Expected: FAIL — the test itself passes trivially only once
-`_clean_state_files` is handed the directory; it fails now because
-nothing constructs that path. Confirm the failure is the missing
-`capture_dir` wiring below, not an import error.
+Expected: the first test PASSES immediately (it calls `_clean_state_files`
+directly, and that helper already removes any directory handed to it —
+it documents the isolation invariant rather than gating this task). The
+second test FAILS on all three backends with "never builds the per-lab
+capture state path". That second failure is the one this task fixes; if
+it passes before you make any change, stop and report — something is
+already wired and the task's premise is wrong.
 
 - [ ] **Step 3: Wire the path in the libvirt runner**
 
