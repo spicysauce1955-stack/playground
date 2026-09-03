@@ -1,10 +1,20 @@
 ---
 # Idempotent: package present, three templated files unchanged, unit
-# enabled but STOPPED. A converged host reports changed=0.
+# installed but STOPPED -- never enabled. A converged host reports
+# changed=0.
 #
 # This role must never start, stop, or restart a capture session --
 # `playground apply` on a lab that is mid-capture leaves the recording
 # untouched. Sessions are started only by `playground capture start`.
+#
+# Not enabling the unit is deliberate, not an oversight: an enabled
+# instance would start recording at boot, violating "provisioning never
+# starts a session". The consequence is that a guest reboot does NOT
+# resume a capture that was running before it -- the session record on
+# the operator's machine still claims it is running, but `capture
+# status` will show `state=inactive`. Recovery is `capture stop` (a
+# no-op against the guest that only clears the stale local record) then
+# `capture start`.
 
 - name: Parse pg_capture JSON payload
   ansible.builtin.set_fact:

@@ -146,6 +146,15 @@ unit exists. The CLI then fails with `config.capture.disabled` rather than
 reporting a dead unit. This is the air-gap and lean-guest opt-out, and it is
 the only way `spec.capture` changes what apply does.
 
+> **Post-implementation correction:** "the `needs_capture` play is
+> skipped entirely" is wrong -- the host is still a member of that
+> group. `docs/architecture/CONTRACTS.md` corrects this: the skip
+> happens *inside* the `capture` role, via its own
+> `ansible.builtin.meta: end_host` guard, evaluated right after
+> `pg_capture` is parsed and before the `tcpdump` package task runs. Net
+> effect is the same (no package, no unit), but the skip point is the
+> role's guard, not group membership.
+
 ### 2. Role wiring
 
 `config/roles/redroid-host.yaml` gains one capability and one provisioner:
@@ -304,6 +313,12 @@ Following the established id grammar:
 - `config.capture.disabled` -- `spec.capture.enabled: false`
 - `runtime.capture.already_running` -- `start` against a live session
 - `runtime.capture.not_running` -- `stop` / `fetch` with nothing captured
+
+  > **Post-implementation correction:** `fetch` never shipped this.
+  > `fetch_command` consults no session record at all, so fetching
+  > before anything was captured surfaces as a plain scp failure (empty
+  > or missing remote directory) plus a `failed` run record, not this
+  > diagnostic. Only `stop` emits it.
 - `runtime.backend.verb_not_supported` -- existing id, reused for
   `local-vbox`
 
@@ -318,9 +333,20 @@ Following the established id grammar:
 ## Idempotency
 
 The role converges to `changed=0`: package present, three templated files
-unchanged, unit enabled-but-stopped. It does **not** start capture -- a
+unchanged, unit installed-but-stopped. It does **not** start capture -- a
 re-apply must never begin recording, and must never interrupt a session
 already in progress.
+
+> **Post-implementation correction:** the unit is never `enable`d, only
+> installed and left stopped -- "enabled-but-stopped" as originally
+> written here was wrong. Not enabling is correct (an enabled instance
+> would start recording at boot, violating "provisioning never starts a
+> session"), but it has a consequence this section didn't state: a guest
+> reboot does **not** resume a capture that was running before it, while
+> the operator's session record still claims it is running. `capture
+> status` reports `state=inactive` in that case; recovery is `capture
+> stop` (a no-op that clears the stale record) then `capture start`. See
+> `docs/architecture/CONTRACTS.md` → "Capture: Redroid device traffic".
 
 `start` on a running session is a diagnostic, not a silent no-op, because
 "already capturing" and "just started capturing" produce differently

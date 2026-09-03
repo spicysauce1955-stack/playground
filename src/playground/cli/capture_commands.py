@@ -15,6 +15,7 @@ not yet have defined them at the point it imports `capture_app`.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from playground.android.targets import AndroidTarget
 from playground.backend.dispatch import query_status
 from playground.capture.commands import (
     clean_cmd,
+    is_active_cmd,
     remote_capture_dir,
     start_cmd,
     status_cmd,
@@ -473,9 +475,16 @@ def fetch_command(
         destination = artifacts / target.vm_name
         destination.mkdir(parents=True, exist_ok=True)
         started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+        # scp's `host:path` operand IS shell-interpreted on the remote
+        # side (legacy scp protocol execs a remote shell; even the
+        # SFTP-based default still tokenizes it for some servers/older
+        # clients). Without quoting, a VM name with a space is
+        # "ambiguous target" and one with a backtick or `$(...)` runs on
+        # the guest. Only the path half is quoted -- the user@host half
+        # must stay bare. Mirrors `_scp_one` in `app_commands.py`.
         source = (
             f"{target.ssh_user}@{target.ssh_host}:"
-            f"{remote_capture_dir(target.vm_name)}/."
+            f"{shlex.quote(f'{remote_capture_dir(target.vm_name)}/.')}"
         )
         argv = build_scp_argv(
             source, str(destination), port=target.ssh_port, recursive=True
@@ -522,6 +531,46 @@ def fetch_command(
             continue
         typer.echo(f"[{target.vm_name}] pcaps → {destination}")
         if clean:
+            # Gate on the GUEST, not on the local session record: the
+            # record can legitimately be absent while a capture is
+            # running (a second operator, or a `playground reset` that
+            # scrubbed it) -- see `status_command`'s docstring. Skipping
+            # `stop` before `fetch --clean` is the natural operator
+            # error the example lab's own header teaches (start ->
+            # install -> stop -> fetch), and `rm -f` against a file
+            # tcpdump still has open unlinks the inode without stopping
+            # the write: data lost, disk still consumed, nothing
+            # reported until the next `-C` rotation. The transfer above
+            # has already succeeded either way, so the operator's data
+            # is safe -- only the guest-side copy is at stake here.
+            probe = run_on_targets(
+                [target], is_active_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
+            )[0]
+            if probe.stdout.strip() == "active":
+                _main()._print_diagnostics(
+                    [
+                        Diagnostic(
+                            id="runtime.capture.still_running",
+                            severity="error",
+                            message=(
+                                f"{target.vm_name!r} is still capturing -- the "
+                                f"pcaps WERE fetched, but the guest copy was "
+                                f"deliberately left in place rather than "
+                                f"deleted out from under a live tcpdump"
+                            ),
+                            source=SourceLocation(
+                                path=str(remote_capture_dir(target.vm_name))
+                            ),
+                            suggestion=(
+                                f"run `playground capture stop --lab {lab_name} "
+                                f"--on {target.vm_name}` before cleaning"
+                            ),
+                        )
+                    ],
+                    err=True,
+                )
+                clean_failed.append(target.vm_name)
+                continue
             removal = run_on_targets(
                 [target], clean_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
             )[0]

@@ -1,5 +1,9 @@
 # redroid-capture — containerized Android with traffic capture, on libvirt
 #
+# This is the repo's first committed `local-libvirt` Redroid lab -- every
+# Redroid path shipped so far (redroid-cloud.yaml) was validated on
+# `cloud-digitalocean` instead.
+#
 # Captures the device's own network namespace from the host VM, so the
 # pcap is exactly this device's traffic:
 #

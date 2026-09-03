@@ -128,6 +128,19 @@ def status_cmd(vm: str) -> str:
     )
 
 
+def is_active_cmd(vm: str) -> str:
+    """Print the unit's activation state, exiting 0 whichever it is.
+
+    `systemctl is-active` exits non-zero for an inactive unit, which is a
+    normal reportable state here rather than an error -- so the `|| true`
+    keeps the ssh call's exit code meaning "the probe ran", leaving the
+    STATE to be read from stdout.
+    """
+    return (
+        f"systemctl is-active {shlex.quote(unit_name(vm))} 2>/dev/null || true"
+    )
+
+
 def clean_cmd(vm: str) -> str:
     """Remove a device's captured pcaps from the guest.
 

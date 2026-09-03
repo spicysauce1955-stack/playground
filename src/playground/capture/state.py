@@ -24,9 +24,14 @@ class CaptureSession(StrictModel):
     """One capture session, as recorded on the operator's machine.
 
     The limits are copied in rather than re-read from the lab at
-    `stop`/`fetch` time: they describe the pcaps that were ACTUALLY
-    produced. Editing `spec.capture` mid-session must not retroactively
-    change what a finished session claims about itself.
+    `stop`/`fetch` time: they are `resolved.capture` as of `start`, i.e.
+    the lab's CONFIGURED limits at session start -- not necessarily what
+    tcpdump actually used. The values tcpdump ran with were baked into
+    the wrapper script at APPLY time; editing `spec.capture` without
+    re-applying leaves this record and the wrapper disagreeing about
+    what the ring's real bounds are. Editing `spec.capture` mid-session
+    must not retroactively change what a finished session claims about
+    itself.
     """
 
     vm: str

@@ -118,6 +118,158 @@ def _two_device_config(tmp_path: Path) -> Path:
     return config_dir
 
 
+def _spaced_vm_name_config(tmp_path: Path) -> Path:
+    """A lab with one capturable VM whose name contains a space.
+
+    `LabVm.name` has no charset validator (`Field(min_length=1)` only),
+    so this is reachable from real lab YAML. It exists to pin the scp
+    remote-operand quoting fix: `scp`'s `host:path` operand is
+    shell-interpreted on the REMOTE side, and a bare space in that
+    operand makes scp report "ambiguous target" -- functionally breaking
+    `fetch` for a legal VM name while every other capture verb (which
+    never builds a `host:path` operand) keeps working.
+    """
+    config_dir = tmp_path / "config"
+    shutil.copytree(CONFIG_DIR, config_dir)
+    (config_dir / "labs" / "spaced-droid.yaml").write_text(
+        dedent(
+            """
+            apiVersion: playground/v1
+            kind: Lab
+            metadata:
+              name: spaced-droid
+            spec:
+              backend: local-libvirt
+              networks:
+                - name: lab-net
+                  profile: nat
+                  cidr: 10.77.0.0/24
+              vms:
+                - name: droid one
+                  role: redroid-host
+                  networks: [lab-net]
+            """
+        ).lstrip("\n")
+    )
+    return config_dir
+
+
+def test_fetch_quotes_the_scp_remote_path_for_a_vm_name_with_a_space(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """The `user@host:path` scp operand is shell-interpreted on the
+    REMOTE side (see `_scp_one` in `app_commands.py`). Only the path
+    half may be quoted -- the `user@host` half must stay bare -- and the
+    unquoted bug reproduces with nothing more exotic than a VM name
+    containing a space.
+    """
+    config_dir = _spaced_vm_name_config(tmp_path)
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    scp_bin = write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "spaced-droid",
+         "--config-dir", str(config_dir), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+
+    assert result.exit_code == 0, result.output
+    scp_log = (tmp_path / "scp.log").read_text()
+    expected_path = shlex.quote("/var/lib/playground/capture/droid one/.")
+    expected_source = f"ubuntu@127.0.0.1:{expected_path}"
+    assert expected_source in scp_log.splitlines(), scp_log
+    # The user@host half must stay bare -- quoting it too would break
+    # scp's own `user@host` parsing.
+    assert "'ubuntu@127.0.0.1" not in scp_log
+
+
+def test_fetch_clean_refuses_when_the_guest_reports_active(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """`--clean` must ask the GUEST whether the unit is still active
+    before deleting anything -- not the local session record, which can
+    legitimately be absent while a capture is running (a second
+    operator, or a `playground reset` that scrubbed it).
+
+    If the operator forgot `stop` before `fetch --clean` (the natural
+    mistake -- the example lab's own header teaches start -> install ->
+    stop -> fetch), `sudo -n rm -f <dir>/*.pcap*` would unlink the file
+    tcpdump still has open: data lost, disk still consumed, nothing
+    reported. The transfer must still be reported a success -- only the
+    cleanup is refused.
+    """
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="active")
+    scp_bin = write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "redroid-cloud", "--clean",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr)
+    assert "runtime.capture.still_running" in output
+
+    # The pcaps DID arrive -- only cleanup was refused.
+    runs = list((tmp_path / ".playground" / "runs").iterdir())
+    assert len(runs) == 1
+    assert (runs[0] / "artifacts" / "capture" / "droid1").is_dir()
+
+    # No `rm` was ever sent to the guest.
+    log = (tmp_path / "ssh.log").read_text()
+    assert "rm -f" not in log
+
+
+def test_fetch_clean_still_removes_when_the_guest_reports_inactive(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """The normal case: `stop` already ran, the guest reports `inactive`,
+    and `--clean` proceeds exactly as before."""
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="inactive")
+    scp_bin = write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "redroid-cloud", "--clean",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+
+    assert result.exit_code == 0, result.output
+    log = (tmp_path / "ssh.log").read_text()
+    assert "sudo -n rm -f" in log
+
+
 def test_start_starts_the_instanced_unit(
     tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
 ) -> None:

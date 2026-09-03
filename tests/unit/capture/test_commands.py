@@ -12,6 +12,7 @@ import shlex
 from playground.capture.commands import (
     CAPTURE_DIR,
     clean_cmd,
+    is_active_cmd,
     remote_capture_dir,
     start_cmd,
     status_cmd,
@@ -161,6 +162,30 @@ def test_clean_cmd_globs_all_rotated_pcap_suffixes() -> None:
     cmd = clean_cmd("droid1")
     assert "*.pcap*" in cmd
     assert "*.pcap'" not in cmd
+
+
+def test_is_active_cmd_never_fails_on_an_inactive_unit() -> None:
+    """`systemctl is-active` exits non-zero for an inactive unit -- a
+    normal reportable state here, not an error -- so the probe must
+    `|| true` to keep the ssh call's exit code meaning "the probe ran",
+    leaving the actual state to be read from stdout.
+    """
+    cmd = is_active_cmd("droid1")
+    assert "systemctl is-active" in cmd
+    assert cmd.rstrip().endswith("|| true")
+    assert "playground-capture@droid1.service" in cmd
+
+
+def test_is_active_cmd_cannot_become_a_second_command() -> None:
+    """The hostile substring is absorbed into one quoted token -- tokens
+    from a real shell's word-splitting must never surface `touch` or
+    `/tmp/OWNED` on their own."""
+    nasty = "x; touch /tmp/OWNED"
+    cmd = is_active_cmd(nasty)
+    assert shlex.quote(unit_name(nasty)) in cmd
+    tokens = shlex.split(cmd)
+    assert "touch" not in tokens
+    assert "/tmp/OWNED" not in tokens
 
 
 def test_clean_cmd_cannot_become_a_second_command() -> None:

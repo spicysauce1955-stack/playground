@@ -527,10 +527,17 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   a hardcoded value" shape this doc warns about.
 - Provisioning (the `capture` Ansible role) installs `tcpdump`, the
   wrapper, and the instanced unit, and converges to unit
-  enabled-but-**stopped**. It never starts, stops, or restarts a
-  session — `playground apply` on a lab that is mid-capture leaves the
-  recording untouched. Sessions start only via `playground capture
-  start`.
+  installed-but-**stopped** — it is never `enable`d. It never starts,
+  stops, or restarts a session — `playground apply` on a lab that is
+  mid-capture leaves the recording untouched. Sessions start only via
+  `playground capture start`. Not enabling is deliberate (an enabled
+  instance would start recording at boot, violating "provisioning never
+  starts a session"), and it has a consequence nobody wrote down before
+  now: **a guest reboot does not resume a capture that was running
+  before it.** The operator's session record still claims the capture
+  is running; `capture status` will show `state=inactive`. The recovery
+  is `capture stop` (a no-op against the guest that only clears the
+  stale local record) followed by `capture start`.
 - `spec.capture.enabled: false` does not skip the `needs_capture` play —
   the host is still a member of that group. It skips *inside* the role,
   via its own `ansible.builtin.meta: end_host` guard, evaluated right
