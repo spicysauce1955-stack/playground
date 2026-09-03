@@ -80,6 +80,147 @@ def test_wrapper_fails_loudly_on_ambiguous_or_absent_container() -> None:
         assert token in wrapper.lower()
 
 
+def test_wrapper_does_not_exec_tcpdump_directly() -> None:
+    """The wrapper must be a WATCHDOG, not a one-shot `exec` into
+    tcpdump: measured live, tcpdump does not die when the container it
+    entered restarts (its own presence keeps the orphaned namespace
+    alive), so something has to stay alive to notice and restart the
+    session. `exec`ing into tcpdump would replace the wrapper's own
+    process image, leaving nothing behind to watch for that."""
+    wrapper = WRAPPER.read_text()
+    assert "exec nsenter" not in wrapper, (
+        "the wrapper must background tcpdump (so it can keep watching), "
+        "not exec into it"
+    )
+    # It must still background the SAME invocation, ending in `&`.
+    assert "-W \"{{ capture_max_files }}\" &" in wrapper
+    assert "tcpdump_pid=$!" in wrapper, "must capture tcpdump's own PID after backgrounding it"
+
+
+def test_wrapper_installs_a_term_trap() -> None:
+    """`systemctl stop` must still let tcpdump flush its savefile
+    cleanly. `KillMode=control-group` already SIGTERMs tcpdump directly
+    as part of the whole cgroup, but the wrapper's own trap is
+    belt-and-braces documented as deliberate, not an oversight."""
+    wrapper = WRAPPER.read_text()
+    # The real `trap` invocation, not prose that happens to mention the
+    # word "trap" in a comment while the actual builtin call is missing.
+    assert "trap cleanup TERM INT" in wrapper
+    assert "kill -TERM \"$tcpdump_pid\"" in wrapper
+
+
+def test_wrapper_polls_and_compares_netns() -> None:
+    """The watchdog must periodically re-derive the container's CURRENT
+    netns and compare it against the one recorded at its own start --
+    that comparison, not container death, is what must trigger a
+    restart (measured live: the container's restart does not kill
+    tcpdump, so nothing else would ever notice)."""
+    wrapper = WRAPPER.read_text()
+    assert "ns_at_start=$(readlink" in wrapper
+    assert '[ "$ns_now" != "$ns_at_start" ]' in wrapper
+
+
+def test_wrapper_checks_tcpdump_liveness_every_second_not_every_five() -> None:
+    """MAJOR regression this guards against: if tcpdump dies immediately
+    (bad `-i`, an AppArmor denial, an unwritable savefile path) and
+    liveness is only checked on the same ~5s cadence as the netns check,
+    the wrapper -- and so the unit -- still reads `active` at
+    `start_cmd`'s 2s `is-active` probe, and `capture start` reports
+    success for a capture that already died. Liveness must be checked
+    on a ~1s cadence, decoupled from the (expensive, two-`docker`-fork)
+    netns check."""
+    wrapper = WRAPPER.read_text()
+    assert "sleep 1" in wrapper
+    assert "sleep 5" not in wrapper, (
+        "a literal 5s sleep would put liveness detection back on the "
+        "netns-check cadence, reintroducing the dead-child regression"
+    )
+
+
+def test_wrapper_gates_the_netns_check_behind_a_five_tick_counter() -> None:
+    """The netns check forks `docker` twice and must not run every ~1s
+    liveness tick -- it must run roughly every 5th tick (~5s), via an
+    explicit counter, not via its own sleep."""
+    wrapper = WRAPPER.read_text()
+    assert "poll_tick=$((poll_tick + 1))" in wrapper
+    assert "[ $((poll_tick % 5)) -eq 0 ] || continue" in wrapper
+    # Ordering, not just presence: the modulo gate must sit BETWEEN the
+    # liveness check and the netns re-derivation, or the "only every 5th
+    # tick" claim is false regardless of what the counter says.
+    liveness_idx = wrapper.index('kill -0 "$tcpdump_pid" 2>/dev/null || break')
+    gate_idx = wrapper.index("[ $((poll_tick % 5)) -eq 0 ] || continue")
+    netns_idx = wrapper.index("ns_now=$(current_netns)")
+    assert liveness_idx < gate_idx < netns_idx
+
+
+def test_wrapper_exits_nonzero_on_a_netns_change() -> None:
+    """A netns mismatch must make the wrapper exit NON-ZERO -- that is
+    what makes systemd's `Restart=always` re-exec it against the new
+    container, which is the only place the new PID gets re-resolved.
+    Assert the exit sits inside the mismatch branch, not merely
+    somewhere in the file (the discovery-failure paths above also exit
+    1, for a different reason)."""
+    wrapper = WRAPPER.read_text()
+    marker = '[ "$ns_now" != "$ns_at_start" ]'
+    idx = wrapper.index(marker)
+    branch = wrapper[idx : idx + 600]
+    assert "kill -TERM" in branch
+    assert "exit 1" in branch
+
+
+def test_wrapper_tolerates_a_transiently_missing_container_while_polling() -> None:
+    """A container that is momentarily absent mid-restart (recreated,
+    not just `docker restart`ed) must NOT crash the watchdog -- it must
+    keep polling, because the container may be coming back. Only an
+    ACTUAL netns change may end the loop."""
+    wrapper = WRAPPER.read_text()
+    # The actual line, not a substring so loose it can never fail: this
+    # is what turns "current_netns() failed" into "keep polling" rather
+    # than letting `set -e` end the watchdog.
+    assert "ns_now=$(current_netns) || continue" in wrapper
+    # The re-discovery helper must not itself abort the script on a
+    # zero/ambiguous match -- it returns non-zero instead of `exit`ing.
+    poll_fn = wrapper[wrapper.index("current_netns()") : wrapper.index("current_netns()") + 900]
+    assert "exit 1" not in poll_fn, (
+        "the polling-time discovery helper must return, never exit, on a "
+        "transiently unresolvable container"
+    )
+
+
+def test_wrapper_propagates_tcpdumps_own_exit_status() -> None:
+    """If tcpdump exits on its own (OOM-killed, crashed) the wrapper
+    must not swallow that -- systemd (and `capture status`) should see
+    the real outcome."""
+    wrapper = WRAPPER.read_text()
+    assert 'wait "$tcpdump_pid"' in wrapper
+    assert "status=$?" in wrapper
+    assert 'exit "$status"' in wrapper
+
+
+def test_wrapper_writes_the_netns_marker_under_run_not_the_capture_dir() -> None:
+    """`capture status` reads this marker independently of the watchdog
+    to detect a stale capture even if the watchdog itself has crashed.
+    It must live under /run (tmpfs -- vanishes on reboot like a running
+    capture does) and NOT inside the per-VM capture directory, which
+    `capture fetch` copies wholesale as artifacts."""
+    wrapper = WRAPPER.read_text()
+    assert 'marker_dir="/run/playground-capture"' in wrapper
+    assert 'marker="${marker_dir}/${vm}.netns"' in wrapper
+    # A real bite, not a regex written as a literal substring (which can
+    # never fail): pull the actual `marker_dir=` assignment out of the
+    # script and check ITS value, so a future edit that rederives the
+    # marker path from `$dir` (the per-VM capture directory `capture
+    # fetch` copies wholesale) fails this test.
+    marker_dir_line = next(
+        line.strip()
+        for line in wrapper.splitlines()
+        if line.strip().startswith("marker_dir=")
+    )
+    assert marker_dir_line == 'marker_dir="/run/playground-capture"'
+    assert "$dir" not in marker_dir_line
+    assert "capture_dir" not in marker_dir_line
+
+
 def test_unit_is_instanced_and_restarts() -> None:
     unit = UNIT.read_text()
     # Assert the functional directives, not prose that happens to mention

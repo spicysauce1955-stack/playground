@@ -10,10 +10,40 @@
 # The PID is resolved HERE, at every start, not baked in by Ansible: the
 # Redroid container runs `restart_policy: unless-stopped`, so its PID
 # changes across restarts and a provision-time PID goes stale.
+#
+# This script is a WATCHDOG, not a one-shot `exec` into tcpdump --
+# measured live, `nsenter --net tcpdump ...` does NOT die when the
+# container it entered restarts. `nsenter --net` moves tcpdump INTO the
+# container's network namespace, and tcpdump's own presence there keeps
+# that namespace alive after every one of the container's own processes
+# is gone. So on a `docker restart`, tcpdump keeps running untouched,
+# systemd's `Restart=always` never fires (nothing died), and the old
+# tcpdump sits in an orphaned, disconnected namespace capturing nothing
+# while `systemctl is-active` still says `active`. That is the bug this
+# watchdog exists to close: it launches tcpdump in the background,
+# checks tcpdump's own liveness roughly every 1s (so a tcpdump that dies
+# immediately -- a bad `-i`, an AppArmor denial, an unwritable savefile
+# path -- is caught well before `playground capture start`'s 2s
+# `is-active` probe, instead of leaving that probe reading a lying
+# `active`), and every 5th tick also polls the container's CURRENT netns
+# against the one observed at start. When the netns differs, it stops
+# tcpdump itself and exits NON-ZERO so that `Restart=always` is what
+# re-execs this script against the new PID -- minting a new `${stamp}`
+# base name, which is the intended, visible discontinuity.
 set -eu
 
 vm="$1"
 dir="{{ capture_dir }}/${vm}"
+
+# The netns marker `playground capture status` reads to detect a stale
+# capture independently of this watchdog (a safety net for a crashed
+# watchdog, or a future regression -- see
+# src/playground/capture/commands.py's status_cmd). Deliberately under
+# /run (tmpfs), NOT under "$dir": /run disappears on reboot exactly like
+# a running capture does, and `capture fetch` copies "$dir" wholesale --
+# a marker living there would show up as a bogus "artifact".
+marker_dir="/run/playground-capture"
+marker="${marker_dir}/${vm}.netns"
 
 ids=$(docker ps --filter "name=^{{ capture_container_prefix }}" --format '{% raw %}{{.ID}}{% endraw %}')
 count=$(printf '%s\n' "$ids" | grep -c . || true)
@@ -35,10 +65,69 @@ fi
 
 mkdir -p "$dir"
 
+# Record this start's netns identity BEFORE launching tcpdump, so the
+# poll loop below (and `capture status`) have a baseline to compare
+# against. readlink, not the raw inode number: the "net:[nnnnn]" form is
+# what changes when the kernel actually tears down and recreates the
+# namespace, and comparing the strings verbatim needs no parsing.
+ns_at_start=$(readlink "/proc/${pid}/ns/net")
+
+mkdir -p "$marker_dir"
+chmod 0755 "$marker_dir"
+printf '%s\n' "$ns_at_start" > "$marker"
+chmod 0644 "$marker"
+
 # tcpdump applies strftime() to -w ONLY when -G is set; with -C it copies
 # the name verbatim and appends a rotation counter. So the stamp is
 # computed here, not delegated to tcpdump.
 stamp=$(date -u +%Y%m%d-%H%M%S)
+
+# Re-discover the container's CURRENT netns, non-fatally. Returns the
+# "net:[nnnnn]" string on stdout, or exits 1 with nothing on stdout if
+# the container cannot be resolved right now (zero or several name
+# matches, no PID, or the PID's /proc entry is already gone). Callers
+# MUST treat a non-zero return as "unknown, try again later", never as
+# "the container is gone for good" -- it may be mid-restart and about to
+# come back, and a false "the container is gone" here must never crash
+# the watchdog (that would defeat the whole point: a transient gap in
+# `docker ps` output would kill the very process meant to survive
+# restarts).
+current_netns() {
+    # `timeout 10` on both docker calls: a wedged daemon must not be
+    # able to block staleness detection (and so the whole poll loop)
+    # indefinitely -- a hung `docker ps`/`docker inspect` here would
+    # otherwise stall this function forever, and this function's
+    # failure is exactly what the poll loop's `|| continue` is built to
+    # tolerate.
+    poll_ids=$(timeout 10 docker ps --filter "name=^{{ capture_container_prefix }}" --format '{% raw %}{{.ID}}{% endraw %}' 2>/dev/null) || return 1
+    poll_count=$(printf '%s\n' "$poll_ids" | grep -c . || true)
+    if [ "$poll_count" -ne 1 ]; then
+        return 1
+    fi
+    poll_pid=$(timeout 10 docker inspect -f '{% raw %}{{.State.Pid}}{% endraw %}' "$poll_ids" 2>/dev/null) || return 1
+    if [ -z "$poll_pid" ] || [ "$poll_pid" = "0" ]; then
+        return 1
+    fi
+    readlink "/proc/${poll_pid}/ns/net" 2>/dev/null || return 1
+}
+
+tcpdump_pid=""
+
+# TERM/INT -> forward to tcpdump and wait for it, so `systemctl stop`
+# still lets tcpdump flush its savefile cleanly rather than being killed
+# out from under itself. Belt-and-braces, not the only path: the unit's
+# default KillMode=control-group already SIGTERMs tcpdump directly, as
+# part of the whole cgroup, independently of this trap (see
+# playground-capture@.service.j2). Exits 0 -- a requested stop is not a
+# failure, and must not make systemd think the wrapper crashed.
+cleanup() {
+    if [ -n "$tcpdump_pid" ] && kill -0 "$tcpdump_pid" 2>/dev/null; then
+        kill -TERM "$tcpdump_pid" 2>/dev/null || true
+        wait "$tcpdump_pid" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap cleanup TERM INT
 
 # -Z root: Debian/Ubuntu tcpdump drops privileges to the `tcpdump` user
 #   by default and then cannot write into this root-owned directory.
@@ -52,9 +141,69 @@ stamp=$(date -u +%Y%m%d-%H%M%S)
 # a global cap on the directory. That is the deliberate trade: one fixed
 # name would keep a global cap but silently TRUNCATE the previous
 # session's data on every container restart, losing data and hiding it.
-exec nsenter --target "$pid" --net \
+#
+# Backgrounded, not `exec`ed: this script must stay alive to watch the
+# container across restarts. nsenter execve()s into tcpdump without
+# forking, so $! below is tcpdump's own PID, not nsenter's.
+nsenter --target "$pid" --net \
     tcpdump -i any -U -Z root \
         -s "{{ capture_snaplen }}" \
         -w "${dir}/${stamp}.pcap" \
         -C "{{ capture_max_file_mb }}" \
-        -W "{{ capture_max_files }}"
+        -W "{{ capture_max_files }}" &
+tcpdump_pid=$!
+
+# Check tcpdump's own liveness every ~1s -- decoupled from the netns
+# check, which stays at ~5s. This matters: `playground capture start`
+# sleeps 2s after `systemctl start` and requires the unit to be
+# `active` before it will trust it (see start_cmd's docstring). If
+# tcpdump dies immediately (bad `-i`, `-Z`/AppArmor denial, an
+# unwritable savefile path) and this loop only noticed once every 5s,
+# the wrapper -- and so the unit -- would still read `active` at that
+# 2s mark, and `start` would report success for a capture that already
+# died. Checking liveness every ~1s instead means a dead tcpdump ends
+# this loop well before that 2s probe fires. `kill -0` as the while
+# condition is exempt from `set -e` (it is a compound-command test,
+# like `if`), so a dead tcpdump ends the loop instead of killing the
+# script.
+poll_tick=0
+while kill -0 "$tcpdump_pid" 2>/dev/null; do
+    sleep 1
+
+    # tcpdump may have exited during the sleep; re-check before doing
+    # any more work this iteration.
+    kill -0 "$tcpdump_pid" 2>/dev/null || break
+
+    # The netns check forks `docker` twice (ps + inspect) and is not
+    # worth doing every second -- only run it on every 5th liveness
+    # tick, so it still runs roughly every 5s while tcpdump death is
+    # still caught within ~1s.
+    poll_tick=$((poll_tick + 1))
+    [ $((poll_tick % 5)) -eq 0 ] || continue
+
+    # `|| continue` absorbs a transient "can't resolve the container"
+    # failure -- see current_netns()'s contract above -- rather than
+    # letting `set -e` end the watchdog over a container that is simply
+    # mid-restart.
+    ns_now=$(current_netns) || continue
+
+    if [ -n "$ns_now" ] && [ "$ns_now" != "$ns_at_start" ]; then
+        echo "capture: ${vm}'s container moved to a new network namespace (${ns_at_start} -> ${ns_now}); stopping this session so systemd restarts against the new container" >&2
+        kill -TERM "$tcpdump_pid" 2>/dev/null || true
+        wait "$tcpdump_pid" 2>/dev/null || true
+        # Non-zero and deliberate: this is what makes Restart=always
+        # re-exec the wrapper, which re-resolves the new PID and mints a
+        # fresh ${stamp}.
+        exit 1
+    fi
+done
+
+# tcpdump exited on its own (killed OOM, crashed, whatever) -- propagate
+# its exit status rather than swallowing it. `set +e`/`set -e` around
+# `wait` avoids `set -e` ending the script on this line before `status`
+# is captured, on every shell this is validated against (sh, bash, dash).
+set +e
+wait "$tcpdump_pid"
+status=$?
+set -e
+exit "$status"

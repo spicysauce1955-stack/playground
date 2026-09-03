@@ -27,6 +27,41 @@ CAPTURE_DIR = "/var/lib/playground/capture"
 `ansible/roles/capture/defaults/main.yml` -- the two are one contract."""
 
 
+CONTAINER_PREFIX = "redroid_"
+"""Container-name prefix `capture-start.j2` uses to discover the Redroid
+container's PID (`capture_container_prefix` in
+`ansible/roles/capture/defaults/main.yml`). Duplicated here for the same
+reason `CAPTURE_DIR` is duplicated from `capture_dir`: `status_cmd` has
+to independently re-discover the container's CURRENT netns from a plain
+guest shell to detect a stale capture (see its docstring), and there is
+no channel to hand a Jinja default across the Ansible/Python boundary.
+Unlike the role's own `redroid_{{ inventory_hostname | regex_replace(...)
+}}` naming expression -- deliberately NOT duplicated, per
+`capture_container_prefix`'s own comment -- this is a plain string
+constant, so the duplication is cheap. Pinned by
+`test_ansible_and_python_agree_on_the_guest_contract`."""
+
+NETNS_MARKER_DIR = "/run/playground-capture"
+"""Where the wrapper (`capture-start.j2`) records the container's netns
+identity at every unit start. Under `/run` (tmpfs) so it disappears on
+reboot exactly like a running capture does, and deliberately NOT under
+`CAPTURE_DIR` -- `capture fetch` copies that whole directory and the
+marker is not a capture artifact."""
+
+
+def _netns_marker_path(vm: str) -> str:
+    """Guest-side path of the netns marker `status_cmd` reads.
+
+    Routed through the same traversal guard as `remote_capture_dir` even
+    though nothing here does a destructive operation on it, purely so a
+    VM name rejected everywhere else in this module is rejected here
+    too, rather than quietly building a path that reads some other VM's
+    marker.
+    """
+    _reject_path_traversal(vm)
+    return f"{NETNS_MARKER_DIR}/{vm}.netns"
+
+
 def unit_name(vm: str) -> str:
     """Return the systemd unit name for a VM.
 
@@ -134,18 +169,64 @@ def status_cmd(vm: str) -> str:
     creates it.
 
     The glob is `*.pcap*`, not `*.pcap`: tcpdump's `-C` rotation appends a
-    counter to whatever `-w` names, so the files on disk are
-    `<stamp>.pcap0`, `<stamp>.pcap1`, ... A bare `*.pcap` glob matches none
-    of them, which would silently report `files=0 bytes=0` for a healthy,
-    actively recording session.
+    counter to whatever `-w` names, ZERO-PADDED to the width of `-W`'s
+    argument -- with `max_files: 40` the files on disk are observed as
+    `<stamp>.pcap00` ... `<stamp>.pcap39`, not `<stamp>.pcap0` /
+    `<stamp>.pcap1`. A bare `*.pcap` glob matches none of them, which
+    would silently report `files=0 bytes=0` for a healthy, actively
+    recording session -- hence `*.pcap*`, which matches any width.
+
+    `state=active` is not, on its own, proof the capture is actually
+    recording. Measured live: `nsenter --net` moves tcpdump INTO the
+    container's network namespace, and tcpdump's own presence there
+    keeps that namespace alive after a Redroid container restart --
+    tcpdump does not die, `Restart=always` never fires, and a stale
+    tcpdump can sit in an orphaned namespace capturing nothing while the
+    unit still reports `active`. `capture-start.j2` is now a watchdog
+    that polls for exactly this and self-heals within roughly 5 seconds
+    by exiting non-zero so systemd restarts it -- so THIS check is a
+    safety net for a crashed watchdog or a future regression, not the
+    primary defence. When (and only when) the unit is `active`, this
+    also re-derives the container's CURRENT netns independently (its own
+    `docker ps` / `docker inspect` / `readlink /proc/<pid>/ns/net`, run
+    under `sudo -n` since the container's init typically runs as root
+    and an unprivileged reader cannot otherwise resolve another user's
+    namespace symlink) and compares it against the marker the wrapper
+    wrote at its own most recent start (`NETNS_MARKER_DIR`). A mismatch
+    -- including "the marker exists but the container can no longer be
+    resolved at all" -- reports `state=stale` instead of `state=active`.
+    Skipped entirely when the unit is not `active` or the marker does
+    not exist yet, so a host running an old wrapper, or one that has
+    never had a session, behaves exactly as before this check existed.
     """
     unit = shlex.quote(unit_name(vm))
     directory = shlex.quote(remote_capture_dir(vm))
+    marker = shlex.quote(_netns_marker_path(vm))
+    name_filter = shlex.quote(f"name=^{CONTAINER_PREFIX}")
+    staleness_check = "".join(
+        [
+            f'if [ "$state" = active ] && [ -r {marker} ]; then ',
+            f"mns=$(cat {marker} 2>/dev/null || true); ",
+            f"cids=$(docker ps --filter {name_filter} --format "
+            "'{{.ID}}' 2>/dev/null || true); ",
+            "ccount=$(printf '%s\\n' \"$cids\" | grep -c . || true); ",
+            'if [ "$ccount" -eq 1 ]; then ',
+            "cpid=$(docker inspect -f '{{.State.Pid}}' \"$cids\" "
+            "2>/dev/null || true); ",
+            "else cpid=; fi; ",
+            'if [ -n "$cpid" ] && [ "$cpid" != 0 ]; then ',
+            'cns=$(sudo -n readlink "/proc/$cpid/ns/net" 2>/dev/null || true); ',
+            "else cns=; fi; ",
+            '[ -n "$mns" ] && [ "$mns" != "$cns" ] && state=stale; ',
+            "fi; ",
+        ]
+    )
     return (
         f"state=$(systemctl is-active {unit} 2>/dev/null || true); "
         f"files=$(find {directory} -maxdepth 1 -name '*.pcap*' 2>/dev/null | wc -l); "
         f"bytes=$(find {directory} -maxdepth 1 -name '*.pcap*' -printf '%s\\n' "
         "2>/dev/null | awk '{t+=$1} END {print t+0}'); "
+        f"{staleness_check}"
         'printf "state=%s files=%s bytes=%s\\n" "$state" "$files" "$bytes"'
     )
 

@@ -4,16 +4,30 @@
 # changed=0.
 #
 # This role itself must never start, stop, or restart a capture session
-# -- it never touches a recording that is already in progress. But that
-# is a claim about THIS role only: `ansible/site.yml` runs the `redroid`
-# role's play before this one's, and if THAT play recreates the Redroid
-# container (image/tag change, `docker-compose up` restart, etc.) it
-# tears down the network namespace tcpdump is attached to. The unit's
-# `Restart=always` then re-execs the wrapper against the new namespace
-# under a fresh `${stamp}`, so `playground apply` on a lab that is
-# mid-capture can still interrupt the session and start a new pcap base
-# name -- it just never does so from this role's own tasks. Sessions are
-# started only by `playground capture start`.
+# -- it never touches a recording that is already in progress. Confirmed
+# live: a re-apply against an already-converged capture-enabled host
+# reported changed=0 across all 41 tasks, did not recreate the Redroid
+# container, and did not disturb a running capture (same container id,
+# same unit MainPID, still recording throughout).
+#
+# But "never touches a recording" is a claim about THIS role only:
+# `ansible/site.yml` runs the `redroid` role's play before this one's,
+# and if THAT play recreates the Redroid container (image/tag change,
+# `docker-compose up` restart, etc.) the running session goes stale --
+# measured live, the container's OWN restart does NOT kill tcpdump or
+# make the unit exit (nsenter --net moved tcpdump INTO the container's
+# netns, and tcpdump's own presence there keeps that netns alive after
+# the container's processes are gone, so nothing dies and
+# `Restart=always` never fires on its own). What actually recovers it is
+# the wrapper's own watchdog loop (`capture-start.j2`): it polls the
+# container's current netns against the one it saw at its last start,
+# and once it notices a mismatch it stops tcpdump itself and exits
+# non-zero, which is what makes `Restart=always` re-exec the wrapper
+# against the new PID under a fresh `${stamp}`. So `playground apply` on
+# a lab that is mid-capture CAN still interrupt the session -- self-
+# healing within roughly one poll interval (~5s) rather than
+# immediately -- it just never does so from this role's own tasks.
+# Sessions are started only by `playground capture start`.
 #
 # Not enabling the unit is deliberate, not an oversight: an enabled
 # instance would start recording at boot, violating "provisioning never
@@ -110,9 +124,12 @@
     # regardless of this directory's mode, so a 0750 parent is
     # incoherent -- it blocks traversal while the contents underneath are
     # world-readable anyway. status_cmd's two `find` calls and `capture
-    # fetch`'s `scp` are both deliberately unprivileged (only start/stop
-    # go through sudo), so the `ubuntu` user genuinely needs to traverse
-    # this directory to read anything back.
+    # fetch`'s `scp` stay deliberately unprivileged -- start/stop/clean go
+    # through sudo, and so, now, does status_cmd's ONE netns-staleness
+    # probe (`sudo -n readlink` on the container's /proc/<pid>/ns/net,
+    # which an unprivileged reader cannot otherwise resolve) -- so the
+    # `ubuntu` user genuinely needs to traverse this directory to read
+    # anything back.
     mode: "0755"
 
 - name: Create the playground lib directory
