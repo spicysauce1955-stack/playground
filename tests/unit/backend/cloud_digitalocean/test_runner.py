@@ -24,6 +24,7 @@ from playground.backend.cloud_digitalocean.runner import (
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
 from playground.events import EventBus
+from playground.models.diagnostic import Diagnostic
 from playground.runs import StepResult
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,7 @@ def _install_shims(
     list_droplets_return: list[dict[str, Any]] | None = None,
     list_droplets_survivors: list[dict[str, Any]] | None = None,
     verify_token_status: int = 200,
+    size_region_diagnostics: list[Diagnostic] | None = None,
 ) -> list[str]:
     """Install shimmed versions of all runner-imported callables.
 
@@ -223,7 +225,17 @@ def _install_shims(
     def fake_verify_token(token: str) -> int:
         return verify_token_status
 
+    def fake_check_size_region_availability(
+        token, *, lab_name, size, region
+    ) -> list[Diagnostic]:
+        steps_called.append("cloud-preflight-size-check")
+        return list(size_region_diagnostics or [])
+
     monkeypatch.setattr(f"{MOD}.verify_token", fake_verify_token)
+    monkeypatch.setattr(
+        f"{MOD}.check_size_region_availability",
+        fake_check_size_region_availability,
+    )
     monkeypatch.setattr(f"{MOD}.run_tofu_init", fake_run_tofu_init)
     monkeypatch.setattr(f"{MOD}.run_tofu_apply", fake_run_tofu_apply)
     monkeypatch.setattr(f"{MOD}.run_tofu_destroy", fake_run_tofu_destroy)
@@ -1284,3 +1296,107 @@ def test_apply_transport_error_proceeds_to_tofu_init(
     assert run.status == "succeeded"
     assert "tofu-init" in steps_called
     assert "tofu-apply" in steps_called
+
+
+# ===========================================================================
+# Size/region preflight — cloud-preflight step, runs after token validation
+# ===========================================================================
+
+
+def test_apply_with_size_unavailable_in_region_fails_before_tofu_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """When check_size_region_availability reports an error, execute_apply
+    must fail the cloud-preflight step and must NOT call run_tofu_init or
+    run_tofu_apply — this is the whole point of the check: catch the DO
+    `422 Size is not available in this region` before spending an apply
+    cycle on it."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    size_diag = Diagnostic(
+        id="runtime.cloud.size_unavailable_in_region",
+        severity="error",
+        message=(
+            "lab 'cloud-smoke': DigitalOcean size 's-4vcpu-8gb' is not "
+            "currently available in region 'nyc3'; it IS currently "
+            "available in: ams3, nyc1"
+        ),
+        suggestion="set spec.providers.cloud-digitalocean.region to one of: ams3, nyc1",
+    )
+    steps_called = _install_shims(
+        monkeypatch, size_region_diagnostics=[size_diag],
+    )
+
+    run, diags = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+    assert run is not None
+    assert run.status == "failed"
+
+    diag_ids = [d.id for d in diags]
+    assert "runtime.cloud.size_unavailable_in_region" in diag_ids
+
+    assert "cloud-preflight-size-check" in steps_called
+    assert "tofu-init" not in steps_called, (
+        "tofu-init must not run when the size/region preflight check fails"
+    )
+    assert "tofu-apply" not in steps_called, (
+        "tofu-apply must not run when the size/region preflight check fails"
+    )
+
+    step_names = [s.name for s in run.steps]
+    assert "cloud-preflight" in step_names
+    preflight_step = next(s for s in run.steps if s.name == "cloud-preflight")
+    assert preflight_step.exit_code != 0
+
+    # Token value must not appear in any diagnostic.
+    for d in diags:
+        assert FAKE_TOKEN not in (d.message or "")
+        assert FAKE_TOKEN not in (d.suggestion or "")
+
+
+def test_apply_with_size_check_warning_proceeds_to_tofu_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_cloud_smoke,
+    source_root: Path,
+    ansible_dir: Path,
+) -> None:
+    """When check_size_region_availability degrades to a warning (API
+    unreachable / malformed response), execute_apply must NOT block and
+    must proceed to tofu-init — a preflight blip must never break an
+    otherwise-valid apply."""
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    warning_diag = Diagnostic(
+        id="runtime.cloud.size_check_unavailable",
+        severity="warning",
+        message="could not verify size availability (API status 0)",
+    )
+    steps_called = _install_shims(
+        monkeypatch, size_region_diagnostics=[warning_diag],
+    )
+
+    run, diags = execute_apply(
+        resolved=resolved_cloud_smoke,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+    assert run is not None
+    assert run.status == "succeeded"
+    assert "tofu-init" in steps_called
+    assert "tofu-apply" in steps_called
+    diag_ids = [d.id for d in diags]
+    assert "runtime.cloud.size_unavailable_in_region" not in diag_ids

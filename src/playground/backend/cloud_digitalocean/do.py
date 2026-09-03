@@ -192,6 +192,142 @@ def delete_droplet(
     ]
 
 
+def check_size_region_availability(
+    token: str,
+    *,
+    lab_name: str,
+    size: str,
+    region: str,
+) -> list[Diagnostic]:
+    """Preflight check: is ``size`` currently available in ``region``?
+
+    DigitalOcean size/region availability is **not static** — capacity moves
+    over time (a size can be pulled from one region and added to another
+    within the same day), so this queries the live ``GET /v2/sizes`` list
+    instead of consulting any hardcoded allowlist.
+
+    Returns:
+    - ``[]`` when the size exists, is available, and lists ``region``.
+    - ``[error Diagnostic]`` (id ``runtime.cloud.size_unavailable_in_region``)
+      when the API confirms the size does not exist, is not available at
+      all, or is not available in ``region``. The message names the regions
+      where the size IS currently available so the operator can fix the lab
+      in one edit.
+    - ``[warning Diagnostic]`` (id ``runtime.cloud.size_check_unavailable``)
+      when the API could not be reached or returned an unexpected shape.
+      This check must NEVER hard-fail an apply on a transient DigitalOcean
+      blip or transport error — a preflight that breaks applies when the API
+      has a hiccup is worse than the 422 it is trying to prevent, so any
+      inconclusive result degrades to a warning and lets the apply proceed.
+
+    The token value is never logged or included in any Diagnostic.
+    """
+    status, body = _request(
+        "GET",
+        "/v2/sizes",
+        token,
+        params={"per_page": 200},
+        timeout=8,
+    )
+    if status == 0 or status >= 300:
+        return [
+            Diagnostic(
+                id="runtime.cloud.size_check_unavailable",
+                severity="warning",
+                message=(
+                    f"lab {lab_name!r}: could not verify whether size "
+                    f"{size!r} is available in region {region!r} "
+                    f"(DigitalOcean sizes API returned status {status}); "
+                    "proceeding without this check"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "verify manually with `doctl compute size list` or at "
+                    "https://cloud.digitalocean.com/droplets/new"
+                ),
+            )
+        ]
+
+    sizes = body.get("sizes")
+    if not isinstance(sizes, list):
+        return [
+            Diagnostic(
+                id="runtime.cloud.size_check_unavailable",
+                severity="warning",
+                message=(
+                    f"lab {lab_name!r}: DigitalOcean sizes API response had "
+                    "unexpected shape (missing 'sizes' list); proceeding "
+                    "without this check"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+            )
+        ]
+
+    match: dict[str, Any] | None = None
+    for entry in sizes:
+        if isinstance(entry, dict) and entry.get("slug") == size:
+            match = entry
+            break
+
+    if match is None:
+        return [
+            Diagnostic(
+                id="runtime.cloud.size_unavailable_in_region",
+                severity="error",
+                message=(
+                    f"lab {lab_name!r}: DigitalOcean size {size!r} was not "
+                    "found in the live sizes list; it cannot be provisioned "
+                    f"in region {region!r}"
+                ),
+                source=SourceLocation(
+                    path="spec.providers.cloud-digitalocean.size"
+                ),
+                suggestion=(
+                    "check for typos, or list current slugs with "
+                    "`doctl compute size list`"
+                ),
+            )
+        ]
+
+    available_regions = sorted(
+        r for r in (match.get("regions") or []) if isinstance(r, str)
+    )
+    is_available = bool(match.get("available", False))
+
+    if is_available and region in available_regions:
+        return []
+
+    if available_regions:
+        region_list = ", ".join(available_regions)
+        message = (
+            f"lab {lab_name!r}: DigitalOcean size {size!r} is not currently "
+            f"available in region {region!r}; it IS currently available in: "
+            f"{region_list}"
+        )
+        suggestion = (
+            "set spec.providers.cloud-digitalocean.region to one of: "
+            f"{region_list}"
+        )
+    else:
+        message = (
+            f"lab {lab_name!r}: DigitalOcean size {size!r} is not currently "
+            f"available in any region (requested region was {region!r})"
+        )
+        suggestion = "choose a different size slug; see `doctl compute size list`"
+
+    return [
+        Diagnostic(
+            id="runtime.cloud.size_unavailable_in_region",
+            severity="error",
+            message=message,
+            source=SourceLocation(
+                path="spec.providers.cloud-digitalocean.region"
+            ),
+            suggestion=suggestion,
+        )
+    ]
+
+
 def verify_token(token: str) -> int:
     """Probe ``GET /v2/account`` to verify the token is accepted by the API.
 
@@ -236,6 +372,7 @@ def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
 __all__ = [
     "CONSOLE_URL",
     "DEFAULT_TOKEN_ENV",
+    "check_size_region_availability",
     "delete_droplet",
     "droplet_summary",
     "list_droplets_by_tag",

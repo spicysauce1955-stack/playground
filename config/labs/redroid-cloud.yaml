@@ -55,7 +55,7 @@ spec:
       # time -- this exact pairing provisioned successfully on 2026-08-31
       # and was rejected hours later -- so confirm with
       # `doctl compute size list --output json` before changing either.
-      region: nyc1
+      region: nyc3
       # The redroid-host role asks for 4 vCPU / 8 GB / 60 GB. DigitalOcean
       # applies ONE size slug to every Droplet in the lab, so this slug —
       # not the role's resources block — is what actually provisions.

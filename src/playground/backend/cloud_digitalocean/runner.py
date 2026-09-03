@@ -29,6 +29,7 @@ from typing import Any
 
 from playground.backend.cloud_digitalocean.do import (
     CONSOLE_URL,
+    check_size_region_availability,
     delete_droplet,
     droplet_summary,
     list_droplets_by_tag,
@@ -454,6 +455,56 @@ def _provision(
                         ),
                     },
                 )
+
+            # Size/region availability check — a LIVE query, not a static
+            # allowlist, because DigitalOcean capacity moves (a size can be
+            # pulled from one region and added to another within the same
+            # day). Runs after credential validation so a bad size/region
+            # pairing is caught here instead of after tofu-init has already
+            # spent an apply cycle reaching a `422 Size is not available in
+            # this region` from `tofu apply`. A network failure or malformed
+            # API response must NOT block the apply — it degrades to a
+            # warning (see check_size_region_availability) so a DigitalOcean
+            # API blip never breaks an otherwise-valid apply.
+            size_diags = check_size_region_availability(
+                preflight_token,
+                lab_name=lab,
+                size=plan.size,
+                region=plan.region,
+            )
+            size_errors = [d for d in size_diags if d.severity == "error"]
+            size_warnings = [d for d in size_diags if d.severity != "error"]
+            for d in size_warnings:
+                bus.publish(
+                    run.run_id, "log_line",
+                    {
+                        "step": "cloud-preflight",
+                        "line": f"WARNING: {d.message}",
+                    },
+                )
+
+            if size_errors:
+                preflight_log.write_text(
+                    f"# cloud-preflight: status={preflight_status}\n"
+                    + "\n".join(f"# {d.message}" for d in size_errors)
+                    + "\n"
+                )
+                preflight_step = _step(
+                    "cloud-preflight", exit_code=1, log_path=preflight_log,
+                    started=_iso_now(),
+                )
+                steps.append(preflight_step)
+                bus.publish(
+                    run.run_id, "step_finished",
+                    {"step": "cloud-preflight", "exit_code": 1},
+                )
+                return _finalize_failure(
+                    run, run_dir, steps, bus, size_errors,
+                    f"credential preflight failed: size {plan.size!r} is "
+                    f"not available in region {plan.region!r} for lab "
+                    f"{lab!r}",
+                )
+
             preflight_log.write_text(
                 f"# cloud-preflight: status={preflight_status}\n"
             )
