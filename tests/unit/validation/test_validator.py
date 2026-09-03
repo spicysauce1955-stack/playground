@@ -399,7 +399,9 @@ def test_budget_exceeded_is_error_in_strict_mode(committed_load: LoadedConfig) -
     )
     committed_load.labs[bad.metadata.name] = bad
 
-    diagnostics = validate(committed_load)
+    # Scope to the injected lab. config/labs/ may hold untracked operator
+    # labs, and one that also exceeds its budget would make this count 2.
+    diagnostics = validate(committed_load, lab=bad.metadata.name)
 
     matching = [d for d in diagnostics if d.id == "config.budget.exceeded"]
     assert len(matching) == 1
@@ -456,7 +458,9 @@ def test_budget_inherits_from_defaults_when_lab_omits_it(
     )
     committed_load.labs[bad.metadata.name] = bad
 
-    diagnostics = validate(committed_load)
+    # Scope to the injected lab. config/labs/ may hold untracked operator
+    # labs, and one that also exceeds its budget would make this count 2.
+    diagnostics = validate(committed_load, lab=bad.metadata.name)
 
     matching = [d for d in diagnostics if d.id == "config.budget.exceeded"]
     assert len(matching) == 1
@@ -496,7 +500,9 @@ def test_budget_exceeded_warns_in_permissive_mode(committed_load: LoadedConfig) 
     )
     committed_load.labs[bad.metadata.name] = bad
 
-    diagnostics = validate(committed_load)
+    # Scope to the injected lab. config/labs/ may hold untracked operator
+    # labs, and one that also exceeds its budget would make this count 2.
+    diagnostics = validate(committed_load, lab=bad.metadata.name)
 
     matching = [d for d in diagnostics if d.id == "config.budget.exceeded"]
     assert len(matching) == 1

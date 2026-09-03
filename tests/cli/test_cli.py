@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -459,8 +460,35 @@ def test_doctor_passes_ssh_key_override(monkeypatch: pytest.MonkeyPatch) -> None
     assert captured["ssh_key_path"] == Path("/tmp/key.pub")
 
 
-def test_validate_committed_config_succeeds() -> None:
-    result = CliRunner().invoke(app, ["validate", "--config-dir", str(CONFIG_DIR)])
+def _committed_config_dir(tmp_path: Path) -> Path:
+    """Materialise config/ from git-TRACKED files only.
+
+    This test asserts an exact diagnostic count, so it must see the
+    committed tree and nothing else. Operators drop untracked labs into
+    config/labs/ (the repo's own lab-list test calls this out and asserts a
+    subset for exactly that reason); each one adds its own diagnostics and
+    silently breaks the count here. A permanently red baseline is worse
+    than the brittleness it signals, because it hides the NEXT regression.
+    """
+    listing = subprocess.run(  # noqa: S603
+        ["git", "ls-files", "config"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    )
+    dest = tmp_path / "config"
+    for rel in listing.stdout.split():
+        src = REPO_ROOT / rel
+        if not src.is_file():
+            continue
+        out = dest / Path(rel).relative_to("config")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(src.read_bytes())
+    return dest
+
+
+def test_validate_committed_config_succeeds(tmp_path: Path) -> None:
+    config_dir = _committed_config_dir(tmp_path)
+
+    result = CliRunner().invoke(app, ["validate", "--config-dir", str(config_dir)])
 
     assert result.exit_code == 0
     # generic-infra has docker1 with explicit per-VM resources, so the
