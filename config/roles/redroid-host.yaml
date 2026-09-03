@@ -22,6 +22,7 @@ spec:
     compose: true
     swarm: true
     redroid: true
+    capture: true
   provisioners:
     # The resolver list-replaces provisioners on `extends`, so we
     # re-list docker explicitly. Order matters: docker first (redroid
