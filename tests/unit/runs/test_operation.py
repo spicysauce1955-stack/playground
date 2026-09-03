@@ -91,3 +91,13 @@ def test_operation_run_round_trips_through_json(tmp_path: Path) -> None:
     rebuilt = OperationRun.model_validate_json((run_dir / "run.json").read_text())
 
     assert rebuilt == finished
+
+
+def test_capture_is_an_allowed_operation(tmp_path) -> None:
+    """`capture fetch` writes artifacts, so it gets a run record and
+    shows up in `playground runs list` like every other operation."""
+    from playground.runs.operation import start_run
+
+    run, run_dir = start_run(tmp_path / "runs", "capture", "redroid-cloud")
+    assert run.operation == "capture"
+    assert (run_dir / "run.json").is_file()

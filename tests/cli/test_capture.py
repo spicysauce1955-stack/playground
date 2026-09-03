@@ -8,8 +8,11 @@ about reaching DigitalOcean.
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import shutil
+import stat
 from pathlib import Path
 from textwrap import dedent
 
@@ -305,3 +308,214 @@ def test_stop_all_skips_a_device_with_no_record_but_stops_the_rest(
     assert "sudo -n systemctl stop" in log
     assert "playground-capture@droid1.service" in log
     assert read_session(state_dir, "two-droids", "droid1") is None
+
+
+def test_fetch_scps_the_guest_capture_directory(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    scp_bin = write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+    assert result.exit_code == 0, result.output
+    scp_log = (tmp_path / "scp.log").read_text()
+    assert "-r" in scp_log, "the guest capture directory is a directory"
+    assert "/var/lib/playground/capture/droid1" in scp_log
+    # The pcaps land as a run artifact, so `runs list` can find them.
+    runs = list((tmp_path / ".playground" / "runs").iterdir())
+    assert len(runs) == 1
+    assert (runs[0] / "run.json").is_file()
+    assert (runs[0] / "artifacts" / "capture" / "droid1").is_dir()
+
+
+def test_fetch_leaves_the_guest_copy_in_place_by_default(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """A failed transfer must not be able to destroy the only copy, so
+    removal is opt-in via --clean."""
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    scp_bin = write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+    assert not (tmp_path / "ssh.log").exists(), (
+        "fetch must not touch the guest's shell when --clean was not passed"
+    )
+
+
+def test_fetch_all_reports_the_working_device_when_one_fails(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """One device's scp failing must not swallow the other's success.
+
+    This exact fan-out shape (per-target failure among several targets)
+    was the site of a real defect in the previous task -- the whole
+    batch used to abort on one bad target. It is correct here (traced,
+    not just asserted), but shipping the highest-risk path with no
+    regression coverage is how that defect comes back.
+    """
+    config_dir = _two_device_config(tmp_path)
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+
+    # A per-target scp shim: the destination path carries the VM name
+    # (`artifacts/<vm>`), so branching on argv content picks out droid2
+    # without touching droid1's transfer. `write_scp_shim` (conftest)
+    # can only fail uniformly for every invocation, so this shim is
+    # local to this test rather than a new conftest factory.
+    scp_dir = tmp_path / "scpbin"
+    scp_dir.mkdir()
+    scp = scp_dir / "scp"
+    scp.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" >> {shlex.quote(str(tmp_path / "scp.log"))}\n'
+        'case "$*" in\n'
+        "  *droid2*) exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    scp.chmod(scp.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_dir}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--all", "--lab", "two-droids",
+         "--config-dir", str(config_dir), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr)
+    # droid1's success was reported despite droid2 failing alongside it.
+    assert "[droid1] pcaps →" in output
+
+    runs = list((tmp_path / ".playground" / "runs").iterdir())
+    assert len(runs) == 1
+    run_record = json.loads((runs[0] / "run.json").read_text())
+    assert run_record["status"] == "failed"
+    assert (runs[0] / "artifacts" / "capture" / "droid1").is_dir()
+    # The summary is what `playground runs show` prints back later: a
+    # transfer failure must be counted there, so it says 1/2, not 2/2.
+    assert "1/2" in run_record["summary"]
+
+
+def test_fetch_clean_failure_is_reported_as_a_failure(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """The operator explicitly asked for cleanup and did not get it. The
+    pcaps are safely on disk either way (fetch itself succeeded), but a
+    guest-side `rm` failure (misconfigured sudoers, permissions) must
+    not be swallowed behind an exit-0 run recorded `succeeded` -- that
+    would tell the operator cleanup happened when it did not.
+    """
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=1)
+    scp_bin = write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "redroid-cloud", "--clean",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr)
+    assert "guest-side cleanup failed" in output
+
+    # The pcaps ARE on disk -- only the guest-side cleanup failed, so
+    # nothing about the transfer itself should look like a failure.
+    runs = list((tmp_path / ".playground" / "runs").iterdir())
+    assert len(runs) == 1
+    assert (runs[0] / "artifacts" / "capture" / "droid1").is_dir()
+    run_record = json.loads((runs[0] / "run.json").read_text())
+    assert run_record["status"] == "failed"
+    # The transfer succeeded -- only cleanup failed -- so the summary
+    # must say the pcaps WERE fetched (1/1), never 0/1, and must call
+    # out the cleanup failure so `playground runs show` doesn't read as
+    # a lost capture.
+    summary = run_record["summary"]
+    assert "1/1" in summary
+    assert "0/1" not in summary
+    assert "cleanup" in summary
+
+
+def test_fetch_writes_a_log_file_for_runs_show_on_failure(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """`log_path` must point at a real log FILE under the run's `logs/`
+    directory, not the artifact directory -- `runs_show_command` prints
+    `log_path` expecting a diagnostic file, and the failure case (a
+    dead scp) is exactly the one an operator will go looking for via
+    `playground runs show`.
+    """
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    scp_bin = write_scp_shim(tmp_path, exit_code=1)
+    monkeypatch.setenv(
+        "PATH",
+        f"{scp_bin}{os.pathsep}{ssh_bin}{os.pathsep}{bin_dir}"
+        f"{os.pathsep}{os.environ['PATH']}",
+    )
+    monkeypatch.setattr(capture_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["capture", "fetch", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / ".playground")],
+    )
+
+    assert result.exit_code == 1
+    runs = list((tmp_path / ".playground" / "runs").iterdir())
+    assert len(runs) == 1
+    run_dir = runs[0]
+    run_record = json.loads((run_dir / "run.json").read_text())
+    log_path = Path(run_record["steps"][0]["log_path"])
+    # Under logs/, not artifacts/ -- and not the artifact directory itself.
+    assert log_path.parent == run_dir / "logs"
+    assert log_path.is_file()
+    assert "exit 1" in log_path.read_text()

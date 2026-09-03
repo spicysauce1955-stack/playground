@@ -126,3 +126,20 @@ def status_cmd(vm: str) -> str:
         "2>/dev/null | awk '{t+=$1} END {print t+0}'); "
         'printf "state=%s files=%s bytes=%s\\n" "$state" "$files" "$bytes"'
     )
+
+
+def clean_cmd(vm: str) -> str:
+    """Remove a device's captured pcaps from the guest.
+
+    The directory is quoted but the glob is deliberately left outside the
+    quotes, so the guest's shell still expands `*.pcap*` while a VM name
+    containing a space or a metacharacter cannot split the path or start a
+    second command -- this one runs `rm -f` under `sudo -n`, so it is the
+    highest-consequence string this module builds.
+
+    `*.pcap*`, not `*.pcap`: tcpdump's `-C` rotation appends a counter to
+    whatever `-w` names, so the files on disk are `<stamp>.pcap0`,
+    `<stamp>.pcap1`, ... A bare `*.pcap` glob matches none of them and
+    `--clean` would silently delete nothing while reporting success.
+    """
+    return f"sudo -n rm -f {shlex.quote(remote_capture_dir(vm))}/*.pcap*"

@@ -11,6 +11,7 @@ import shlex
 
 from playground.capture.commands import (
     CAPTURE_DIR,
+    clean_cmd,
     remote_capture_dir,
     start_cmd,
     status_cmd,
@@ -149,3 +150,27 @@ def test_status_glob_matches_tcpdumps_rotation_suffix() -> None:
     cmd = status_cmd("droid1")
     assert "'*.pcap*'" in cmd
     assert "'*.pcap'" not in cmd
+
+
+def test_clean_cmd_globs_all_rotated_pcap_suffixes() -> None:
+    """tcpdump's `-C` rotation appends a counter to whatever `-w` names,
+    so the files on disk are `<stamp>.pcap0`, `<stamp>.pcap1`, ... A bare
+    `*.pcap` glob matches none of them, which would make `--clean` report
+    success while silently deleting nothing.
+    """
+    cmd = clean_cmd("droid1")
+    assert "*.pcap*" in cmd
+    assert "*.pcap'" not in cmd
+
+
+def test_clean_cmd_cannot_become_a_second_command() -> None:
+    """This one runs `rm -f` as root, so a VM name that escapes the path
+    is the worst case in this module. The glob must stay expandable while
+    the directory stays a single token.
+    """
+    nasty = "x; touch /tmp/OWNED"
+    cmd = clean_cmd(nasty)
+    assert "; touch /tmp/OWNED/*.pcap*" not in cmd
+    assert shlex.quote(f"/var/lib/playground/capture/{nasty}") in cmd
+    assert cmd.endswith("/*.pcap*")  # glob outside the quotes, still expandable
+

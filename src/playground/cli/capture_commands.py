@@ -15,6 +15,7 @@ not yet have defined them at the point it imports `capture_app`.
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -24,7 +25,14 @@ import typer
 from playground.android.runner import TargetResult, run_on_targets
 from playground.android.targets import AndroidTarget
 from playground.backend.dispatch import query_status
-from playground.capture.commands import start_cmd, status_cmd, stop_cmd, unit_name
+from playground.capture.commands import (
+    clean_cmd,
+    remote_capture_dir,
+    start_cmd,
+    status_cmd,
+    stop_cmd,
+    unit_name,
+)
 from playground.capture.state import (
     CaptureSession,
     clear_session,
@@ -34,6 +42,8 @@ from playground.capture.state import (
 from playground.capture.targets import resolve_capture_targets
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
+from playground.runs.operation import StepResult, finish_run, start_run
+from playground.ssh.argv import build_scp_argv
 from playground.validation import validate as validate_loaded_config
 
 
@@ -406,4 +416,140 @@ def status_command(
             )
         if not result.ok:
             failed.append(target.vm_name)
+    _exit_for_failures(failed, len(targets))
+
+
+_FETCH_TIMEOUT = 300.0
+"""A 1 GB ring over a cloud VM's uplink is not a 30-second transfer."""
+
+
+@capture_app.command("fetch", help="Copy captured pcaps into a run artifact directory.")
+def fetch_command(
+    lab: LabOpt = None,
+    on: OnOpt = None,
+    role: RoleOpt = None,
+    all_devices: AllOpt = False,
+    user: UserOpt = "ubuntu",
+    clean: Annotated[
+        bool,
+        typer.Option(
+            "--clean",
+            help="Remove the guest-side pcaps after a successful transfer.",
+        ),
+    ] = False,
+    config_dir: ConfigDirOpt = Path("config"),
+    tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
+) -> None:
+    """Pull each device's pcap directory into this run's artifacts.
+
+    Recorded as an operation run so the pcaps are addressable later
+    (`playground runs list`) rather than landing in whatever directory
+    the operator happened to be standing in.
+
+    The guest copy is left in place unless `--clean`: a failed scp must
+    never be able to destroy the only copy of a capture.
+    """
+    lab_name, _resolved, targets = _resolve(
+        lab=lab, on=on, role=role, all_devices=all_devices, user=user,
+        config_dir=config_dir, tofu_dir=tofu_dir,
+    )
+
+    run, run_dir = start_run(state_dir / "runs", "capture", lab_name)
+    artifacts = run_dir / "artifacts" / "capture"
+    logs_dir = run_dir / "logs"
+    steps: list[StepResult] = []
+    # Two different questions, two different lists: "did the operator get
+    # everything they asked for?" (the exit code, `failed` = both lists
+    # combined) vs. "how many devices' pcaps were actually fetched?" (the
+    # persisted summary, which must count only transfer failures --
+    # counting a cleanup failure there would print "fetched capture from
+    # 0/1" for a run whose pcaps DID arrive and only cleanup afterward
+    # failed).
+    fetch_failed: list[str] = []
+    clean_failed: list[str] = []
+
+    for target in targets:
+        destination = artifacts / target.vm_name
+        destination.mkdir(parents=True, exist_ok=True)
+        started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+        source = (
+            f"{target.ssh_user}@{target.ssh_host}:"
+            f"{remote_capture_dir(target.vm_name)}/."
+        )
+        argv = build_scp_argv(
+            source, str(destination), port=target.ssh_port, recursive=True
+        )
+        try:
+            completed = subprocess.run(  # noqa: S603
+                argv, capture_output=True, text=True, check=False,
+                timeout=_FETCH_TIMEOUT,
+            )
+            code = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            code, stdout, stderr = 1, "", str(exc)
+
+        # A `.log` file under the run's `logs/` directory, not the
+        # artifact directory itself: `runs_show_command` prints
+        # `log_path` expecting a diagnostic FILE (every other StepResult
+        # producer in this repo follows that convention), and a failed
+        # scp's stderr is exactly what `playground runs show` exists to
+        # surface later. Written on failure too -- that is the case
+        # someone will actually go looking for.
+        log_path = logs_dir / f"fetch-{target.vm_name}.log"
+        log_path.write_text(
+            f"$ {' '.join(argv)}\n"
+            f"exit {code}\n"
+            f"--- stdout ---\n{stdout}"
+            f"--- stderr ---\n{stderr}"
+        )
+
+        steps.append(
+            StepResult(
+                name=f"capture-fetch:{target.vm_name}",
+                command=list(argv),
+                exit_code=code,
+                log_path=str(log_path),
+                started_at=started_at,
+                finished_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+            )
+        )
+        if code != 0:
+            typer.echo(f"[{target.vm_name}] fetch failed: {stderr.strip()}", err=True)
+            fetch_failed.append(target.vm_name)
+            continue
+        typer.echo(f"[{target.vm_name}] pcaps → {destination}")
+        if clean:
+            removal = run_on_targets(
+                [target], clean_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
+            )[0]
+            _echo(removal)
+            if not removal.ok:
+                typer.echo(
+                    f"[{target.vm_name}] pcaps were fetched successfully, but the "
+                    f"guest-side cleanup failed — the capture directory on the "
+                    f"guest still holds them",
+                    err=True,
+                )
+                clean_failed.append(target.vm_name)
+
+    failed = fetch_failed + clean_failed
+    fetched = len(targets) - len(fetch_failed)
+    summary = f"fetched capture from {fetched}/{len(targets)} device(s)"
+    if clean_failed:
+        summary += (
+            f"; guest-side cleanup failed on {len(clean_failed)} "
+            "(pcaps remain on the guest)"
+        )
+
+    finish_run(
+        run,
+        run_dir,
+        status="failed" if failed else "succeeded",
+        steps=steps,
+        summary=summary,
+    )
+    typer.echo(f"  run: {run.run_id}")
     _exit_for_failures(failed, len(targets))
