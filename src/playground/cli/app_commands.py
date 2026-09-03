@@ -696,7 +696,15 @@ def ui_dump_command(
     _exit_for_failures(failed, len(targets))
 
 
-@app_app.command("logcat", help="Dump or follow the Android log.")
+_VALID_LOG_PRIORITIES = ("V", "D", "I", "W", "E", "F")
+"""adb logcat's own priority letters (Verbose/Debug/Info/Warn/Error/Fatal).
+
+`S` (silent) is deliberately excluded: it is not a *minimum* priority
+(the meaning `--priority` documents) — it hides everything, which reads
+as a bug report ("nothing shows up") rather than a filter."""
+
+
+@app_app.command("logcat", help="Dump, follow, filter, or clear the Android log.")
 def logcat_command(
     follow: Annotated[
         bool, typer.Option("--follow", "-f", help="Stream instead of dumping the buffer.")
@@ -704,6 +712,39 @@ def logcat_command(
     lines: Annotated[
         int | None, typer.Option("--lines", "-n", help="Limit the dump to the last N lines.")
     ] = None,
+    package: Annotated[
+        str | None,
+        typer.Option(
+            "--package",
+            help=(
+                "Only show this package's output. Resolves its pid ON THE "
+                "DEVICE via `pidof`; if the app is not running, fails with "
+                "a clear message instead of an empty filter."
+            ),
+        ),
+    ] = None,
+    tag: Annotated[
+        str | None,
+        typer.Option(
+            "--tag", help="Only show this log tag (`logcat -s TAG:LEVEL`; silences the rest)."
+        ),
+    ] = None,
+    priority: Annotated[
+        str | None,
+        typer.Option(
+            "--priority", help="Minimum priority to show: V, D, I, W, E, or F (case-insensitive)."
+        ),
+    ] = None,
+    clear: Annotated[
+        bool,
+        typer.Option(
+            "--clear",
+            help=(
+                "Clear the log buffer and exit without dumping anything. "
+                "Cannot be combined with any other logcat flag."
+            ),
+        ),
+    ] = False,
     lab: LabOpt = None,
     on: OnOpt = None,
     role: RoleOpt = None,
@@ -712,6 +753,47 @@ def logcat_command(
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
 ) -> None:
+    # `--clear` is a distinct operation (wipe, don't read) that ignores
+    # every other logcat flag by construction (`logcat_cmd` short-circuits
+    # on it) — combining it with a filter or --follow/--lines reads as the
+    # caller expecting BOTH a clear AND a dump/stream in one call, which
+    # this single adb invocation cannot do. Reject up front rather than
+    # silently discarding whichever flag `logcat_cmd` would have ignored.
+    if clear and (
+        follow or lines is not None or package is not None or tag is not None
+        or priority is not None
+    ):
+        _fail(
+            Diagnostic(
+                id="config.app.logcat_clear_exclusive",
+                severity="error",
+                message=(
+                    "--clear cannot be combined with --follow, --lines, "
+                    "--package, --tag, or --priority"
+                ),
+                source=SourceLocation(path="<argv>"),
+                suggestion=(
+                    "run `playground app logcat --clear` on its own, then a "
+                    "separate `playground app logcat ...` call to read fresh output"
+                ),
+            )
+        )
+    if priority is not None:
+        normalized = priority.upper()
+        if normalized not in _VALID_LOG_PRIORITIES:
+            _fail(
+                Diagnostic(
+                    id="config.app.invalid_priority",
+                    severity="error",
+                    message=(
+                        f"--priority {priority!r} is not valid; choose one of "
+                        + ", ".join(_VALID_LOG_PRIORITIES)
+                    ),
+                    source=SourceLocation(path="<argv>"),
+                    suggestion="pass one of V, D, I, W, E, F (case-insensitive)",
+                )
+            )
+        priority = normalized
     # `--all` means "every device" regardless of how many exist today, and
     # a live stream cannot multiplex — reject the combination up front
     # rather than only when a second device happens to be applied later.
@@ -742,7 +824,9 @@ def logcat_command(
                 suggestion="pass --on <vm>",
             )
         )
-    command = logcat_cmd(follow=follow, lines=lines)
+    command = logcat_cmd(
+        follow=follow, lines=lines, package=package, tag=tag, priority=priority, clear=clear
+    )
     if follow:
         _stream(targets[0], command)
     else:
@@ -857,7 +941,16 @@ def pull_command(
 @app_app.command(
     "shell",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-    help="Run a raw `adb shell` command — the escape hatch for anything not covered above.",
+    help=(
+        "Run a raw `adb shell` command — the escape hatch for anything not "
+        "covered above. Each word after `--` is quoted individually (same as "
+        "`playground exec`), so it reaches the device as ONE argv, not "
+        "something a shell re-splits on your behalf: a pipeline or "
+        "redirection written directly (`... -- ps | grep x`) is passed "
+        "through literally and fails with 'inaccessible or not found', "
+        "because there is no shell on the device to interpret `|`. Invoke "
+        "one explicitly instead: `playground app shell -- sh -c 'ps | grep x'`."
+    ),
 )
 def shell_command(
     ctx: typer.Context,

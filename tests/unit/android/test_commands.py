@@ -244,3 +244,127 @@ def test_stop_verifies_the_process_is_actually_gone() -> None:
     assert "am force-stop com.x" in cmd
     assert "pidof com.x" in cmd
     assert "exit 0" in cmd
+
+
+# --- logcat filtering: --package / --tag / --priority / --clear ---
+
+
+def test_logcat_clear_uses_dash_c_and_ignores_other_flags() -> None:
+    """`--clear` maps straight to `adb logcat -c`; any other flag values
+    passed alongside it are irrelevant because the CLI layer rejects that
+    combination before this builder is ever called (see app_commands.py)."""
+    cmd = logcat_cmd(follow=False, lines=None, clear=True)
+    assert cmd == f"{adb_prefix()} logcat -c"
+
+
+def test_logcat_tag_uses_dash_s_with_default_verbose_priority() -> None:
+    cmd = logcat_cmd(follow=False, lines=None, tag="ActivityManager")
+    assert "-s ActivityManager:V" in cmd
+
+
+def test_logcat_tag_and_priority_combine_into_one_filterspec() -> None:
+    cmd = logcat_cmd(follow=False, lines=None, tag="ActivityManager", priority="e")
+    assert "-s ActivityManager:E" in cmd
+
+
+def test_logcat_priority_alone_uses_the_wildcard_tag() -> None:
+    """No `-s` (default-to-silent) filterspec flag without a `--tag` --
+    only `adb -s <serial>` (device selection) should appear."""
+    cmd = logcat_cmd(follow=False, lines=None, priority="w")
+    assert "*:W" in cmd
+    assert "logcat -s" not in cmd
+    assert " -s *:W" not in cmd
+
+
+def test_logcat_package_resolves_pid_via_pidof_on_the_device() -> None:
+    """`adb logcat` cannot resolve a package name to a pid itself, and the
+    CLI/guest side cannot know the device's pid table -- `pidof` must run
+    ON THE DEVICE, inside the same quoted script `adb shell` hands to
+    /system/bin/sh -c (the same double-hop hazard `launch_cmd` guards
+    against), not as a separate guest-side computation."""
+    cmd = logcat_cmd(follow=False, lines=None, package="com.example.app")
+    assert "pidof com.example.app" in cmd
+    assert '--pid="$PID"' in cmd
+    assert cmd.count("shell ") == 1
+    tail = cmd.split("shell ", 1)[1]
+    assert tail.startswith("'"), "device script must be quoted as one arg"
+
+
+def test_logcat_package_not_running_exits_with_a_clear_message() -> None:
+    """A malformed `--pid=` (empty pid) must never reach `logcat`; the
+    device-side script instead reports the app is not running and exits
+    non-zero itself."""
+    cmd = logcat_cmd(follow=False, lines=None, package="com.example.app")
+    assert "is not running" in cmd
+    assert "exit 1" in cmd
+
+
+def test_logcat_package_dump_mode_keeps_dash_d_and_tails_matching_lines() -> None:
+    """Dump mode keeps -d, but --lines must NOT become `-t N`: on Redroid 11
+    `-t N` applies the pid filter to the last N RAW lines and returns
+    nothing when the newest lines belong to another process. Verified live
+    2026-09-03."""
+    cmd = logcat_cmd(follow=False, lines=50, package="com.x")
+    argv = _simulate_device_argv(cmd)
+    assert "-d" in argv
+    assert "-t" not in argv, "-t N filters the wrong side of the pipe"
+    assert "tail" in argv
+    assert "50" in argv
+
+
+def test_logcat_package_follow_mode_omits_dash_d() -> None:
+    cmd = logcat_cmd(follow=True, lines=None, package="com.x")
+    argv = _simulate_device_argv(cmd)
+    assert "-d" not in argv
+
+
+def test_logcat_package_combines_with_tag_and_priority() -> None:
+    cmd = logcat_cmd(follow=False, lines=None, package="com.x", tag="MyTag", priority="i")
+    assert '--pid="$PID"' in cmd
+    assert "-s MyTag:I" in cmd
+
+
+def test_priority_filterspec_is_quoted_against_guest_globbing() -> None:
+    """`*:W` is interpreted by the GUEST shell for the plain `adb logcat`
+    form. Unquoted, a file matching `*:W` in the ssh working directory
+    would glob-expand and silently rewrite the filter."""
+    cmd = logcat_cmd(follow=False, lines=None, priority="W")
+    assert "'*:W'" in cmd or '"*:W"' in cmd, f"unquoted glob in: {cmd}"
+
+
+def test_tag_filterspec_is_quoted() -> None:
+    cmd = logcat_cmd(follow=False, lines=None, tag="My Tag", priority="E")
+    assert "'My Tag:E'" in cmd
+
+
+def test_lines_with_a_filter_tails_matching_lines_not_raw_lines() -> None:
+    """LIVE BUG 2026-09-03: `logcat -t N -s TAG:V` applies the filter to the
+    last N RAW lines, so it returns nothing whenever the newest lines are
+    not the tag's -- silently defeating the filter. Verified on Redroid 11:
+    `-t 5 -s Zygote:V` gave only the header while the unfiltered buffer was
+    full of Zygote lines. --lines must mean the last N MATCHING lines."""
+    cmd = logcat_cmd(follow=False, lines=5, tag="Zygote")
+    assert "-t 5" not in cmd, "-t N filters the wrong side"
+    assert "tail -n 5" in cmd
+    assert "-s" in cmd and "Zygote:V" in cmd
+
+
+def test_lines_with_priority_filter_also_tails() -> None:
+    cmd = logcat_cmd(follow=False, lines=3, priority="E")
+    assert "-t 3" not in cmd
+    assert "tail -n 3" in cmd
+
+
+def test_lines_without_a_filter_still_uses_the_cheap_protocol_form() -> None:
+    """No filter means no pipe is needed, so stay on the plain adb logcat
+    form rather than paying for a device shell."""
+    cmd = logcat_cmd(follow=False, lines=5)
+    assert "-t 5" in cmd
+    assert "tail -n" not in cmd
+
+
+def test_follow_never_tails() -> None:
+    """A stream has no last N lines to seek to."""
+    cmd = logcat_cmd(follow=True, lines=None, tag="X")
+    assert "tail -n" not in cmd
+    assert "-d" not in cmd

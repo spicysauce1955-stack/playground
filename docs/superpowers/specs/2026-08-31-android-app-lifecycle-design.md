@@ -514,3 +514,51 @@ A successful SPLIT install. Telegram from APKPure is a single universal
 APK. `.apkm`/`.xapk` bundles exist in the same download directory and
 would exercise `install-multiple` properly, but bundle extraction is the
 `bundletool` path this spec explicitly deferred.
+
+## Log reading and remote commands, validated 2026-09-03
+
+`playground app shell` and `playground app logcat` both existed and were
+exercised throughout the Telegram run. Filtering was added afterwards
+because the unfiltered buffer is unusable in practice: a live device
+running Telegram produced 531 log lines, of which 57 were Telegram's.
+
+New flags on `logcat`: `--package PKG`, `--tag TAG`, `--priority LEVEL`,
+and `--clear`. `shell`'s help now documents that arguments are quoted
+individually (like `exec`), so a pipeline needs `-- sh -c '...'`.
+
+| Check | Result |
+|---|---|
+| `--package` on a running app | 531 lines -> 34, all from Telegram's pid |
+| `--package` on a stopped app | clear "is not running" message, exit 1 |
+| `--package` on an absent package | same, no malformed `--pid=` |
+| `--tag Zygote --lines 3` | 3 real Zygote lines |
+| `--priority E --lines 3` | 3 real error lines |
+| `--clear` | buffer 2816 lines -> 15 |
+| **`--follow`** | **streamed 149 lines with arrivals spread over 18s** |
+
+### A bug this found, invisible without a device
+
+`logcat -t N` applies a filterspec to the last N **raw** lines, not the
+last N **matching** lines. So `--tag Zygote --lines 5` returned nothing at
+all while the unfiltered buffer was full of Zygote lines -- the filter was
+silently defeated by the exact flag combination a user reaching for
+filtering would try first. Confirmed directly on device:
+
+    logcat -d -s Zygote:V        -> Zygote lines
+    logcat -d -t 5 -s Zygote:V   -> only the header
+
+When a filter is in play, `--lines` now means the last N matching lines,
+implemented as a device-side `logcat -d <filter> | tail -n N`. With no
+filter it stays on the cheaper `adb logcat -t N` protocol form that needs
+no device shell.
+
+Also fixed pre-emptively: the `*:LEVEL` filterspec was unquoted, so the
+GUEST shell would glob it against the ssh working directory. A file
+matching `*:W` there would have silently rewritten the filter.
+
+### `--follow` was implemented correctly but had never been run
+
+It routes through a separate `_stream()` that inherits stdio with no
+timeout, rather than the capturing fan-out runner. That looked right on
+inspection, but "looks right" is not evidence -- the timestamped arrival
+spread above is.

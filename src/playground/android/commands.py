@@ -149,12 +149,116 @@ def ui_dump_cmd(remote_path: str) -> str:
     return adb_shell(f"uiautomator dump {shlex.quote(remote_path)}")
 
 
-def logcat_cmd(*, follow: bool, lines: int | None) -> str:
+def _logcat_filterspec(*, tag: str | None, priority: str | None) -> list[str]:
+    """Build the trailing filterspec tokens shared by both logcat forms.
+
+    `-s TAG:LEVEL` sets the default filter to silent (`-s`) and then adds
+    one filterspec for `TAG` at `LEVEL` -- exactly the "show only this
+    tag" idiom `--tag` promises. Priority defaults to V(erbose) so a bare
+    `--tag` shows everything for that tag, matching the CLI help text
+    ("`logcat -s TAG:V` style"). Without a tag, `*:LEVEL` sets every tag's
+    minimum priority without silencing anything, which is the right
+    default for a bare `--priority`.
+
+    Uppercased here (not just at the CLI layer) because this builder is
+    unit-tested directly and must produce the same shape regardless of
+    the case the caller passed in.
+    """
+    if tag is not None:
+        level = (priority or "V").upper()
+        return ["-s", shlex.quote(f"{tag}:{level}")]
+    if priority is not None:
+        # Quote the `*`: for the plain `adb logcat` form this string is
+        # interpreted by the GUEST shell, which would glob it against the
+        # ssh working directory. A stray file matching `*:W` there would
+        # silently rewrite the filter.
+        return [shlex.quote(f"*:{priority.upper()}")]
+    return []
+
+
+def _logcat_package_cmd(
+    package: str, *, follow: bool, lines: int | None, tag: str | None, priority: str | None
+) -> str:
+    """Filter logcat to one package by resolving its pid ON THE DEVICE.
+
+    `adb logcat` (the plain protocol form `logcat_cmd` otherwise uses)
+    takes its arguments directly -- it never reaches a device shell, so
+    it has no way to run `pidof` for us. Package filtering therefore has
+    to go through `adb_shell`'s single-quoted device script instead, the
+    same double-hop-safe path `launch_cmd`/`stop_cmd` use, so `$(...)`
+    and `$PID` are expanded by the DEVICE's sh, never the guest's.
+
+    `pidof` can print more than one pid (isolated/multi-process apps
+    sharing the same base name); `${PID%% *}` keeps only the first,
+    since `--pid=` takes exactly one. An empty result (app not running)
+    exits with a clear stderr message instead of ever building a
+    malformed `--pid=` with nothing after the `=`.
+    """
+    quoted = shlex.quote(package)
+    not_running = shlex.quote(f"{package} is not running (no matching process)")
+    prefix = (
+        f"PID=$(pidof {quoted} 2>/dev/null); "
+        "PID=${PID%% *}; "
+        f'if [ -z "$PID" ]; then echo {not_running} >&2; exit 1; fi; '
+    )
+    args = ["logcat"]
+    if not follow:
+        args.append("-d")
+    args.append('--pid="$PID"')
+    args.extend(_logcat_filterspec(tag=tag, priority=priority))
+    # NOT `-t N`. Verified live on Redroid 11: `-t N` seeks to the last N
+    # RAW lines and only then applies the filter, so `-t 5 -s Zygote:V`
+    # returns nothing whenever the newest 5 lines are not Zygote's --
+    # silently defeating the filter. `--lines` has to mean "the last N
+    # MATCHING lines", so filter first and tail afterwards.
+    tail = f" | tail -n {int(lines)}" if lines is not None and not follow else ""
+    return adb_shell(prefix + " ".join(args) + tail)
+
+
+def logcat_cmd(
+    *,
+    follow: bool,
+    lines: int | None,
+    package: str | None = None,
+    tag: str | None = None,
+    priority: str | None = None,
+    clear: bool = False,
+) -> str:
+    """Dump/follow/filter/clear the device log.
+
+    `clear` short-circuits everything else and maps straight to `adb
+    logcat -c`: the CLI layer (`app_commands.py`) rejects combining
+    `--clear` with any other logcat flag before this is ever called, so
+    the other parameters are simply ignored here rather than validated
+    twice.
+
+    `package` routes through `_logcat_package_cmd` (a device shell
+    script, see its docstring); without it this stays the plain `adb
+    logcat` protocol form, which accepts `-s`/`*:LEVEL` filterspecs
+    directly as adb arguments with no device-shell re-parsing hazard.
+    """
+    if clear:
+        return f"{adb_prefix()} logcat -c"
+    if package is not None:
+        return _logcat_package_cmd(
+            package, follow=follow, lines=lines, tag=tag, priority=priority
+        )
     parts = [adb_prefix(), "logcat"]
     if not follow:
         parts.append("-d")
+    filterspec = _logcat_filterspec(tag=tag, priority=priority)
+    if lines is not None and filterspec and not follow:
+        # `-t N` applies the filter to the last N RAW lines, so it silently
+        # returns nothing when the newest lines do not match -- verified
+        # live on Redroid 11 (`-t 5 -s Zygote:V` gave only the header while
+        # the unfiltered buffer was full of Zygote lines). When a filter is
+        # in play, `--lines` must mean the last N MATCHING lines, which
+        # needs a device-side pipe rather than the bare protocol form.
+        device = " ".join(["logcat", "-d", *filterspec])
+        return adb_shell(f"{device} | tail -n {int(lines)}")
     if lines is not None:
         parts.append(f"-t {int(lines)}")
+    parts.extend(filterspec)
     return " ".join(parts)
 
 

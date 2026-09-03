@@ -786,3 +786,96 @@ def test_install_rejects_a_split_directory_with_no_base_apk(
 
     assert result.exit_code == 1
     assert "config.app.split_apk_invalid" in result.output + result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# logcat filtering / buffer-clearing (--package, --tag, --priority, --clear)
+# --------------------------------------------------------------------------- #
+
+
+def test_logcat_clear_runs_adb_logcat_dash_c(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--clear")
+    assert result.exit_code == 0, result.output
+    log = (tmp_path / "ssh.log").read_text()
+    assert "logcat -c" in log
+
+
+def test_logcat_clear_rejects_follow(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--clear", "--follow")
+    assert result.exit_code == 1
+    assert "config.app.logcat_clear_exclusive" in result.output + str(result.stderr)
+
+
+def test_logcat_clear_rejects_lines(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--clear", "--lines", "10")
+    assert result.exit_code == 1
+    assert "config.app.logcat_clear_exclusive" in result.output + str(result.stderr)
+
+
+def test_logcat_clear_rejects_package(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--clear", "--package", "com.example.app")
+    assert result.exit_code == 1
+    assert "config.app.logcat_clear_exclusive" in result.output + str(result.stderr)
+
+
+def test_logcat_invalid_priority_is_rejected_with_valid_choices_named(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--priority", "X")
+    assert result.exit_code == 1
+    assert "config.app.invalid_priority" in result.output + str(result.stderr)
+    assert "V, D, I, W, E, F" in result.output + str(result.stderr)
+
+
+def test_logcat_priority_is_case_insensitive(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--priority", "w")
+    assert result.exit_code == 0, result.output
+    log = (tmp_path / "ssh.log").read_text()
+    assert "*:W" in log
+
+
+def test_logcat_tag_and_priority_combine_into_one_filterspec(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--tag", "ActivityManager", "--priority", "e")
+    assert result.exit_code == 0, result.output
+    log = (tmp_path / "ssh.log").read_text()
+    assert "-s ActivityManager:E" in log
+
+
+def test_logcat_package_resolves_pid_on_the_device(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "logcat", "--package", "com.example.app")
+    assert result.exit_code == 0, result.output
+    log = _remote_command_line((tmp_path / "ssh.log").read_text())
+    argv = _simulate_device_argv(log)
+    joined = " ".join(argv)
+    assert "pidof" in joined
+    assert "com.example.app" in argv
+    assert "is not running (no matching process)" in joined
+    assert '--pid=$PID' in joined
+
+
+def test_shell_help_documents_the_sh_dash_c_workaround() -> None:
+    result = CliRunner().invoke(app, ["app", "shell", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "sh -c" in result.output
