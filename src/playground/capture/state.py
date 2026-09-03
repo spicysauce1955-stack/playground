@@ -42,8 +42,19 @@ class CaptureSession(StrictModel):
     snaplen: int
 
 
+def lab_capture_dir(state_dir: Path, lab: str) -> Path:
+    """The per-lab directory holding one record per VM.
+
+    `playground reset` scrubs this whole directory, and `session_path`
+    puts records inside it -- so both must derive it from here rather
+    than each spelling the path out, or a move would leave reset
+    scrubbing a directory nothing writes to.
+    """
+    return state_dir / "state" / "capture" / lab
+
+
 def session_path(state_dir: Path, lab: str, vm: str) -> Path:
-    return state_dir / "state" / "capture" / lab / f"{vm}.json"
+    return lab_capture_dir(state_dir, lab) / f"{vm}.json"
 
 
 def write_session(state_dir: Path, lab: str, session: CaptureSession) -> Path:

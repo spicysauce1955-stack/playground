@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import shlex
 
+import pytest
+
 from playground.capture.commands import (
     CAPTURE_DIR,
     clean_cmd,
@@ -136,7 +138,11 @@ def test_a_metacharacter_in_a_vm_name_cannot_become_a_second_command_start() -> 
 
 
 def test_status_keeps_the_capture_dir_as_one_token() -> None:
-    nasty = "a b;rm -rf /"
+    # No literal "/" here (unlike the metacharacter tests above): a VM
+    # name containing one is now rejected outright by
+    # remote_capture_dir's traversal guard, so this fixture only needs
+    # the OTHER shell metacharacters (space, `;`) to make its point.
+    nasty = "a b;rm -rf x"
     # The directory appears inside a command substitution, so assert the
     # quoted form is present rather than tokenizing the whole script.
     assert shlex.quote(f"/var/lib/playground/capture/{nasty}") in status_cmd(nasty)
@@ -188,14 +194,37 @@ def test_is_active_cmd_cannot_become_a_second_command() -> None:
     assert "/tmp/OWNED" not in tokens
 
 
+@pytest.mark.parametrize("vm", ["../../etc", "..", ".", "a/b", "/etc"])
+def test_remote_capture_dir_rejects_path_traversal(vm: str) -> None:
+    """`LabVm.name` has no charset validator, so `shlex.quote` blocks
+    shell injection but not path TRAVERSAL: a VM named `../..` still
+    quotes safely as one shell token, but the resulting path resolves
+    outside `CAPTURE_DIR` entirely -- and `clean_cmd` runs `sudo -n rm
+    -f` around exactly that path. Every guest-side capture path is built
+    on `remote_capture_dir`, so the guard belongs there.
+    """
+    with pytest.raises(ValueError):
+        remote_capture_dir(vm)
+
+
+def test_remote_capture_dir_accepts_ordinary_names() -> None:
+    assert remote_capture_dir("droid1") == f"{CAPTURE_DIR}/droid1"
+    assert remote_capture_dir("a b;rm -rf x") == f"{CAPTURE_DIR}/a b;rm -rf x"
+
+
 def test_clean_cmd_cannot_become_a_second_command() -> None:
     """This one runs `rm -f` as root, so a VM name that escapes the path
     is the worst case in this module. The glob must stay expandable while
     the directory stays a single token.
+
+    No literal "/" in the fixture (unlike the metacharacter tests above
+    that only exercise `unit_name`): a VM name containing one is now
+    rejected outright by `remote_capture_dir`'s traversal guard, so this
+    fixture only needs the other shell metacharacters to make its point.
     """
-    nasty = "x; touch /tmp/OWNED"
+    nasty = "x; touch OWNED"
     cmd = clean_cmd(nasty)
-    assert "; touch /tmp/OWNED/*.pcap*" not in cmd
+    assert "; touch OWNED/*.pcap*" not in cmd
     assert shlex.quote(f"/var/lib/playground/capture/{nasty}") in cmd
     assert cmd.endswith("/*.pcap*")  # glob outside the quotes, still expandable
 

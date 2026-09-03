@@ -527,17 +527,23 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   a hardcoded value" shape this doc warns about.
 - Provisioning (the `capture` Ansible role) installs `tcpdump`, the
   wrapper, and the instanced unit, and converges to unit
-  installed-but-**stopped** — it is never `enable`d. It never starts,
-  stops, or restarts a session — `playground apply` on a lab that is
-  mid-capture leaves the recording untouched. Sessions start only via
-  `playground capture start`. Not enabling is deliberate (an enabled
-  instance would start recording at boot, violating "provisioning never
-  starts a session"), and it has a consequence nobody wrote down before
-  now: **a guest reboot does not resume a capture that was running
-  before it.** The operator's session record still claims the capture
-  is running; `capture status` will show `state=inactive`. The recovery
-  is `capture stop` (a no-op against the guest that only clears the
-  stale local record) followed by `capture start`.
+  installed-but-**stopped** — it is never `enable`d. The `capture` role
+  itself never starts, stops, or restarts a session, and never touches a
+  recording already in progress. That guarantee is scoped to this role,
+  though: `ansible/site.yml` runs the `redroid` role's play before the
+  `capture` play, so `playground apply` on a lab that is mid-capture CAN
+  still interrupt the session — if that earlier play recreates the
+  Redroid container, it tears down the network namespace `tcpdump` is
+  attached to, `Restart=always` re-execs the wrapper against the new
+  namespace, and a new `${stamp}` pcap base name begins. Sessions start
+  only via `playground capture start`. Not enabling is deliberate (an
+  enabled instance would start recording at boot, violating "provisioning
+  never starts a session"), and it has a consequence nobody wrote down
+  before now: **a guest reboot does not resume a capture that was
+  running before it.** The operator's session record still claims the
+  capture is running; `capture status` will show `state=inactive`. The
+  recovery is `capture stop` (a no-op against the guest that only clears
+  the stale local record) followed by `capture start`.
 - `spec.capture.enabled: false` does not skip the `needs_capture` play —
   the host is still a member of that group. It skips *inside* the role,
   via its own `ansible.builtin.meta: end_host` guard, evaluated right
@@ -546,6 +552,17 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   is the role's guard, not group membership — a detail that matters if
   you ever go looking for a `when:` on the play itself and don't find
   one.
+- **Every `redroid-host` now provisions capture tooling by default.**
+  `config/roles/redroid-host.yaml` declares `capabilities.capture: true`
+  and lists the `capture` role in `provisioners`, and
+  `CaptureOptions.enabled` defaults to `true` — so any lab using this
+  role, including the previously capture-free `redroid-cloud`, now
+  installs `tcpdump` and hard-fails at provisioning time if the apt
+  archive is unreachable (the same "abort loudly rather than silently
+  degrade" precedent as the redroid role's own `adb` probe/abort pair).
+  This is not a defect, but it is a behaviour change worth knowing about
+  before re-applying an existing lab. `spec.capture.enabled: false` in
+  the lab's spec is the opt-out for an air-gapped or lean guest.
 - `local-vbox` is excluded by construction, not by a runtime check on
   that backend: `capture_vm_names()` only returns VMs whose role
   declares `capabilities.capture: true`, and `redroid-host`'s capture

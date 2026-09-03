@@ -3,9 +3,17 @@
 # installed but STOPPED -- never enabled. A converged host reports
 # changed=0.
 #
-# This role must never start, stop, or restart a capture session --
-# `playground apply` on a lab that is mid-capture leaves the recording
-# untouched. Sessions are started only by `playground capture start`.
+# This role itself must never start, stop, or restart a capture session
+# -- it never touches a recording that is already in progress. But that
+# is a claim about THIS role only: `ansible/site.yml` runs the `redroid`
+# role's play before this one's, and if THAT play recreates the Redroid
+# container (image/tag change, `docker-compose up` restart, etc.) it
+# tears down the network namespace tcpdump is attached to. The unit's
+# `Restart=always` then re-execs the wrapper against the new namespace
+# under a fresh `${stamp}`, so `playground apply` on a lab that is
+# mid-capture can still interrupt the session and start a new pcap base
+# name -- it just never does so from this role's own tasks. Sessions are
+# started only by `playground capture start`.
 #
 # Not enabling the unit is deliberate, not an oversight: an enabled
 # instance would start recording at boot, violating "provisioning never

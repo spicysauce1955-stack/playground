@@ -37,13 +37,35 @@ def unit_name(vm: str) -> str:
     return f"{UNIT_TEMPLATE}{vm}.service"
 
 
+def _reject_path_traversal(vm: str) -> None:
+    """Reject a VM name that could escape the capture directory.
+
+    `LabVm.name` is `Field(min_length=1)` with no charset validator, so
+    `shlex.quote` (used throughout this module) correctly blocks shell
+    injection but not path TRAVERSAL: a VM named e.g. ``../..`` still
+    quotes safely as a single shell token, but `f"{CAPTURE_DIR}/{vm}"`
+    then resolves outside the capture root entirely -- and `clean_cmd`
+    builds a `sudo -n rm -f` around exactly that path. This is a plain
+    charset/value check, not a schema-level validator: a stricter
+    `LabVm.name` pattern would be a cross-cutting change affecting every
+    lab, not just capture.
+    """
+    if "/" in vm or vm in (".", ".."):
+        raise ValueError(f"invalid VM name for a capture path: {vm!r}")
+
+
 def remote_capture_dir(vm: str) -> str:
     """Return the guest-side capture directory path for a VM.
 
     This is a DATA function: the return value is used as a path argument
     to scp and rm, which handle their own quoting. Quoting happens at
     the command-builder level, not here, to avoid double-quoting bugs.
+
+    Every guest-side capture path is derived from this function, so the
+    traversal guard lives here rather than being repeated at each call
+    site.
     """
+    _reject_path_traversal(vm)
     return f"{CAPTURE_DIR}/{vm}"
 
 

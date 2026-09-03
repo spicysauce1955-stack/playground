@@ -6,7 +6,7 @@
 test:  ## Run the full unit + CLI test suite.
 	PYTHONPATH=src uv run --no-project \
 	  --with pytest --with pytest-asyncio --with pydantic \
-	  --with ruamel.yaml --with jsonschema --with typer --with textual \
+	  --with ruamel.yaml --with jsonschema --with typer --with textual --with jinja2 \
 	  pytest tests
 
 .PHONY: help

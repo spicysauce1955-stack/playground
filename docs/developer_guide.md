@@ -608,7 +608,7 @@ python3 --version
 
 # Run unit tests
 PYTHONPATH=src uv run --no-project \
-  --with pytest --with pydantic --with ruamel.yaml --with jsonschema --with typer \
+  --with pytest --with pydantic --with ruamel.yaml --with jsonschema --with typer --with jinja2 \
   pytest tests -q
 
 # Run mypy strict

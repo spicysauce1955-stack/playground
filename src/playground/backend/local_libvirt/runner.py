@@ -41,6 +41,7 @@ from playground.backend.local_libvirt.scrub import scrub_lab
 from playground.backend.local_libvirt.tfvars import render_tfvars
 from playground.backend.local_libvirt.verify import verify_lab
 from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
+from playground.capture.state import lab_capture_dir
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic
 from playground.models.resolved import ResolvedLab
@@ -388,7 +389,7 @@ def execute_reset(
     tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
-    capture_dir = state_dir / "state" / "capture" / lab
+    capture_dir = lab_capture_dir(state_dir, lab)
 
     tfvars_path.parent.mkdir(parents=True, exist_ok=True)
     tfvars = render_tfvars(resolved)

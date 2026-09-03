@@ -93,17 +93,64 @@ def test_unit_is_instanced_and_restarts() -> None:
     assert "\nRestart=always\n" in unit
 
 
+_SYSTEMD_MODULES = (
+    "ansible.builtin.systemd",
+    "ansible.builtin.systemd_service",
+    "ansible.builtin.service",
+)
+_SHELL_MODULES = (
+    "ansible.builtin.command",
+    "ansible.builtin.shell",
+    "command",
+    "shell",
+)
+
+
 def test_role_does_not_start_capture() -> None:
     """A re-apply must never begin recording, and must never interrupt a
-    session already in progress. The unit is enabled-but-stopped."""
+    session already in progress. The unit is installed but STOPPED --
+    never enabled: an enabled instance would start recording at boot,
+    which the role's own comment (tasks/main.yml:10-17) calls out as the
+    load-bearing risk here -- as much a violation of "provisioning never
+    starts a session" as calling `state: started` directly.
+
+    Must catch all of: `ansible.builtin.systemd` / `systemd_service` /
+    `service` setting `state: started|restarted` OR `enabled: yes`, and a
+    raw `command:`/`shell:` task invoking `systemctl start`/`systemctl
+    enable` directly.
+    """
     tasks = _yaml.load(TASKS.read_text())
     for task in tasks:
-        systemd = task.get("ansible.builtin.systemd", {})
-        state = str(systemd.get("state", ""))
-        assert state not in ("started", "restarted"), (
-            f"task {task['name']!r} sets state={state!r}; provisioning must "
-            "not start or restart a capture session"
-        )
+        name = task.get("name", "<unnamed>")
+        for module in _SYSTEMD_MODULES:
+            args = task.get(module)
+            if not isinstance(args, dict):
+                continue
+            state = str(args.get("state", ""))
+            assert state not in ("started", "restarted"), (
+                f"task {name!r} sets state={state!r} via {module}; "
+                "provisioning must not start or restart a capture session"
+            )
+            enabled = args.get("enabled")
+            assert enabled not in (True, "yes", "true", "Yes", "True"), (
+                f"task {name!r} enables the unit via {module}; an enabled "
+                "instance would start recording at boot, violating the "
+                "never-enabled invariant"
+            )
+        for module in _SHELL_MODULES:
+            args = task.get(module)
+            if args is None:
+                continue
+            text = args if isinstance(args, str) else str(args.get("cmd", args))
+            lowered = text.lower()
+            assert "systemctl start" not in lowered, (
+                f"task {name!r} shells out to `systemctl start` via "
+                f"{module}; provisioning must not start the capture unit"
+            )
+            assert "systemctl enable" not in lowered, (
+                f"task {name!r} shells out to `systemctl enable` via "
+                f"{module}; the unit must never be enabled"
+            )
 
 
 def test_the_disabled_guard_precedes_the_package_install() -> None:
@@ -154,10 +201,68 @@ def test_ansible_and_python_agree_on_the_guest_contract() -> None:
     these drift, the guest writes pcaps where the CLI does not look and
     `capture fetch` silently returns nothing at all. The duplication is
     unavoidable; leaving it unenforced is not.
+
+    Pinning the directory ROOT and the unit template's FILENAME is not
+    enough -- three more things are each written twice and each break the
+    feature, silently, with a green suite, if they drift:
+
+    1. The unit-install task's `dest:` -- rename it without renaming the
+       `.j2` and `systemctl start playground-capture@<vm>.service` targets
+       a unit that was never installed.
+    2. The wrapper's per-VM subdirectory (`capture-start.j2`) -- Python's
+       `remote_capture_dir()` assumes exactly one level of nesting under
+       the root; move the wrapper's output a level deeper (or shallower)
+       and `fetch`/`status`/`clean` silently look in the wrong place.
+    3. The `.pcap` basename the wrapper's `-w` writes -- every Python glob
+       is `*.pcap*`; change the wrapper's extension and `status` reports
+       `files=0 bytes=0` forever, and `clean` deletes nothing.
     """
-    from playground.capture.commands import CAPTURE_DIR, unit_name
+    from playground.capture.commands import (
+        CAPTURE_DIR,
+        clean_cmd,
+        remote_capture_dir,
+        status_cmd,
+        unit_name,
+    )
 
     assert _yaml.load(DEFAULTS.read_text())["capture_dir"] == CAPTURE_DIR
     # The template's filename IS the instance template the CLI names.
     assert UNIT.name == "playground-capture@.service.j2"
     assert unit_name("droid1") == "playground-capture@droid1.service"
+
+    # (1) The unit-install task's real `dest:`, not just the template's
+    # filename -- find the template task whose `src` IS the unit template,
+    # and assert its `dest` basename is the `@` instance form `unit_name()`
+    # produces (an empty instance name, i.e. the template itself: systemd
+    # expects `<name>@.service` on disk with the instance filled in at
+    # `systemctl start <name>@<instance>.service` time).
+    tasks = _yaml.load(TASKS.read_text())
+    unit_install = next(
+        t
+        for t in tasks
+        if t.get("ansible.builtin.template", {}).get("src") == UNIT.name
+    )
+    dest = str(unit_install["ansible.builtin.template"]["dest"])
+    assert Path(dest).name == unit_name(""), (
+        "the unit-install task's dest must be the `@` instance-template "
+        "form of unit_name(), or `systemctl start` targets a unit that "
+        "was never installed"
+    )
+
+    # (2) The per-VM subdirectory: the wrapper must nest exactly the shape
+    # `remote_capture_dir()` builds -- `<capture_dir>/<vm>`.
+    wrapper = WRAPPER.read_text()
+    assert 'dir="{{ capture_dir }}/${vm}"' in wrapper, (
+        "the wrapper must write into <capture_dir>/<vm>, matching "
+        "remote_capture_dir()'s '<root>/<vm>' shape"
+    )
+    assert remote_capture_dir("droid1") == f"{CAPTURE_DIR}/droid1"
+
+    # (3) The `.pcap` basename: the wrapper's `-w` target, and every glob
+    # Python builds against it.
+    assert '-w "${dir}/${stamp}.pcap"' in wrapper, (
+        "the wrapper's -w target must end in .pcap, matching the *.pcap* "
+        "glob every Python-side command uses"
+    )
+    assert "*.pcap*" in status_cmd("droid1")
+    assert "*.pcap*" in clean_cmd("droid1")
