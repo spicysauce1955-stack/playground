@@ -8,6 +8,7 @@ from pydantic import ConfigDict, Field
 
 from playground.models.base import StrictModel
 from playground.models.kinds import (
+    AndroidAppOptions,
     Budget,
     NetworkProfileSpec,
     RetentionPolicy,
@@ -59,7 +60,7 @@ class ResolvedVm(StrictModel):
 
 class ResolvedWorkload(StrictModel):
     name: str
-    type: Literal["container", "compose", "swarm"]
+    type: Literal["container", "compose", "swarm", "android_app"]
     source: str
     placement: WorkloadPlacement
     networks: list[str] = Field(default_factory=list)
@@ -68,6 +69,7 @@ class ResolvedWorkload(StrictModel):
     environment: dict[str, str] = Field(default_factory=dict)
     resources: dict[str, int] | None = None
     tags: list[str] = Field(default_factory=list)
+    android: AndroidAppOptions | None = None
 
 
 class ResolvedCommand(StrictModel):

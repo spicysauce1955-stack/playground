@@ -1,60 +1,214 @@
 ---
-- name: Ensure required kernel modules are loaded (best-effort; modern kernels build them in)
-  community.general.modprobe:
-    name: "{{ item }}"
-    state: present
-  loop:
-    - binder_linux
-    - ashmem_linux
-  ignore_errors: true
+# Idempotent: the role probes for binder FIRST and does nothing when the
+# kernel already provides it, so a converged host reports changed=0.
+#
+# Ubuntu Noble (and every Ubuntu cloud image) builds binder as a module
+# (CONFIG_ANDROID_BINDER_IPC=m) shipped in linux-modules-extra-<kernel>,
+# which cloud-init does not install. Redroid needs binder in
+# /proc/filesystems; it does NOT need nested virtualization.
+#
+# Two live-only failures shape this role (both hit on DigitalOcean,
+# 2026-08-31 -- see docs/architecture/CONTRACTS.md):
+#
+#   1. binderfs must NEVER be persisted in /etc/fstab. fstab mounts run
+#      before systemd-modules-load.service, and /dev is a devtmpfs whose
+#      contents are gone at boot, so the mount fails and the box boots
+#      into `maintenance` with no sshd. redroid-binderfs.service does the
+#      job in the correct order instead.
+#   2. `package_upgrade: true` in cloud-init stages a NEWER kernel than
+#      the one running at apply time. Installing modules-extra only for
+#      the running kernel means the next reboot boots a kernel with no
+#      binder. So we install it for every kernel present in /lib/modules.
+#
+# ashmem_linux was removed from staging in kernels >= 5.18 and Redroid
+# uses memfd instead, so its modprobe is best-effort forever.
 
 - name: Probe binder filesystem support in the running kernel
   ansible.builtin.command: grep -qw binder /proc/filesystems
   register: binder_check
   changed_when: false
-  # Handle the rc explicitly below so the failure message can name
-  # the VmRole opt-out path instead of a bare grep exit-1.
+  # Handle the rc explicitly below so the failure message can name the
+  # VmRole opt-out path instead of a bare grep exit-1.
+  failed_when: false
+
+- name: Enumerate every installed kernel
+  ansible.builtin.command: find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
+  register: installed_kernels
+  changed_when: false
+
+- name: Install kernel modules-extra for every installed kernel
+  ansible.builtin.apt:
+    name: "linux-modules-extra-{{ item }}"
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  loop: "{{ installed_kernels.stdout_lines | sort }}"
+  loop_control:
+    label: "{{ item }}"
+  when: redroid_install_kernel_modules | bool
+  # A kernel with no modules-extra package in the archive must not abort
+  # the play; the binder re-probe below is the real gate for the RUNNING
+  # kernel, and a staged kernel is only best-effort.
+  failed_when: false
+  register: modules_extra
+
+- name: Load binder_linux with the three standard device nodes
+  community.general.modprobe:
+    name: binder_linux
+    params: devices=binder,hwbinder,vndbinder
+    state: present
+  when: binder_check.rc != 0
+  register: binder_modprobe
+  failed_when: false
+
+- name: Load ashmem_linux (best-effort; absent on kernels >= 5.18)
+  community.general.modprobe:
+    name: ashmem_linux
+    state: present
+  ignore_errors: true
+
+- name: Persist binder_linux across reboots
+  ansible.builtin.copy:
+    content: |
+      # Managed by the playground redroid Ansible role.
+      binder_linux
+    dest: /etc/modules-load.d/redroid-binder.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Persist the binder_linux devices parameter across reboots
+  ansible.builtin.copy:
+    content: |
+      # Managed by the playground redroid Ansible role.
+      options binder_linux devices=binder,hwbinder,vndbinder
+    dest: /etc/modprobe.d/redroid-binder.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+# Undo the fstab entry earlier versions of this role wrote via
+# `ansible.posix.mount: state: mounted`. Leaving it in place boots the
+# host into `maintenance` with no sshd.
+- name: Remove any stale binderfs fstab entry (it breaks boot)
+  ansible.posix.mount:
+    path: /dev/binderfs
+    state: absent_from_fstab
+
+- name: Install the binderfs mount unit (correct boot ordering)
+  ansible.builtin.template:
+    src: redroid-binderfs.service.j2
+    dest: /etc/systemd/system/redroid-binderfs.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: binderfs_unit
+
+- name: Enable and start the binderfs mount unit
+  ansible.builtin.systemd:
+    name: redroid-binderfs.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Restart the binderfs unit when its definition changed
+  ansible.builtin.systemd:
+    name: redroid-binderfs.service
+    state: restarted
+  when: binderfs_unit.changed
+
+- name: Re-probe binder after remediation
+  ansible.builtin.command: grep -qw binder /proc/filesystems
+  register: binder_recheck
+  changed_when: false
   failed_when: false
 
 - name: Gather kernel facts for the abort message
   ansible.builtin.setup:
     filter: ansible_kernel
-  when: binder_check.rc != 0
+  when: binder_recheck.rc != 0
 
-- name: Abort cleanly when the kernel lacks binderfs (with opt-out hint)
+- name: Abort cleanly when the kernel still lacks binderfs (with opt-out hint)
   ansible.builtin.fail:
     msg: |
       Host '{{ inventory_hostname }}' is running kernel
-      {{ ansible_kernel | default('<unknown>') }}, which does NOT
-      expose binder in /proc/filesystems. Redroid requires
-      binder_linux + ashmem_linux — without them the rest of this
-      role would create a non-functional container.
+      {{ ansible_kernel | default('<unknown>') }}, which does NOT expose
+      binder in /proc/filesystems. Redroid requires binder; without it the
+      rest of this role would create a non-functional container.
+
+      Already attempted: installing linux-modules-extra for every kernel in
+      /lib/modules (redroid_install_kernel_modules =
+      {{ redroid_install_kernel_modules | default(true) }}) and
+      `modprobe binder_linux`.
+
+      Kernels present on this host: {{ installed_kernels.stdout_lines | join(', ') }}
+      Kernel actually running:      {{ ansible_kernel | default('<unknown>') }}
 
       To resolve:
-        - Run on an Android-capable kernel (Anbox-modules / mainline
-          ≥ 5.10 with CONFIG_ANDROID_BINDER_IPC=y), OR
-        - Remove `redroid` from this VM's VmRole. The conventional
-          opt-out is to use `docker-host` instead of `redroid-host`
-          under config/roles/, or to drop `ansible_role: redroid`
-          from a custom VmRole's `spec.provisioners` list.
+        - Confirm the package exists for the RUNNING kernel:
+          `apt-cache policy linux-modules-extra-{{ ansible_kernel | default('$(uname -r)') }}`.
+          Ubuntu cloud images ship `linux-image-virtual`, which carries no
+          modules-extra; if the archive has no matching version, the kernel
+          is newer than the package set, OR
+        - Run on an Android-capable kernel (mainline >= 5.10 with
+          CONFIG_ANDROID_BINDER_IPC built in or available as a module), OR
+        - Remove `redroid` from this VM's VmRole. The conventional opt-out
+          is to use `docker-host` instead of `redroid-host` under
+          config/roles/, or to drop `ansible_role: redroid` from a custom
+          VmRole's `spec.provisioners` list.
 
-      site.yml dispatches the redroid play only on the
-      `[needs_redroid]` inventory group, so removing the provisioner
-      drops this host from the play entirely on the next apply.
-  when: binder_check.rc != 0
+      site.yml dispatches the redroid play only on the `[needs_redroid]`
+      inventory group, so removing the provisioner drops this host from the
+      play entirely on the next apply.
+  when: binder_recheck.rc != 0
 
-- name: Create binderfs mountpoint
-  ansible.builtin.file:
-    path: /dev/binderfs
-    state: directory
-    mode: '0755'
+- name: Install the adb client on the guest
+  ansible.builtin.apt:
+    name: adb
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  when: redroid_install_adb | bool
+  # Tolerated like the modules-extra task above, for the same reason: an
+  # unreachable archive must not abort the play, and it previously did so
+  # even when adb was ALREADY installed (the apt cache update fails
+  # before the package state is examined). This was the only apt task in
+  # the role without the guard -- an asymmetry, not a decision.
+  # The probe below is the honest gate.
+  failed_when: false
 
-- name: Mount binderfs
-  ansible.posix.mount:
-    path: /dev/binderfs
-    src: binder
-    fstype: binder
-    state: mounted
+# Whether adb ended up present is what actually matters, and it is not the
+# same question as whether apt succeeded: the operator may have opted out
+# with redroid_install_adb: false, or shipped it by another route. Fail
+# here, naming the opt-out, rather than letting a later `adb` call in
+# workload_android_app or verify-lab die as rc 127 with empty output.
+- name: Confirm adb is on the guest
+  ansible.builtin.command: adb version
+  register: adb_present
+  changed_when: false
+  failed_when: false
+
+- name: Abort when adb is missing (android_app workloads and verify need it)
+  ansible.builtin.fail:
+    msg: |
+      Host '{{ inventory_hostname }}' has no working `adb` on PATH.
+
+      The app-lifecycle layer runs adb ON the guest -- `android_app`
+      workloads and the verify-lab package check both shell out to it --
+      so without it those fail later with a bare exit code 127 and no
+      message.
+
+      redroid_install_adb is currently
+      {{ redroid_install_adb | default(true) }}.
+
+      To resolve:
+        - Leave redroid_install_adb: true and make the apt archive
+          reachable (Ubuntu ships `adb` in universe), OR
+        - Install adb by another route if this host is air-gapped, OR
+        - Keep redroid_install_adb: false ONLY if this lab declares no
+          android_app workloads and you do not need `playground app`.
+          Redroid itself still runs; only the app layer needs the client.
+  when: adb_present.rc != 0
 
 - name: Pull redroid image
   community.docker.docker_image:

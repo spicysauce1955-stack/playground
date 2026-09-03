@@ -384,6 +384,110 @@ reading.
 port-forward is involved. `wait_for_vms_ready` and `verify_lab` receive
 `ssh_ports=None`, which both functions treat as "use port 22 for all VMs".
 
+## Workload: `android_app`
+
+`type: android_app` is the first workload type whose staged artifact is
+not always a single file, and whose Ansible role talks to something
+other than Docker/`docker compose`/`docker stack` on the guest (a running
+Redroid device, over `adb`). Read this section, and update it, before
+changing `stage_workload_files`, `workload_to_ansible_payload`, or
+`ansible/roles/workload_android_app`.
+
+### `stage_workload_files`: file-or-directory in, same shape out
+
+`workload.source` for `android_app` may point at either:
+
+- a single `*.apk` file, or
+- a directory of split APKs (one base APK + `split_config.*`/`config.*`
+  siblings; validated by `playground.android.splits.find_base_apk`).
+
+`stage_workload_files` (`src/playground/planner/scheduling.py`) mirrors
+whichever shape it was given: a file source is copied to
+`stage_dir/<vm>/<workload><suffix>`; a directory source is copied to
+`stage_dir/<vm>/<workload>/` (contents only, one `shutil.copyfile` per
+`*.apk`, with the destination directory `rmtree`'d first so a split
+dropped from the lab config doesn't linger). Both branches write into the
+**same return type** as every other workload type —
+`dict[str, dict[str, Path]]`, `{vm_name: {workload_name: staged_path}}` —
+so `render_inventory` and the compose/swarm code paths need no changes to
+carry a directory instead of a file; they just don't stat what's on the
+other end of the path.
+
+`.aab` / `.apks` (Android App Bundles, not installable APKs) and a
+single non-`.apk` file (typically an un-extracted `.xapk`/`.apkm`, which
+are ZIPs of already-built splits) are both rejected at this layer with a
+diagnostic, before staging — not left for the role to fail on.
+
+### The role discriminates file-vs-directory by the STAGED PATH's suffix — this is load-bearing
+
+`ansible/roles/workload_android_app/tasks/main.yml` never inspects
+`item.staged_source` on disk to decide which copy/install task to run; it
+checks `(item.staged_source | lower).endswith('.apk')`. Staging preserves
+the source's shape (see above), so this is a safe inference **as long as
+every file source stage_workload_files accepts ends in `.apk`** — which is
+exactly what the `config.workload.apk_bundle_not_extracted` diagnostic in
+`stage_workload_files` guarantees by rejecting any other single-file
+source before it reaches staging.
+
+If that guard is ever relaxed (e.g. to "cosmetically" accept any file
+extension), a single-file source whose name does not end in `.apk` will
+still be staged as a *file*, but the role will route it into the
+split-directory branch (`copy: src: "{{ item.staged_source }}/"`), and
+`ansible.builtin.copy` will fail because you cannot glob a trailing `/`
+onto a plain file. Do not remove the suffix guard in
+`stage_workload_files` without also changing how the role tells file and
+directory sources apart.
+
+### The `android` payload key and the fields the role consumes
+
+`workload_to_ansible_payload` (`src/playground/planner/scheduling.py`)
+adds an `"android"` key — `workload.android.model_dump()` — to the
+per-workload dict whenever `workload.android is not None`; it is omitted
+entirely (not `null`) for a `container`/`compose`/`swarm` workload, or an
+`android_app` workload with no `android:` block declared (the role warns
+and skips those by name rather than crashing on `item.android.package`).
+
+`AndroidAppOptions` (`src/playground/models/kinds.py`) has five fields,
+and the role consumes all five:
+
+| field         | type          | role usage                                                                 |
+|---------------|---------------|------------------------------------------------------------------------------|
+| `package`     | `str`         | idempotency check (`pm list packages`), `pm grant`, `pidof`, `am start -n`   |
+| `launch`      | `bool`        | gates the "ensure a process exists" launch tasks                            |
+| `activity`    | `str \| None` | when set, `am start -n <package>/<activity>`; when unset, launcher discovery via `cmd package resolve-activity` with a `monkey` fallback |
+| `permissions` | `list[str]`   | looped `pm grant <package> <perm>`, tolerant of failure (`failed_when: false`) |
+| `reinstall`   | `bool`        | forces `adb install -r` / `install-multiple -r` unconditionally on every apply |
+
+`pg_apk_root` (default `/opt/playground/apks`) is where staged files land
+on the guest, one subdirectory per workload name.
+
+### The guest needs `adb`; it comes from the redroid role, not this one
+
+`workload_android_app` runs `adb` commands against `127.0.0.1:5555`
+**on the guest itself** — it never opens a network path to the device and
+has no `adb`-installation task of its own. `adb` is installed by the
+`redroid` role's `redroid_install_adb` task (default `true`, Ubuntu
+universe package `adb`), which then asserts `adb version` succeeds and
+fails the play by name if it doesn't. Setting `redroid_install_adb: false`
+without providing `adb` some other way therefore breaks every
+`android_app` workload on that VM, not just Redroid itself — `verify-lab`
+and any `type: android_app` role tasks will fail at the same "no adb on
+PATH" assertion.
+
+### ADB has no authentication — reachability, not exposure, is the control
+
+Same rule as the redroid contract above: the redroid container binds
+`0.0.0.0:5555` regardless of workload type, so `android_app` inherits
+whatever reachability that backend has (see "ADB has no authentication"
+under the Redroid section: DO's firewall opens 22 only; local-libvirt's
+NAT network has no firewall in front of it; local-vbox does not forward
+5555 to the host by default). The `workload_android_app` role itself
+never exposes anything new — it drives `adb` from inside the guest over
+SSH-executed Ansible tasks, the same mechanism `playground app` uses.
+Operators reach a device with `playground adb --lab <lab> --on <vm>`
+(SSH tunnel to the guest's 5555) or `playground app <verb> --on <vm>`
+(guest-side `adb`, no tunnel) — never by opening 5555 to a network.
+
 ## Cross-layer pitfalls (things future-you will hit)
 
 These are the gotchas we've already paid for. Each one cost
@@ -506,14 +610,124 @@ image default DHCP all NICs) and only emits it when there's an intnet
 NIC needing a static IP. NICs are matched by MAC (no `set-name`) to
 avoid depending on guest interface enumeration.
 
-### vbox: no nested virt → Redroid won't work there
+### Redroid needs binder, not nested virtualization
 
-The libvirt path uses `cpu { mode = "host-passthrough" }` so guests get
-binderfs for Redroid. VirtualBox doesn't pass that through, so a
-`redroid-host` lab on `local-vbox` will fail the binder assertion.
-Generic VM + Docker labs are the supported vbox use case
-(`config/providers/local-vbox.yaml` records `nested_virtualization:
-false`).
+The recurring misstatement in this repo was that Redroid requires nested
+virt. It does not. `binder` is a KERNEL MODULE
+(`CONFIG_ANDROID_BINDER_IPC=m`), not a CPU feature, and no CPU-level
+passthrough setting provides it. Redroid is a container: it needs `binder`
+in `/proc/filesystems` on the kernel it runs on, plus a mounted binderfs.
+`cpu { mode = "host-passthrough" }` in `tofu/main.tf` is unrelated to
+binder — it is a PRD constraint that exposes host CPU virt extensions to
+the guest for nested hypervisors and virt-accelerated workloads. Proven
+live: Redroid runs on a DigitalOcean Droplet, which has no nested
+virtualization at all (no libvirt guest, no `host-passthrough` in the
+picture); the Ansible role loading the `binder_linux` module is what makes
+it work, on any backend whose guest kernel can load that module.
+
+On `local-libvirt`, Redroid runs inside a libvirt *guest*; that guest's own
+kernel (whatever `cpu_mode` it boots with) is what the redroid role targets
+— `host-passthrough` neither helps nor hinders binder. On a cloud VM there
+is no nesting at all: Redroid runs directly on the instance kernel.
+
+Ubuntu builds binder as a MODULE (`CONFIG_ANDROID_BINDER_IPC=m`,
+`CONFIG_ANDROID_BINDERFS=m`) and ships it in
+`linux-modules-extra-<kernel>`, which cloud images do not install. The
+`redroid` Ansible role installs it for **every kernel in `/lib/modules`**,
+loads `binder_linux` with `devices=binder,hwbinder,vndbinder`, and mounts
+binderfs through a `redroid-binderfs.service` systemd unit. Set
+`redroid_install_kernel_modules: false` to opt out on air-gapped hosts.
+
+Verified live on DigitalOcean `ubuntu-24-04-x64` (2026-08-31): apply is
+idempotent (`changed=0` on re-run), Redroid 11 boots
+(`sys.boot_completed=1`), ADB works through `playground adb`, and the whole
+stack survives a graceful reboot.
+
+### Redroid image tags: pin the date-stamped one
+
+`redroid/redroid:<version>-latest` is a MOVING tag -- upstream repoints it
+on every new build of that version. A lab pinned to it is not reproducible:
+two applies weeks apart can boot different Android builds from identical
+committed config, and an app-test result cannot be attributed to a specific
+build.
+
+`ansible/roles/redroid/defaults/main.yml` pins the date-stamped tag
+(`11.0.0-240527`) that `11.0.0-latest` resolved to on 2026-08-31 --
+identical digest, so the pin changed nothing at the time it was made.
+`tests/unit/ansible/test_redroid_image_pin.py` fails if a `-latest` tag is
+reintroduced. Choose new versions from
+https://hub.docker.com/r/redroid/redroid/tags, always a date-stamped tag.
+
+### Two live-only failures this role exists to avoid
+
+Both were invisible to static tests and to a first apply. They only
+appeared on the first reboot.
+
+**1. NEVER put binderfs in `/etc/fstab`.** This is an availability bug, not
+a cosmetic one. `ansible.posix.mount: state: mounted` writes
+`binder /dev/binderfs binder defaults 0 0`. Systemd attempts fstab mounts at
+`local-fs.target` — *before* `systemd-modules-load.service` has loaded
+`binder_linux` — and `/dev` is a devtmpfs, so the mountpoint does not exist
+yet either. The mount fails, the boot degrades to `maintenance`, and **sshd
+never starts**: the VM is unreachable until a hard power-cycle
+(`doctl compute droplet-action power-cycle`). `redroid-binderfs.service`
+does the same work ordered `After=systemd-modules-load.service` and
+`Before=docker.service`. The role also runs
+`ansible.posix.mount: state: absent_from_fstab` to clean up hosts that
+already carry the bad entry. A unit test
+(`test_binderfs_is_never_persisted_in_fstab`) fails if anyone reintroduces
+it.
+
+**2. Kernel/package skew is real, not theoretical.** DigitalOcean's
+cloud-init sets `package_upgrade: true`, which stages a NEWER kernel than
+the one running at apply time. Observed: applied on `6.8.0-124-generic`,
+rebooted into `6.8.0-138-generic`, and
+`modprobe: FATAL: Module binder_linux not found in /lib/modules/6.8.0-138-generic`.
+Ubuntu cloud images ship `linux-image-virtual`, which deliberately carries
+no modules-extra. Installing for the running kernel alone is therefore not
+enough — the role loops over every directory in `/lib/modules`. Per-kernel
+installs are best-effort (`failed_when: false`); the binder re-probe is the
+real gate for the running kernel.
+
+**ADB has no authentication.** The redroid container is run with
+`ports: ["5555:5555"]`, which binds `0.0.0.0:5555` inside the guest —
+that is exposure at the guest-network level regardless of backend, and
+this doc is not the place to claim it never happens. What varies is who
+can *reach* that guest address:
+
+- `cloud-digitalocean`: the firewall (`tofu/cloud_digitalocean/main.tf`)
+  opens port 22 only, so 5555 is unreachable from the public internet —
+  the Droplet's own guest-level bind is mitigated entirely by the cloud
+  firewall.
+- `local-libvirt`: there is no firewall layer in front of the NAT network
+  (10.0.10.0/24) — the libvirt host and every other VM on that NAT network
+  can reach `<vm-ip>:5555` directly. Do not put a `redroid-host` lab on a
+  shared or untrusted host network.
+- `local-vbox`: NAT + port-forward means 5555 is not forwarded to the host
+  by default (only the SSH port is), but VMs on the same internal network
+  NIC can still reach it guest-to-guest.
+
+In all cases, prefer `playground adb --lab <lab> --on <vm>` (forwards a
+local port over SSH) or guest-side `adb` over relying on 5555 being
+unreachable.
+
+### vbox: Redroid support is UNVERIFIED, not proven-impossible
+
+`config/providers/local-vbox.yaml` records `redroid: false`, but per
+"Redroid needs binder, not nested virtualization" above, the honest reason
+is that nobody has tested it — not that VirtualBox is architecturally
+incapable. Redroid only needs the guest kernel to load `binder_linux` (via
+`linux-modules-extra-<kernel>`, same as any other guest) and to run a
+`--privileged` container; neither of those is inherently blocked by
+VirtualBox. `nested_virtualization: false` for vbox is accurate on its own
+terms (VBox doesn't expose KVM nested-virt to guests), but it is not the
+reason Redroid is disabled — do not conflate the two capabilities.
+
+Until someone runs the redroid role against a `local-vbox` guest and
+confirms binder loads and the container starts, treat `redroid: false`
+there as "untested," and do not flip it to `true` without a live
+verification note (in the style of the DigitalOcean one above). Generic VM
++ Docker labs remain the supported, verified vbox use case.
 
 ### libvirt: nested-virt fails when L0 refuses VMX passthrough
 

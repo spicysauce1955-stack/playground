@@ -70,7 +70,7 @@ variable "ubuntu_image_url" {
 }
 
 variable "cpu_mode" {
-  description = "libvirt CPU mode for every domain. `host-passthrough` is the default (load-bearing for the redroid-host lab — Redroid containers need binderfs which needs full CPU feature passthrough). Override to `host-model` (or similar) on hosts where the L0 hypervisor can't tolerate VMX passthrough — the symptom is QEMU pausing/crashing the guest at startup with `kvm_intel: vmread/vmwrite failed` kernel messages. Set via `spec.providers.local-libvirt.cpu_mode` in the lab YAML."
+  description = "libvirt CPU mode for every domain. `host-passthrough` is the default and a PRD constraint: it exposes the host CPU's virt extensions to the guest, which nested hypervisors and virt-accelerated guest workloads need. It is NOT what Redroid needs -- binder is a kernel module (linux-modules-extra-<kernel>), installed by the redroid Ansible role, not a CPU feature; see docs/architecture/CONTRACTS.md. Override to `host-model` (or similar) on hosts where the L0 hypervisor can't tolerate VMX passthrough -- the symptom is QEMU pausing/crashing the guest at startup with `kvm_intel: vmread/vmwrite failed` kernel messages. Set via `spec.providers.local-libvirt.cpu_mode` in the lab YAML."
   type        = string
   default     = "host-passthrough"
 }

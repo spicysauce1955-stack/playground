@@ -1,0 +1,9 @@
+---
+pg_workloads: '[]'
+
+# Where staged APKs land on the guest.
+pg_apk_root: /opt/playground/apks
+
+# Android may still be booting immediately after the container starts;
+# installing then fails on a device that is merely slow.
+pg_android_boot_timeout: 180

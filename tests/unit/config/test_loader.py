@@ -217,3 +217,18 @@ def test_cloud_smoke_lab_loads_in_committed_config() -> None:
     assert diagnostics == []
     assert "cloud-smoke" in loaded.labs
     assert "cloud-digitalocean" in loaded.providers
+
+
+def test_redroid_cloud_lab_loads_in_committed_config() -> None:
+    """The shipped cloud Redroid lab parses and resolves cleanly."""
+    loaded, diagnostics = load_config(CONFIG_DIR)
+    assert diagnostics == []
+    assert "redroid-cloud" in loaded.labs
+
+    lab = loaded.labs["redroid-cloud"]
+    assert lab.spec.backend == "cloud-digitalocean"
+    assert [vm.role for vm in lab.spec.vms] == ["redroid-host"]
+    # DigitalOcean applies ONE size slug to every Droplet in the lab, so the
+    # slug — not the role's resources block — is the real control. It must
+    # be big enough for an Android container.
+    assert lab.spec.providers["cloud-digitalocean"]["size"] == "s-4vcpu-8gb"

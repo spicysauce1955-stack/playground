@@ -69,6 +69,17 @@
   roles:
     - workload_compose
 
+- name: Deploy android_app workloads
+  hosts: playground
+  become: yes
+  gather_facts: no
+  roles:
+    # Platform-level like the other workload_* plays: dispatch happens
+    # inside the role via pg_workloads, and the role ends the host early
+    # when nothing matches. Must run AFTER the redroid play so the
+    # Android container exists before an APK is installed.
+    - workload_android_app
+
 # Swarm spans hosts: manager initializes first, workers join using the
 # token the manager exposed, then stacks deploy on the manager. Each
 # phase is a separate play because Ansible can't reorder tasks across

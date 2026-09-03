@@ -23,3 +23,8 @@ spec:
   capabilities:
     nested_virtualization: false
     privileged_containers: true
+    # Redroid needs binder in the Droplet's own kernel, not nested virt —
+    # there is no nesting on a cloud VM. Ubuntu images ship binder in
+    # linux-modules-extra, which the redroid Ansible role installs.
+    # Verified live on ubuntu-24-04-x64 / kernel 6.8.0-124-generic.
+    redroid: true

@@ -24,12 +24,21 @@ Diagnostic IDs:
   classes from ``requirements.md`` §5.13 are tracked for a later slice)
 - ``config.backend.per_vm_resources_unsupported`` (warning; today's
   ``local-libvirt`` backend applies global ``var.vm_memory`` / ``var.vm_vcpu``)
+- ``config.backend.capability_unsupported`` (warning; a VmRole capability
+  the chosen backend's ProviderConfig declares ``false``)
 - ``config.network.ip_not_in_cidr`` (per-VM pinned IP outside the lab
   network's CIDR)
 - ``config.network.duplicate_ip`` (two VMs pin the same IP on the same
   network)
 - ``config.network.dns_domain_invalid`` (``Lab.spec.dns_domain`` doesn't
   look like an RFC-1035-ish domain name)
+- ``config.workload.android_options_missing`` (``type: android_app`` with
+  no ``android:`` block — ``package`` cannot be inferred)
+- ``config.workload.android_options_ignored`` (warning; an ``android:``
+  block on a non-``android_app`` workload)
+- ``config.workload.android_target_not_capable`` (warning; an
+  ``android_app`` workload's placement matches no VM with the ``redroid``
+  capability)
 """
 
 from __future__ import annotations
@@ -37,7 +46,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 # Loose RFC-1035-ish check: lowercase alphanum + hyphens, dot-separated
 # labels, no leading/trailing dot, no consecutive dots. Strict
@@ -296,6 +305,7 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
 
     for idx, wl in enumerate(lab.spec.workloads):
         diagnostics.extend(_check_workload_placement(lab, idx, source, loaded))
+        diagnostics.extend(_check_android_workload(lab, idx, source, loaded))
         for net_idx, net_name in enumerate(wl.networks):
             if net_name not in declared_network_names:
                 diagnostics.append(
@@ -332,6 +342,7 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_budget(lab, loaded, source))
     diagnostics.extend(_check_offline_artifacts(lab, loaded, source))
     diagnostics.extend(_check_backend_capability(lab, loaded, source))
+    diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
     diagnostics.extend(_check_dns_domain(lab, source))
 
@@ -563,6 +574,90 @@ def _check_workload_placement(
     ]
 
 
+def _check_android_workload(
+    lab: Lab,
+    workload_idx: int,
+    source: SourceLocation,
+    loaded: LoadedConfig,
+) -> list[Diagnostic]:
+    """Validate `type: android_app` workloads and their options block.
+
+    Placement itself is checked by ``_check_workload_placement``, which is
+    type-agnostic; this covers only the Android-specific shape.
+    """
+    workload = lab.spec.workloads[workload_idx]
+    key = f"spec.workloads[{workload_idx}]"
+
+    if workload.type != "android_app":
+        if workload.android is not None:
+            return [
+                Diagnostic(
+                    id="config.workload.android_options_ignored",
+                    severity="warning",
+                    message=(
+                        f"workload {workload.name!r} is type "
+                        f"{workload.type!r} but declares an `android:` block, "
+                        "which only applies to type: android_app"
+                    ),
+                    source=source,
+                    key_path=f"{key}.android",
+                    suggestion="remove the android: block, or set type: android_app",
+                )
+            ]
+        return []
+
+    if workload.android is None:
+        return [
+            Diagnostic(
+                id="config.workload.android_options_missing",
+                severity="error",
+                message=(
+                    f"workload {workload.name!r} is type android_app but has "
+                    "no `android:` block; `package` is required"
+                ),
+                source=source,
+                key_path=f"{key}.android",
+                suggestion=(
+                    "add `android: {package: com.example.app}` — the package "
+                    "name drives install idempotency, launch, and verify"
+                ),
+            )
+        ]
+
+    # Warn (principle 10) when placement resolves only to VMs whose role
+    # chain lacks the redroid capability.
+    placement = workload.placement
+    candidates = [
+        vm for vm in lab.spec.vms
+        if (placement.target_vm == vm.name)
+        or (placement.target_role is not None
+            and placement.target_role in _role_ancestors(loaded, vm.role))
+        or (placement.target_tag is not None and placement.target_tag in vm.tags)
+        or (placement.auto is True)
+    ]
+    capable = [
+        vm for vm in candidates
+        if _capabilities_for_vm(loaded, vm).get("redroid")
+    ]
+    if candidates and not capable:
+        return [
+            Diagnostic(
+                id="config.workload.android_target_not_capable",
+                severity="warning",
+                message=(
+                    f"workload {workload.name!r} installs an APK but its "
+                    "placement matches no VM with the `redroid` capability"
+                ),
+                source=source,
+                key_path=f"{key}.placement",
+                suggestion=(
+                    "target a VM whose role is redroid-host (or extends it)"
+                ),
+            )
+        ]
+    return []
+
+
 def _check_budget(
     lab: Lab,
     loaded: LoadedConfig,
@@ -718,13 +813,16 @@ def _check_backend_capability(
 ) -> list[Diagnostic]:
     """Warn when the lab declares intent the chosen backend can't honor.
 
-    Today only ``local-libvirt`` is checked: ``tofu/main.tf`` applies a
-    single global ``var.vm_memory`` / ``var.vm_vcpu`` to every domain, so a
-    lab with heterogeneous per-VM resources will not be reproduced
-    accurately on apply. Permissive per engineering principle #10 — warn,
-    don't block.
+    ``local-libvirt``: ``tofu/main.tf`` applies a single global
+    ``var.vm_memory`` / ``var.vm_vcpu`` to every domain. ``cloud-digitalocean``
+    has the same limitation for a different reason: ``_TFVARS_KEYS`` in
+    ``src/playground/backend/cloud_digitalocean/tfvars.py`` carries a single
+    scalar ``size``, so one Droplet size applies to every VM in the lab.
+    Either way, a lab with heterogeneous per-VM resources will not be
+    reproduced accurately on apply. Permissive per engineering principle
+    #10 — warn, don't block.
     """
-    if lab.spec.backend != "local-libvirt":
+    if lab.spec.backend not in ("local-libvirt", "cloud-digitalocean"):
         return []
 
     resources_per_vm = [_resources_for_vm(loaded, vm) for vm in lab.spec.vms]
@@ -736,23 +834,38 @@ def _check_backend_capability(
     if all((r.vcpu, r.memory_mb, r.disk_gb) == first for r in populated[1:]):
         return []
 
+    if lab.spec.backend == "cloud-digitalocean":
+        detail = (
+            "the cloud-digitalocean backend applies a single Droplet `size` "
+            "slug to every VM in the lab"
+        )
+        suggestion = (
+            "set spec.providers.cloud-digitalocean.size to a slug that fits "
+            "the largest VM; per-VM resources are advisory on this backend"
+        )
+    else:
+        detail = (
+            "the local-libvirt backend applies global "
+            "var.vm_memory/var.vm_vcpu uniformly"
+        )
+        suggestion = (
+            "tune var.vm_memory and var.vm_vcpu in tofu/terraform.tfvars "
+            "to fit the largest VM, or wait for tofu support for per-VM "
+            "resources"
+        )
+
     return [
         Diagnostic(
             id="config.backend.per_vm_resources_unsupported",
             severity="warning",
             message=(
                 f"lab {lab.metadata.name!r} declares heterogeneous per-VM "
-                "resources, but the local-libvirt backend applies global "
-                "var.vm_memory/var.vm_vcpu uniformly. Per-VM resources will "
-                "not be honored until tofu is enriched."
+                f"resources, but {detail}. Per-VM resources will not be "
+                "honored until tofu is enriched."
             ),
             source=source,
             key_path="spec.vms[*].resources",
-            suggestion=(
-                "tune var.vm_memory and var.vm_vcpu in tofu/terraform.tfvars "
-                "to fit the largest VM, or wait for tofu support for per-VM "
-                "resources"
-            ),
+            suggestion=suggestion,
         )
     ]
 
@@ -778,6 +891,75 @@ def _resources_for_role(loaded: LoadedConfig, role_name: str) -> Resources | Non
         if role is not None and role.spec.resources is not None:
             return role.spec.resources
     return None
+
+
+def _capabilities_for_vm(loaded: LoadedConfig, vm: LabVm) -> dict[str, Any]:
+    """Union a VM's role capabilities across the whole ``extends`` chain.
+
+    Unlike ``image`` / ``resources`` — where the first non-``None`` value
+    along the chain wins — capabilities MERGE, with the leaf overriding
+    same-named ancestor keys. This mirrors ``_deep_merge_spec`` in
+    ``config/resolver.py``, which merges root -> leaf. ``_role_ancestors``
+    returns leaf -> root, hence the ``reversed``.
+    """
+    merged: dict[str, Any] = {}
+    for ancestor in reversed(_role_ancestors(loaded, vm.role)):
+        role = loaded.roles.get(ancestor)
+        if role is not None:
+            merged.update(role.spec.capabilities)
+    return merged
+
+
+def _check_role_provider_capabilities(
+    lab: Lab,
+    loaded: LoadedConfig,
+    source: SourceLocation,
+) -> list[Diagnostic]:
+    """Warn when a VM's role wants a capability its backend declares false.
+
+    Permissive per engineering principle #10: the operator may know
+    something the provider config does not, so this warns rather than
+    blocking. A capability the provider does not mention produces nothing —
+    ``ProviderConfigSpec`` is an open model and "undeclared" is not
+    "unsupported".
+    """
+    provider = loaded.providers.get(lab.spec.backend)
+    if provider is None:
+        # config.reference.unknown_provider already covers this.
+        return []
+    provider_caps = getattr(provider.spec, "capabilities", None) or {}
+    if not isinstance(provider_caps, dict):
+        return []
+
+    diagnostics: list[Diagnostic] = []
+    for idx, vm in enumerate(lab.spec.vms):
+        for capability, wanted in sorted(_capabilities_for_vm(loaded, vm).items()):
+            if not wanted:
+                continue
+            if provider_caps.get(capability) is not False:
+                continue
+            diagnostics.append(
+                Diagnostic(
+                    id="config.backend.capability_unsupported",
+                    severity="warning",
+                    message=(
+                        f"VM {vm.name!r} in lab {lab.metadata.name!r} uses role "
+                        f"{vm.role!r}, which declares capability "
+                        f"{capability!r}, but backend {lab.spec.backend!r} "
+                        f"declares {capability}: false"
+                    ),
+                    source=source,
+                    key_path=f"spec.vms[{idx}].role",
+                    suggestion=(
+                        f"choose a backend whose ProviderConfig declares "
+                        f"{capability}: true, use a VmRole without that "
+                        f"capability, or set {capability}: true in "
+                        f"config/providers/{lab.spec.backend}.yaml if the "
+                        "backend really does support it"
+                    ),
+                )
+            )
+    return diagnostics
 
 
 __all__ = ["validate"]

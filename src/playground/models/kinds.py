@@ -312,11 +312,32 @@ class WorkloadPlacement(BaseModel):
         return self
 
 
+class AndroidAppOptions(StrictModel):
+    """Android-specific fields for a ``type: android_app`` workload.
+
+    Kept in a sub-model so Android concerns do not widen the schema every
+    workload type shares. ``package`` is required and cannot be inferred:
+    it drives the install idempotency check, the launch, and the
+    verify-lab assertion.
+
+    ``activity`` is optional because the launcher activity is
+    discoverable at runtime with
+    ``cmd package resolve-activity --brief``; when unset the role
+    launches via ``monkey``, which needs no activity name.
+    """
+
+    package: str = Field(min_length=1)
+    launch: bool = False
+    activity: str | None = None
+    permissions: list[str] = Field(default_factory=list)
+    reinstall: bool = False
+
+
 class LabWorkload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str = Field(min_length=1)
-    type: Literal["container", "compose", "swarm"]
+    type: Literal["container", "compose", "swarm", "android_app"]
     source: str = Field(min_length=1)
     placement: WorkloadPlacement
     networks: list[str] = Field(default_factory=list)
@@ -325,6 +346,7 @@ class LabWorkload(BaseModel):
     environment: dict[str, str] = Field(default_factory=dict)
     resources: Resources | None = None
     tags: list[str] = Field(default_factory=list)
+    android: AndroidAppOptions | None = None
 
 
 class LabVmNetwork(StrictModel):

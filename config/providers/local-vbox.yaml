@@ -31,3 +31,13 @@ spec:
     # expected to work here. Generic VM + Docker labs do.
     nested_virtualization: false
     privileged_containers: true
+    # UNVERIFIED, not proven-impossible: nobody has run the redroid role
+    # against a local-vbox guest. Redroid only needs the guest kernel to
+    # load binder_linux (linux-modules-extra-<kernel>, same as any other
+    # guest) and to run a --privileged container -- neither is inherently
+    # blocked by VirtualBox, and nested_virtualization is a separate
+    # capability that binder does not depend on. Leave this false until a
+    # live run confirms binder loads and the container starts on this
+    # backend; see docs/architecture/CONTRACTS.md, "vbox: Redroid support
+    # is UNVERIFIED, not proven-impossible".
+    redroid: false
