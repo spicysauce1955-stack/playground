@@ -1,0 +1,76 @@
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: barak-fleet-airgap
+  description: |
+    Four-VM lab simulating a real barak-deploy fleet: one connected build/release
+    host ("central") and three AIR-GAPPED deploy targets, one per simulated team.
+
+      central   10.30.50.10  build + release host (has egress; builds images, wraps
+                             deliveries, ships them over the lab network)
+      alpha     10.30.50.21  team Ada    — orders-api (multi-service compose stack)
+      bravo     10.30.50.22  team Brook  — edge-web  (swarm rolling update)
+      charlie   10.30.50.23  team Cy     — metrics-agent (systemd + config patching)
+
+    NOTE ON THE AIR-GAP: the `isolated` NetworkProfile declares
+    `internet_access: false`, but the local-libvirt backend hardcodes
+    `mode = "nat"` on every libvirt_network (tofu/main.tf), so the profile is
+    NOT enforced today. This lab therefore declares `nat` honestly and the
+    air-gap is applied INSIDE each target guest at test-runtime (default route
+    dropped + egress REJECTed except the lab subnet), then proven by asserting
+    that DNS and outbound TCP both fail on the target while the lab hop still
+    works. See the campaign notes for the upstream ask.
+
+    Sizing: the local-libvirt backend does not emit per-VM resources (it applies
+    global var.vm_memory / var.vm_vcpu and a hardcoded 20 GB disk), so this lab
+    declares none and relies on tofu/terraform.tfvars for the fleet-wide size.
+
+    The lab is barak-deploy-agnostic — it just provisions four docker-hosts.
+  tags: [barak-deploy, fleet, airgap]
+
+spec:
+  backend: local-libvirt
+  offline: false
+
+  budget:
+    mode: permissive
+    max_vcpu: 10
+    max_memory_mb: 14336
+    max_disk_gb: 160
+    max_vms: 4
+    max_containers: 40
+
+  networks:
+    - name: fleet-net
+      profile: nat
+      cidr: 10.30.50.0/24
+
+  vms:
+    - name: central
+      role: docker-host
+      networks:
+        - name: fleet-net
+          ip: 10.30.50.10
+
+    - name: alpha
+      role: docker-host
+      networks:
+        - name: fleet-net
+          ip: 10.30.50.21
+
+    - name: bravo
+      role: docker-host
+      networks:
+        - name: fleet-net
+          ip: 10.30.50.22
+
+    - name: charlie
+      role: docker-host
+      networks:
+        - name: fleet-net
+          ip: 10.30.50.23
+
+  providers:
+    local-libvirt:
+      uri: qemu:///system
+      pool: default
