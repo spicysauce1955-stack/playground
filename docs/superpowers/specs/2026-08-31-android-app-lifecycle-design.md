@@ -462,3 +462,55 @@ mid-apply `422 Size is not available in this region`, after `tofu-init` had
 run. The lab moved to `nyc1`. A `cloud-preflight` check that validates the
 region/size pairing against the DO API before provisioning would convert
 this into a clear pre-flight diagnostic; not implemented.
+
+## Real-app validation: Telegram 12.2.10, 2026-09-03
+
+Run against `telegram-12.2.10-apkpure.apk` — a genuine 146 MB universal
+APK (`org.telegram.messenger`, includes x86_64 so it runs on
+`redroid11_x86_64`). Two Droplets, both destroyed; inventory confirmed
+identical to baseline.
+
+This is the first validation against a real third-party app rather than a
+system package or a synthesized fixture.
+
+| Capability | Result |
+|---|---|
+| `install` (146 MB) | Success in 2m21s |
+| `list --third-party` | `org.telegram.messenger` |
+| `launch` (discovery) | resolved `.DefaultIcon` |
+| `screenshot` | real 720x1280 PNG of the Telegram intro screen |
+| `ui-dump` | real hierarchy with element bounds |
+| `input tap` | drove the app from intro to phone-number entry |
+| `input text` | Telegram parsed "5551234" as country 55 (Brazil) + "51 234" |
+| `logcat` | real Telegram log lines |
+| `clear` | state reset; relaunch returns to the intro screen |
+| `push` / `pull` | content round-tripped and verified on device |
+| `stop` | exit 0, idempotent when repeated |
+| Declarative `android_app` workload | staged, installed, launched via declared activity |
+| **Idempotency** | **second apply: `changed=0`** |
+| `verify-lab` | `android package org.telegram.messenger installed` |
+
+### Three things this run established that earlier fixtures could not
+
+1. **The raised timeouts were necessary, not speculative.** The 146 MB scp
+   plus install took 2m21s. `_SCP_TIMEOUT` was originally 60s, so this
+   install would have timed out. The increase to 180s/300s had been a
+   judgement call with no evidence behind it until now.
+
+2. **Launch discovery beats reading the manifest.** The APK's manifest
+   names `org.telegram.ui.LaunchActivity`, and hardcoding it would have
+   been the obvious move. The device resolved `.DefaultIcon` instead:
+   Telegram ships activity-aliases for icon variants and only the enabled
+   alias is the real launcher. `cmd package resolve-activity` gets this
+   right; manifest-reading does not.
+
+3. **A real app exercises paths a system package cannot.** Earlier runs
+   could not test install (the fixture was preinstalled) or
+   `list --third-party` (nothing was third-party). Both are now covered.
+
+### Still not covered
+
+A successful SPLIT install. Telegram from APKPure is a single universal
+APK. `.apkm`/`.xapk` bundles exist in the same download directory and
+would exercise `install-multiple` properly, but bundle extraction is the
+`bundletool` path this spec explicitly deferred.
