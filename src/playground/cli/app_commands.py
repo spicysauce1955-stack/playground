@@ -44,6 +44,7 @@ from playground.android.commands import (
     wait_booted_cmd,
 )
 from playground.android.runner import TargetResult, run_on_targets
+from playground.android.splits import find_base_apk
 from playground.android.targets import AndroidTarget, resolve_targets
 from playground.backend.dispatch import query_status
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -432,23 +433,23 @@ def install_command(
     # install` happily ran install-multiple on it and let the device
     # answer -- which it does with `INSTALL_FAILED_INVALID_APK`, a much
     # worse place to find out.
-    if path.is_dir() and not any(a.name == "base.apk" for a in apks):
-        _fail(
-            Diagnostic(
-                id="config.app.split_apk_invalid",
-                severity="error",
-                message=(
-                    f"directory {str(path)!r} has no base.apk; a split set "
-                    "needs exactly one base.apk alongside its "
-                    "split_config.*.apk siblings"
-                ),
-                source=SourceLocation(path=str(path)),
-                suggestion=(
-                    "pass the single .apk file directly, or add the base.apk "
-                    "the splits belong to"
-                ),
+    if path.is_dir():
+        _, reason = find_base_apk(apks)
+        if reason is not None:
+            _fail(
+                Diagnostic(
+                    id="config.app.split_apk_invalid",
+                    severity="error",
+                    message=f"directory {str(path)!r} is not a valid split set: {reason}",
+                    source=SourceLocation(path=str(path)),
+                    suggestion=(
+                        "a split set is one base APK (base.apk, or "
+                        "<package>.apk from an .xapk) plus its "
+                        "split_config.*/config.* siblings; or pass a single "
+                        ".apk file directly"
+                    ),
+                )
             )
-        )
 
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,

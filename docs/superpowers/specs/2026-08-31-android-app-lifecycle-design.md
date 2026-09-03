@@ -562,3 +562,50 @@ It routes through a separate `_stream()` that inherits stdio with no
 timeout, rather than the capturing fan-out runner. That looked right on
 inspection, but "looks right" is not evidence -- the timestamped arrival
 spread above is.
+
+
+## Split install: open question 3 answered, 2026-09-03
+
+**Split install works, verified live with a real matching split set.**
+
+The spec deferred this behind bundletool. That was partly wrong. bundletool
+is needed for `.aab` -- an App *Bundle* that must be BUILT into APKs.
+`.apkm` (APKMirror) and `.xapk` (APKPure) are plain ZIPs of already-built
+splits, so extracting one needs nothing but `unzip`.
+
+Extracted `telegram-12.2.10-apkmirror.apkm`, took the subset matching the
+device (`base.apk` + `split_config.x86_64.apk` + `split_config.xhdpi.apk` +
+`split_config.en.apk`, 79 MB), and installed it:
+
+    playground app install <dir>   ->  Success, 1m38s
+
+All four splits registered on the device (`pm path` lists each), the app
+launched, and a screenshot rendered. Installing the *whole* extracted
+bundle would fail on conflicting ABIs -- selecting a device-appropriate
+subset is the caller's job, and remains so.
+
+### A naming gap this exposed
+
+The two ecosystems name split sets differently, and both occur in practice:
+
+| Source | Base | Splits |
+|---|---|---|
+| APKMirror `.apkm` / bundletool | `base.apk` | `split_config.<qualifier>.apk` |
+| APKPure `.xapk` | `<package>.apk` | `config.<qualifier>.apk` |
+
+Requiring the literal name `base.apk` accepted the first and **rejected the
+second**, even though both are installable -- and this project's own
+apk-fetcher downloads `.xapk` files.
+
+`src/playground/android/splits.py` now identifies the base by ELIMINATION:
+a split member is anything named `split_config.*` or `config.*`, and what
+remains is the base. That still refuses the two sets that genuinely cannot
+install -- no base at all, or several base candidates where guessing would
+be worse than refusing. Both the interactive and declarative paths share
+it, since they had already disagreed once and left the device to arbitrate
+with `INSTALL_FAILED_INVALID_APK`.
+
+### Still deferred
+
+`.aab` proper. That genuinely needs bundletool and device-spec-aware split
+selection, and nothing here forecloses adding it.

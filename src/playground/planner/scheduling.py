@@ -17,6 +17,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from playground.android.splits import find_base_apk
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab, ResolvedVm, ResolvedWorkload
 
@@ -183,27 +184,22 @@ def stage_workload_files(
 
             if src.is_dir() and workload.type == "android_app":
                 apks = sorted(src.glob("*.apk"))
-                has_base = any(p.name == "base.apk" for p in apks)
-                if not apks or not has_base:
+                _, reason = find_base_apk(apks)
+                if reason is not None:
                     diagnostics.append(
                         Diagnostic(
                             id="config.workload.split_apk_invalid",
                             severity="error",
                             message=(
                                 f"workload {workload.name!r} declares "
-                                f"source {workload.source!r} ({src}), a "
-                                "directory that must contain a base.apk "
-                                "plus any split APKs, but "
-                                + (
-                                    "no *.apk files were found"
-                                    if not apks
-                                    else "no base.apk was found"
-                                )
+                                f"source {workload.source!r} ({src}), which "
+                                f"is not a valid split set: {reason}"
                             ),
                             source=SourceLocation(path=str(src)),
                             suggestion=(
-                                "name the main APK base.apk and place "
-                                "config/language/density splits alongside it"
+                                "a split set is one base APK (base.apk, or "
+                                "<package>.apk from an .xapk) plus its "
+                                "split_config.*/config.* siblings"
                             ),
                         )
                     )
