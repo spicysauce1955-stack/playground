@@ -256,6 +256,49 @@ def test_android_app_workloads_without_an_android_block_are_skipped_not_crashed(
     )
 
 
+# --- Defect E: the launcher-discovery task must guard on the resolved
+# component's OWN package prefix, not just on the presence of a slash,
+# exactly like src/playground/android/commands.py::launch_cmd. --------
+
+
+def _discovery_task() -> dict:
+    return next(
+        t
+        for t in _tasks()
+        if "resolve-activity" in str(t.get("ansible.builtin.shell", ""))
+    )
+
+
+def test_discovery_guard_checks_the_resolved_component_belongs_to_the_package() -> None:
+    """LIVE BUG: `cmd package resolve-activity` can return a component from
+    a DIFFERENT package (e.g. the Resolver activity or a Settings
+    fallback) when the requested package has no launcher activity of its
+    own. Both contain a `/`, so a slash-only check wrongly launches the
+    foreign component instead of falling through to monkey."""
+    shell = str(_discovery_task()["ansible.builtin.shell"])
+    assert '${ACT#*/}" != "$ACT"' in shell, "must still check for a slash"
+    assert '${ACT%%/*}" =' in shell, (
+        "must also check the resolved component's package prefix matches "
+        "the requested package, or a foreign component (e.g. the "
+        "Resolver activity) gets launched instead of falling through to "
+        "monkey -- see launch_cmd's matching guard"
+    )
+
+
+def test_discovery_task_polls_for_the_process_instead_of_a_single_pidof() -> None:
+    """monkey/am start only dispatch an intent; process creation is async,
+    so a single immediate pidof misreads a successful cold start as a
+    failure. Must poll like the declared-activity sibling task."""
+    shell = str(_discovery_task()["ansible.builtin.shell"])
+    assert "while" in shell, (
+        "must bound-poll pidof instead of checking it exactly once, like "
+        "the declared-activity launch task and launch_cmd itself"
+    )
+    assert shell.count("pidof") == 1, (
+        "the poll loop must be the only pidof check left in this task"
+    )
+
+
 def test_declared_activity_launch_also_verifies_with_pidof() -> None:
     """AUDIT 3d: `am start` returns an exit code that varies by Android
     release and prints its real error on stderr, so it is no more a launch

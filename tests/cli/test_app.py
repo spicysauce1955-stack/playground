@@ -19,6 +19,8 @@ import shlex
 import stat
 from pathlib import Path
 
+import pytest
+import typer
 from typer.testing import CliRunner
 
 import playground.cli.app_commands as app_commands
@@ -879,3 +881,113 @@ def test_shell_help_documents_the_sh_dash_c_workaround() -> None:
     result = CliRunner().invoke(app, ["app", "shell", "--help"])
     assert result.exit_code == 0, result.output
     assert "sh -c" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# BUG 1: `install` must reject .aab/.apks bundles locally, the same rule
+# `stage_workload_files` (planner/scheduling.py) enforces for the
+# declarative `android_app` workload. `.apkm`/`.xapk` are NOT bundles (they
+# are ZIPs of already-built splits) and must still be accepted.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("suffix", [".aab", ".apks"])
+def test_install_rejects_bundle_files(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, suffix
+) -> None:
+    bundle = tmp_path / f"app{suffix}"
+    bundle.write_bytes(b"fake bundle bytes")
+
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "install", str(bundle))
+
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr)
+    assert "config.app.bundle_unsupported" in output
+    assert "bundletool" in output
+    # rejected before `_resolve` ever ran -- no ssh call (boot-wait or
+    # otherwise) should have been attempted.
+    assert not (tmp_path / "ssh.log").exists()
+
+
+@pytest.mark.parametrize("suffix", [".apkm", ".xapk"])
+def test_install_still_accepts_apkm_and_xapk_single_files(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim, suffix
+) -> None:
+    """The bundle rejection above must not overreach: `.apkm` (APKMirror)
+    and `.xapk` (APKPure) are ZIPs of already-built split APKs, not
+    bundles that need `bundletool`."""
+    f = tmp_path / f"app{suffix}"
+    f.write_bytes(b"fake zip bytes")
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    write_scp_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["app", "install", str(f), "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "config.app.bundle_unsupported" not in result.output + str(result.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# BUG 2: `--out` pointing at an existing FILE must fail cleanly (a
+# Diagnostic naming which of "directory" or "file" the flag wants for that
+# verb), not raise a raw `FileExistsError` traceback.
+# --------------------------------------------------------------------------- #
+
+
+def test_screenshot_out_pointing_at_an_existing_file_is_a_clean_failure(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    out_file = tmp_path / "shot.png"
+    out_file.write_bytes(b"not a directory")
+
+    result = _run(tmp_path, monkeypatch, write_apply_shims, write_ssh_shim,
+                  "screenshot", "--out", str(out_file))
+
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr)
+    assert "Traceback" not in output
+    assert "config.app.out_is_a_file" in output
+    assert "directory" in output
+
+
+def test_ensure_out_directory_rejects_an_existing_file(tmp_path, capsys) -> None:
+    """Direct unit test of the helper both `screenshot` and `ui-dump`
+    (fan-out) call before writing output. `ui-dump`'s own fan-out branch
+    only runs this with 2+ matched devices, which no lab config used
+    elsewhere in this module provides -- exercising the helper directly
+    covers that call site's wording without needing a multi-VM lab."""
+    out_file = tmp_path / "dump.xml"
+    out_file.write_bytes(b"not a directory")
+
+    with pytest.raises(typer.Exit) as excinfo:
+        app_commands._ensure_out_directory(
+            out_file, why="ui-dump with more than one matched device (fan-out)"
+        )
+
+    assert excinfo.value.exit_code == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "Traceback" not in output
+    assert "config.app.out_is_a_file" in output
+    assert "ui-dump" in output
+
+
+def test_ensure_out_directory_creates_a_missing_directory(tmp_path) -> None:
+    """Happy path: a not-yet-existing --out is still created, same as the
+    `mkdir(parents=True, exist_ok=True)` call this helper replaced."""
+    out_dir = tmp_path / "fresh" / "nested"
+    app_commands._ensure_out_directory(out_dir, why="screenshot")
+    assert out_dir.is_dir()

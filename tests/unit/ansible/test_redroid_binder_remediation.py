@@ -71,9 +71,16 @@ def test_binder_is_reprobed_after_remediation() -> None:
 def test_abort_message_mentions_the_attempted_remediation() -> None:
     text = TASKS.read_text()
     assert "linux-modules-extra" in text
+    # Select the BINDER abort by content rather than by count: the role
+    # legitimately has more than one abort now (adb presence is a separate
+    # honest gate), and counting would make any future gate a failure here.
     fail_tasks = [t for t in _tasks() if "ansible.builtin.fail" in t]
-    assert len(fail_tasks) == 1
-    msg = fail_tasks[0]["ansible.builtin.fail"]["msg"]
+    binder_aborts = [
+        f for f in fail_tasks
+        if "binder" in str(f["ansible.builtin.fail"]["msg"]).lower()
+    ]
+    assert len(binder_aborts) == 1, "expected exactly one binder abort"
+    msg = binder_aborts[0]["ansible.builtin.fail"]["msg"]
     assert "modules-extra" in msg, "the abort must say remediation was already tried"
 
 

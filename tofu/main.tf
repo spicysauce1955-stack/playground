@@ -118,12 +118,15 @@ resource "libvirt_domain" "playground_node" {
   vcpu   = var.vm_vcpu
 
   # CPU mode is configurable per lab (via spec.providers.local-libvirt.cpu_mode).
-  # Default `host-passthrough` is required for the redroid-host lab — Redroid
-  # containers need binderfs, which needs full CPU feature passthrough. On
-  # hosts where the L0 hypervisor doesn't tolerate VMX passthrough (symptom:
-  # QEMU pauses or crashes the guest right after `virsh start` and the kernel
-  # logs `kvm_intel: vmread/vmwrite failed`), a non-Redroid lab can override
-  # to `host-model`.
+  # Default `host-passthrough` is a PRD constraint: it exposes the host CPU's
+  # virt extensions to the guest, which nested hypervisors and virt-accelerated
+  # guest workloads need. It is NOT what Redroid needs — binder is a kernel
+  # module (linux-modules-extra-<kernel>), not a CPU feature; see the redroid
+  # role and docs/architecture/CONTRACTS.md, "Redroid needs binder, not nested
+  # virtualization". On hosts where the L0 hypervisor doesn't tolerate VMX
+  # passthrough (symptom: QEMU pauses or crashes the guest right after
+  # `virsh start` and the kernel logs `kvm_intel: vmread/vmwrite failed`), a
+  # lab can override to `host-model`.
   cpu {
     mode = var.cpu_mode
   }

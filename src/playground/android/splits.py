@@ -20,6 +20,17 @@ Both the interactive ``playground app install`` and the declarative
 ``android_app`` staging path use this, because they previously disagreed
 about what a valid split set was and the device was left to arbitrate with
 ``INSTALL_FAILED_INVALID_APK``.
+
+Scope of the two prefixes, checked rather than assumed: every bundle in
+``apk-fetcher/downloads`` was enumerated on 2026-09-03, and each extracts
+to exactly ONE non-split APK -- ``.apkm`` to ``base.apk`` plus
+``split_config.*``, ``.xapk`` to ``<package>.apk`` plus ``config.*``. A
+review raised a third possible layout, ``<package>.config.<qualifier>.apk``;
+no bundle here uses it, so it is deliberately NOT matched. Adding a
+speculative pattern for an unobserved format would risk misreading a
+legitimate base such as ``com.foo.config.bar.apk`` as a split, turning a
+working set into "the base APK is missing". If such a bundle turns up, add
+the prefix with a sample to test against.
 """
 
 from __future__ import annotations

@@ -390,6 +390,43 @@ def _timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _ensure_out_directory(out: Path, *, why: str) -> None:
+    """``out.mkdir(parents=True, exist_ok=True)``, but exit with a clean
+    Diagnostic instead of a bare traceback when ``--out`` already exists as
+    a FILE.
+
+    ``exist_ok=True`` only tolerates a pre-existing leaf that is itself a
+    directory — Python still raises ``FileExistsError`` when the leaf
+    exists as a plain file (e.g. ``playground app screenshot --out
+    shot.png``, where the caller meant `ui-dump`'s single-file meaning of
+    ``--out`` but this verb's ``--out`` names a DIRECTORY). This is the
+    mirror image of the ``local_path.is_dir()`` check in
+    ``_capture_to_local`` above, which already handles the flag pointing
+    at an existing DIRECTORY when the verb wants a FILE.
+    """
+    if out.exists() and not out.is_dir():
+        _fail(
+            Diagnostic(
+                id="config.app.out_is_a_file",
+                severity="error",
+                message=f"--out {str(out)!r} is a file, but {why} needs a directory",
+                source=SourceLocation(path=str(out)),
+                suggestion="pass a directory path, or remove the existing file first",
+            )
+        )
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _fail(
+            Diagnostic(
+                id="config.app.out_dir_uncreatable",
+                severity="error",
+                message=f"cannot create --out directory {str(out)!r}: {exc}",
+                source=SourceLocation(path=str(out)),
+            )
+        )
+
+
 @app_app.command(
     "install",
     help="Install an APK. A directory installs every *.apk inside as one split install.",
@@ -413,6 +450,33 @@ def install_command(
                 severity="error",
                 message=f"APK path {str(path)!r} does not exist",
                 source=SourceLocation(path=str(path)),
+            )
+        )
+
+    if path.suffix in (".aab", ".apks"):
+        # Same rule `stage_workload_files` enforces in planner/scheduling.py
+        # for the declarative `android_app` workload — this is not a
+        # directory, so it would otherwise skip the split-set gate below
+        # entirely, scp a 100MB+ bundle to the guest, and fail with
+        # `INSTALL_FAILED_INVALID_APK`: the exact "let the device answer"
+        # outcome the split-set comment above names, just reached from the
+        # opposite direction. Match the declarative side's wording so the
+        # two are recognisably the same rule.
+        _fail(
+            Diagnostic(
+                id="config.app.bundle_unsupported",
+                severity="error",
+                message=(
+                    f"{str(path)!r} is an Android App Bundle — Redroid "
+                    "installs APKs, not bundles"
+                ),
+                source=SourceLocation(path=str(path)),
+                suggestion=(
+                    "convert the bundle to device-specific APKs with "
+                    "`bundletool build-apks` / `install-apks` (or ship the "
+                    "split APKs directly); see "
+                    "docs/research/android-emulation/app-install-launch.md"
+                ),
             )
         )
 
@@ -652,7 +716,7 @@ def screenshot_command(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
         config_dir=config_dir, tofu_dir=tofu_dir,
     )
-    out.mkdir(parents=True, exist_ok=True)
+    _ensure_out_directory(out, why="screenshot (one PNG per matched device)")
     device_path = "/sdcard/playground-screenshot.png"
     failed: list[str] = []
     for target in targets:
@@ -688,7 +752,9 @@ def ui_dump_command(
     device_path = "/sdcard/playground-ui-dump.xml"
     multi = len(targets) > 1
     if multi:
-        out.mkdir(parents=True, exist_ok=True)
+        _ensure_out_directory(
+            out, why="ui-dump with more than one matched device (fan-out)"
+        )
     failed: list[str] = []
     for target in targets:
         local_path = out / f"{target.vm_name}-{_timestamp()}.xml" if multi else out

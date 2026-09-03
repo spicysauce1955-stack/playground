@@ -273,11 +273,24 @@
 # app's real launcher component; `am start -n` on it gives an honest
 # 0/non-0. monkey survives only as the last-resort fallback when
 # resolution fails, and its own exit status is discarded in favour of
-# the trailing `pidof` -- "did it launch" is a question about the
+# a bounded `pidof` poll -- "did it launch" is a question about the
 # process, not about which command started it.
 #
+# `resolve-activity` can return a component that belongs to a DIFFERENT
+# package (e.g. `android/...ResolverActivity` or a Settings fallback)
+# when the requested package has no launcher activity of its own --
+# both contain a `/`, so checking for that alone is not enough; the
+# component's own package prefix (`${ACT%%/*}`) must match the
+# requested package too, or this falls through to monkey. See
+# launch_cmd's comment for the same guard.
+#
+# monkey only dispatches an intent; process creation is async, so a
+# single `pidof` right after is a race that reports a false failure on
+# a slow cold start -- poll for a bounded number of attempts instead,
+# same as the declared-activity task above.
+#
 # The device-side script is quoted as ONE argument to `adb shell` so
-# `$(...)`, `;` and the `if` run on the DEVICE (Android's
+# `$(...)`, `;` and the `if`/`while` run on the DEVICE (Android's
 # /system/bin/sh), not on the guest invoking adb.
 #
 # failed_when: false -- see the idempotency note at the top of this
@@ -288,13 +301,15 @@
   ansible.builtin.shell: >-
     adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true;
     adb -s 127.0.0.1:5555 shell
-    'ACT=$(cmd package resolve-activity --brief {{ item.item.android.package }} | tail -n 1);
-    if [ -n "$ACT" ] && [ "${ACT#*/}" != "$ACT" ]; then
+    'ACT=$(cmd package resolve-activity --brief {{ item.item.android.package | quote }} | tail -n 1);
+    if [ -n "$ACT" ] && [ "${ACT#*/}" != "$ACT" ] && [ "${ACT%%/*}" = {{ item.item.android.package | quote }} ]; then
     am start -n "$ACT" >/dev/null 2>&1;
     else
-    monkey -p {{ item.item.android.package }} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;
-    fi;
-    pidof {{ item.item.android.package }} >/dev/null 2>&1'
+    monkey -p {{ item.item.android.package | quote }} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;
+    n=0; while [ "$n" -lt 10 ]; do
+    pidof {{ item.item.android.package | quote }} >/dev/null 2>&1 && exit 0;
+    n=$((n + 1)); sleep 1; done; exit 1;
+    fi'
   args:
     executable: /bin/bash
   loop: "{{ pg_pidof.results | default([]) }}"

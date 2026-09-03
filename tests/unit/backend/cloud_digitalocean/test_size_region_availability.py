@@ -44,6 +44,170 @@ def _stub(monkeypatch: pytest.MonkeyPatch, status: int, body: dict) -> None:
     )
 
 
+_PAGE_1_WITH_NEXT = {
+    "sizes": _SIZES_BODY["sizes"],
+    "links": {
+        "pages": {
+            "next": "https://api.digitalocean.com/v2/sizes?page=2&per_page=200",
+        }
+    },
+}
+
+_PAGE_2_MATCH = {
+    "sizes": [
+        {
+            "slug": "s-page-2-only",
+            "available": True,
+            "regions": ["nyc1"],
+        },
+    ],
+    # No `links.pages.next` -> this is the last page; catalogue is complete.
+}
+
+_PAGE_2_NO_MATCH_NO_NEXT = {
+    "sizes": [
+        {
+            "slug": "s-something-else",
+            "available": True,
+            "regions": ["nyc1"],
+        },
+    ],
+}
+
+
+def _stub_sequence(monkeypatch: pytest.MonkeyPatch, responses: list[tuple[int, dict]]) -> None:
+    """Stub `_request` to return successive responses on successive calls,
+    regardless of the `path`/`params` passed (mirrors how `check_size_region_
+    availability` follows an absolute `links.pages.next` URL as `path`)."""
+    calls = iter(responses)
+
+    def fake_request(method, path, token, *, params=None, timeout=15):
+        try:
+            return next(calls)
+        except StopIteration:  # pragma: no cover - test bug guard
+            raise AssertionError("more pages fetched than stubbed") from None
+
+    monkeypatch.setattr(do_module, "_request", fake_request)
+
+
+# ---------------------------------------------------------------------------
+# Pagination: slug found on page 2 -> definitive result regardless of
+# whether the rest of the catalogue was ever fetched
+# ---------------------------------------------------------------------------
+
+
+def test_size_found_on_second_page_returns_no_diagnostics(monkeypatch):
+    _stub_sequence(
+        monkeypatch,
+        [(200, _PAGE_1_WITH_NEXT), (200, _PAGE_2_MATCH)],
+    )
+    diags = check_size_region_availability(
+        "tok", lab_name="my-lab", size="s-page-2-only", region="nyc1",
+    )
+    assert diags == []
+
+
+def test_size_found_on_second_page_but_wrong_region_returns_error(monkeypatch):
+    _stub_sequence(
+        monkeypatch,
+        [(200, _PAGE_1_WITH_NEXT), (200, _PAGE_2_MATCH)],
+    )
+    diags = check_size_region_availability(
+        "tok", lab_name="my-lab", size="s-page-2-only", region="ams3",
+    )
+    assert len(diags) == 1
+    assert diags[0].severity == "error"
+    assert diags[0].id == "runtime.cloud.size_unavailable_in_region"
+
+
+# ---------------------------------------------------------------------------
+# Pagination: truncated (page cap hit) + unknown slug -> WARNING, never error
+# ---------------------------------------------------------------------------
+
+
+def test_pagination_truncated_by_page_cap_and_unknown_slug_returns_warning(monkeypatch):
+    """Every page keeps advertising a `next` link, so pagination never
+    terminates naturally and hits `_MAX_SIZE_PAGES`. The slug is never
+    seen. This must degrade to a warning, not assert non-existence."""
+
+    def fake_request(method, path, token, *, params=None, timeout=15):
+        return (
+            200,
+            {
+                "sizes": [{"slug": "s-filler", "available": True, "regions": ["nyc1"]}],
+                "links": {
+                    "pages": {
+                        "next": "https://api.digitalocean.com/v2/sizes?page=999&per_page=200",
+                    }
+                },
+            },
+        )
+
+    monkeypatch.setattr(do_module, "_request", fake_request)
+    diags = check_size_region_availability(
+        "tok", lab_name="my-lab", size="s-does-not-exist", region="nyc3",
+    )
+    assert len(diags) == 1
+    assert diags[0].severity == "warning"
+    assert diags[0].id == "runtime.cloud.size_check_unavailable"
+    assert diags[0].id != "runtime.cloud.size_unavailable_in_region"
+
+
+# ---------------------------------------------------------------------------
+# Pagination: fully enumerated (multiple pages, last one has no `next`) +
+# unknown slug -> hard error, because absence was actually confirmed
+# ---------------------------------------------------------------------------
+
+
+def test_pagination_fully_enumerated_and_unknown_slug_returns_error(monkeypatch):
+    _stub_sequence(
+        monkeypatch,
+        [(200, _PAGE_1_WITH_NEXT), (200, _PAGE_2_NO_MATCH_NO_NEXT)],
+    )
+    diags = check_size_region_availability(
+        "tok", lab_name="my-lab", size="s-does-not-exist", region="nyc3",
+    )
+    assert len(diags) == 1
+    assert diags[0].severity == "error"
+    assert diags[0].id == "runtime.cloud.size_unavailable_in_region"
+
+
+# ---------------------------------------------------------------------------
+# Pagination: mid-pagination fetch failure -> WARNING, never error
+# ---------------------------------------------------------------------------
+
+
+def test_mid_pagination_transport_failure_returns_warning(monkeypatch):
+    """First page succeeds and points at a next page; the second page fetch
+    fails outright (transport error). The slug isn't in what was fetched,
+    but the listing was never confirmed complete."""
+    _stub_sequence(
+        monkeypatch,
+        [(200, _PAGE_1_WITH_NEXT), (0, {})],
+    )
+    diags = check_size_region_availability(
+        "tok", lab_name="my-lab", size="s-does-not-exist", region="nyc3",
+    )
+    assert len(diags) == 1
+    assert diags[0].severity == "warning"
+    assert diags[0].id == "runtime.cloud.size_check_unavailable"
+
+
+def test_mid_pagination_malformed_shape_returns_warning(monkeypatch):
+    """First page succeeds; the second page's body is missing the `sizes`
+    key entirely. Inconclusive, so this must warn rather than error."""
+    _stub_sequence(
+        monkeypatch,
+        [(200, _PAGE_1_WITH_NEXT), (200, {"unexpected": "shape"})],
+    )
+    diags = check_size_region_availability(
+        "tok", lab_name="my-lab", size="s-does-not-exist", region="nyc3",
+    )
+    assert len(diags) == 1
+    assert diags[0].severity == "warning"
+    assert diags[0].id == "runtime.cloud.size_check_unavailable"
+
+
 # ---------------------------------------------------------------------------
 # Case 1: size available in the requested region -> no diagnostic
 # ---------------------------------------------------------------------------
@@ -189,3 +353,49 @@ def test_token_never_appears_in_any_diagnostic(monkeypatch):
             assert secret not in (d.suggestion or ""), (
                 f"token leaked in diagnostic suggestion: {d.suggestion!r}"
             )
+
+
+def test_token_never_appears_in_any_diagnostic_across_pagination(monkeypatch):
+    """Same guarantee as above, but exercising the paginated code paths:
+    slug found on page 2, page-cap truncation, and a mid-pagination
+    failure."""
+    secret = "dop_v1_" + "t" * 64
+
+    def multi_page_ok(method, path, token, *, params=None, timeout=15):
+        assert secret not in path
+        if params:
+            assert secret not in str(params)
+        return (200, _PAGE_1_WITH_NEXT) if "page=2" not in path else (200, _PAGE_2_MATCH)
+
+    monkeypatch.setattr(do_module, "_request", multi_page_ok)
+    diags = check_size_region_availability(
+        secret, lab_name="my-lab", size="s-page-2-only", region="nyc1",
+    )
+    for d in diags:
+        assert secret not in (d.message or "")
+        assert secret not in (d.suggestion or "")
+
+    def always_next_page(method, path, token, *, params=None, timeout=15):
+        return (
+            200,
+            {
+                "sizes": [{"slug": "s-filler", "available": True, "regions": ["nyc1"]}],
+                "links": {"pages": {"next": "https://api.digitalocean.com/v2/sizes?page=999"}},
+            },
+        )
+
+    monkeypatch.setattr(do_module, "_request", always_next_page)
+    diags = check_size_region_availability(
+        secret, lab_name="my-lab", size="s-does-not-exist", region="nyc3",
+    )
+    for d in diags:
+        assert secret not in (d.message or "")
+        assert secret not in (d.suggestion or "")
+
+    _stub_sequence(monkeypatch, [(200, _PAGE_1_WITH_NEXT), (0, {})])
+    diags = check_size_region_availability(
+        secret, lab_name="my-lab", size="s-does-not-exist", region="nyc3",
+    )
+    for d in diags:
+        assert secret not in (d.message or "")
+        assert secret not in (d.suggestion or "")

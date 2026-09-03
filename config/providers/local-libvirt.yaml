@@ -28,6 +28,11 @@ spec:
   capabilities:
     nested_virtualization: true
     privileged_containers: true
-    # cpu mode host-passthrough in tofu/main.tf lets the guest kernel
-    # provide binder.
+    # Redroid needs the guest kernel to load binder_linux (installed by the
+    # redroid Ansible role from linux-modules-extra-<kernel>) and to run a
+    # --privileged container. cpu_mode (host-passthrough by default) is
+    # unrelated to binder -- it exposes host CPU virt extensions for nested
+    # hypervisors, not kernel-module availability. See
+    # docs/architecture/CONTRACTS.md, "Redroid needs binder, not nested
+    # virtualization".
     redroid: true

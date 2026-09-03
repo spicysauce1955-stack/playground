@@ -329,30 +329,59 @@ def _verify_one(
             "adb -s 127.0.0.1:5555 shell pm list packages",
             timeout=timeout,
         )
-        for package in target.android_packages:
-            if f"package:{package}" not in installed.stdout:
-                outcome.log_lines.append(
-                    f"[{target.name}] android package {package} NOT installed"
+        if installed.returncode != 0:
+            outcome.log_lines.append(
+                f"{target.name}: pm list packages failed "
+                f"(exit {installed.returncode}) — cannot verify android packages"
+            )
+            outcome.diagnostics.append(
+                Diagnostic(
+                    id="runtime.apply.verify_failed",
+                    severity="error",
+                    message=(
+                        f"VM {target.name!r}: could not query installed "
+                        f"android packages (adb/ssh exit {installed.returncode}): "
+                        f"{installed.stderr.strip() or '(no stderr)'}"
+                    ),
+                    source=SourceLocation(path=target.ip),
+                    suggestion=(
+                        f"check the device is reachable: "
+                        f"`ssh {target.ssh_user}@{target.ip} adb -s "
+                        "127.0.0.1:5555 shell pm list packages`"
+                    ),
                 )
-                outcome.diagnostics.append(
-                    Diagnostic(
-                        id="runtime.apply.verify_failed",
-                        severity="error",
-                        message=(
-                            f"VM {target.name!r}: declared android_app "
-                            f"package {package!r} is not installed"
-                        ),
-                        source=SourceLocation(path=target.ip),
-                        suggestion=(
-                            "check the workload_android_app role output in "
-                            "the ansible log for this host"
-                        ),
+            )
+        else:
+            # Exact-token membership, not substring — "package:com.foo" is
+            # contained in "package:com.foo.debug" as a substring but they
+            # are different packages. Mirrors the workload_android_app role
+            # (ansible/roles/workload_android_app/tasks/main.yml), which
+            # uses .split() for the same reason.
+            installed_tokens = installed.stdout.split()
+            for package in target.android_packages:
+                if f"package:{package}" not in installed_tokens:
+                    outcome.log_lines.append(
+                        f"[{target.name}] android package {package} NOT installed"
                     )
-                )
-            else:
-                outcome.log_lines.append(
-                    f"[{target.name}] android package {package} installed"
-                )
+                    outcome.diagnostics.append(
+                        Diagnostic(
+                            id="runtime.apply.verify_failed",
+                            severity="error",
+                            message=(
+                                f"VM {target.name!r}: declared android_app "
+                                f"package {package!r} is not installed"
+                            ),
+                            source=SourceLocation(path=target.ip),
+                            suggestion=(
+                                "check the workload_android_app role output in "
+                                "the ansible log for this host"
+                            ),
+                        )
+                    )
+                else:
+                    outcome.log_lines.append(
+                        f"[{target.name}] android package {package} installed"
+                    )
 
     # 4. commands.enabled with target: any
     for cmd in any_commands:

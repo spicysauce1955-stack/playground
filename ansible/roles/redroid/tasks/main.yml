@@ -169,6 +169,46 @@
     update_cache: yes
     cache_valid_time: 3600
   when: redroid_install_adb | bool
+  # Tolerated like the modules-extra task above, for the same reason: an
+  # unreachable archive must not abort the play, and it previously did so
+  # even when adb was ALREADY installed (the apt cache update fails
+  # before the package state is examined). This was the only apt task in
+  # the role without the guard -- an asymmetry, not a decision.
+  # The probe below is the honest gate.
+  failed_when: false
+
+# Whether adb ended up present is what actually matters, and it is not the
+# same question as whether apt succeeded: the operator may have opted out
+# with redroid_install_adb: false, or shipped it by another route. Fail
+# here, naming the opt-out, rather than letting a later `adb` call in
+# workload_android_app or verify-lab die as rc 127 with empty output.
+- name: Confirm adb is on the guest
+  ansible.builtin.command: adb version
+  register: adb_present
+  changed_when: false
+  failed_when: false
+
+- name: Abort when adb is missing (android_app workloads and verify need it)
+  ansible.builtin.fail:
+    msg: |
+      Host '{{ inventory_hostname }}' has no working `adb` on PATH.
+
+      The app-lifecycle layer runs adb ON the guest -- `android_app`
+      workloads and the verify-lab package check both shell out to it --
+      so without it those fail later with a bare exit code 127 and no
+      message.
+
+      redroid_install_adb is currently
+      {{ redroid_install_adb | default(true) }}.
+
+      To resolve:
+        - Leave redroid_install_adb: true and make the apt archive
+          reachable (Ubuntu ships `adb` in universe), OR
+        - Install adb by another route if this host is air-gapped, OR
+        - Keep redroid_install_adb: false ONLY if this lab declares no
+          android_app workloads and you do not need `playground app`.
+          Redroid itself still runs; only the app layer needs the client.
+  when: adb_present.rc != 0
 
 - name: Pull redroid image
   community.docker.docker_image:

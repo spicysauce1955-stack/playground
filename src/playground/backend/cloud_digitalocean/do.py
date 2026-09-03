@@ -192,6 +192,75 @@ def delete_droplet(
     ]
 
 
+_MAX_SIZE_PAGES = 25
+"""Page cap for :func:`_fetch_all_sizes`.
+
+At ``per_page=200`` this is headroom for ~5000 size entries — DigitalOcean's
+catalogue today is a few hundred — while guaranteeing a pathological or
+looping ``links.pages.next`` response can never hang a preflight forever.
+"""
+
+
+def _fetch_all_sizes(
+    token: str,
+) -> tuple[list[dict[str, Any]], bool, str | None, int]:
+    """Fetch the full ``GET /v2/sizes`` catalogue, following ``links.pages.next``.
+
+    Returns ``(sizes, complete, incomplete_reason, last_status)``:
+
+    - ``sizes`` is every entry parsed from every page fetched so far
+      (best-effort — populated even when a later page fails).
+    - ``complete`` is True only when pagination reached a page with no
+      ``links.pages.next`` without ever hitting a transport/HTTP failure, a
+      malformed page body, or the page cap. Only a ``True`` here means the
+      absence of a slug is a confirmed fact rather than an artifact of a
+      truncated fetch.
+    - ``incomplete_reason`` is ``None`` when ``complete`` is True, else one
+      of ``"status_error"`` (transport failure or non-2xx status),
+      ``"shape_error"`` (a page body was missing/malformed ``sizes``), or
+      ``"page_cap"`` (pagination did not terminate within
+      :data:`_MAX_SIZE_PAGES` pages).
+    - ``last_status`` is the HTTP status of the last request attempted (0 for
+      a transport error), used to compose diagnostics.
+
+    The token value is never logged or included in any return value here.
+    """
+    sizes: list[dict[str, Any]] = []
+    path = "/v2/sizes"
+    params: dict[str, Any] | None = {"per_page": 200}
+    status = 0
+    for _ in range(_MAX_SIZE_PAGES):
+        status, body = _request("GET", path, token, params=params, timeout=8)
+        if status == 0 or status >= 300:
+            return sizes, False, "status_error", status
+
+        page_sizes = body.get("sizes")
+        if not isinstance(page_sizes, list):
+            return sizes, False, "shape_error", status
+        sizes.extend(page_sizes)
+
+        next_url: str | None = None
+        links = body.get("links")
+        if isinstance(links, dict):
+            pages = links.get("pages")
+            if isinstance(pages, dict):
+                candidate = pages.get("next")
+                if isinstance(candidate, str) and candidate:
+                    next_url = candidate
+
+        if next_url is None:
+            return sizes, True, None, status
+
+        # `next_url` is an absolute URL that already carries its own query
+        # string (DigitalOcean's pagination convention); passing it as
+        # `path` with no extra `params` lets `_request` use it verbatim
+        # (httpx.Client overrides base_url when given an absolute URL).
+        path = next_url
+        params = None
+
+    return sizes, False, "page_cap", status
+
+
 def check_size_region_availability(
     token: str,
     *,
@@ -204,64 +273,34 @@ def check_size_region_availability(
     DigitalOcean size/region availability is **not static** — capacity moves
     over time (a size can be pulled from one region and added to another
     within the same day), so this queries the live ``GET /v2/sizes`` list
-    instead of consulting any hardcoded allowlist.
+    instead of consulting any hardcoded allowlist. The list is paginated
+    (``links.pages.next``); :func:`_fetch_all_sizes` follows every page up
+    to a bounded cap so a catalogue larger than one page is not mistaken for
+    the complete set.
 
     Returns:
     - ``[]`` when the size exists, is available, and lists ``region``.
     - ``[error Diagnostic]`` (id ``runtime.cloud.size_unavailable_in_region``)
-      when the API confirms the size does not exist, is not available at
-      all, or is not available in ``region``. The message names the regions
-      where the size IS currently available so the operator can fix the lab
-      in one edit.
+      when the size was found (on any page) and confirmed not available in
+      ``region`` or not available at all, OR when the *entire* catalogue was
+      successfully enumerated and the slug is genuinely not in it. The
+      message names the regions where the size IS currently available so
+      the operator can fix the lab in one edit.
     - ``[warning Diagnostic]`` (id ``runtime.cloud.size_check_unavailable``)
-      when the API could not be reached or returned an unexpected shape.
-      This check must NEVER hard-fail an apply on a transient DigitalOcean
-      blip or transport error — a preflight that breaks applies when the API
-      has a hiccup is worse than the 422 it is trying to prevent, so any
-      inconclusive result degrades to a warning and lets the apply proceed.
+      when the API could not be reached, returned an unexpected shape, or
+      the catalogue listing could not be established as complete (a page
+      fetch failed partway through, or pagination hit the page cap) and the
+      slug was not found in what *was* fetched. This check must NEVER
+      hard-fail an apply on a transient DigitalOcean blip, transport error,
+      or an incomplete listing — a preflight that breaks applies when the
+      API has a hiccup, or when the catalogue merely exceeds one page, is
+      worse than the 422 it is trying to prevent. Only a fully enumerated
+      "not found" is reported as a hard error; any inconclusive result
+      degrades to a warning and lets the apply proceed.
 
     The token value is never logged or included in any Diagnostic.
     """
-    status, body = _request(
-        "GET",
-        "/v2/sizes",
-        token,
-        params={"per_page": 200},
-        timeout=8,
-    )
-    if status == 0 or status >= 300:
-        return [
-            Diagnostic(
-                id="runtime.cloud.size_check_unavailable",
-                severity="warning",
-                message=(
-                    f"lab {lab_name!r}: could not verify whether size "
-                    f"{size!r} is available in region {region!r} "
-                    f"(DigitalOcean sizes API returned status {status}); "
-                    "proceeding without this check"
-                ),
-                source=SourceLocation(path="DigitalOcean API"),
-                suggestion=(
-                    "verify manually with `doctl compute size list` or at "
-                    "https://cloud.digitalocean.com/droplets/new"
-                ),
-            )
-        ]
-
-    sizes = body.get("sizes")
-    if not isinstance(sizes, list):
-        return [
-            Diagnostic(
-                id="runtime.cloud.size_check_unavailable",
-                severity="warning",
-                message=(
-                    f"lab {lab_name!r}: DigitalOcean sizes API response had "
-                    "unexpected shape (missing 'sizes' list); proceeding "
-                    "without this check"
-                ),
-                source=SourceLocation(path="DigitalOcean API"),
-            )
-        ]
+    sizes, complete, incomplete_reason, status = _fetch_all_sizes(token)
 
     match: dict[str, Any] | None = None
     for entry in sizes:
@@ -270,6 +309,39 @@ def check_size_region_availability(
             break
 
     if match is None:
+        if not complete:
+            if incomplete_reason == "shape_error":
+                detail = (
+                    "a DigitalOcean sizes API page had an unexpected shape "
+                    "(missing 'sizes' list)"
+                )
+            elif incomplete_reason == "page_cap":
+                detail = (
+                    "the sizes catalogue was not fully enumerated within "
+                    f"{_MAX_SIZE_PAGES} pages"
+                )
+            else:  # "status_error"
+                detail = (
+                    "a DigitalOcean sizes API page request returned status "
+                    f"{status}"
+                )
+            return [
+                Diagnostic(
+                    id="runtime.cloud.size_check_unavailable",
+                    severity="warning",
+                    message=(
+                        f"lab {lab_name!r}: could not verify whether size "
+                        f"{size!r} is available in region {region!r} "
+                        f"({detail}); proceeding without this check"
+                    ),
+                    source=SourceLocation(path="DigitalOcean API"),
+                    suggestion=(
+                        "verify manually with `doctl compute size list` or "
+                        "at https://cloud.digitalocean.com/droplets/new"
+                    ),
+                )
+            ]
+
         return [
             Diagnostic(
                 id="runtime.cloud.size_unavailable_in_region",

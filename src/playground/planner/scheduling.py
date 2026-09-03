@@ -125,9 +125,11 @@ def workload_to_ansible_payload(
     }
     if staged_source is not None:
         payload["staged_source"] = str(staged_source)
-    # getattr (not a direct attribute access): some callers/tests pass a
-    # minimal duck-typed workload without an `android` field, and every
-    # real ResolvedWorkload already defaults it to None.
+    # Direct attribute access, deliberately. An earlier version used
+    # getattr() to tolerate a duck-typed test stub, but that would also
+    # swallow a genuine missing-attribute bug on the real model, so the
+    # stub was given `android = None` instead (see
+    # tests/unit/planner/test_scheduling.py). Do not reintroduce getattr.
     if workload.android is not None:
         payload["android"] = workload.android.model_dump()
     return payload
@@ -160,7 +162,11 @@ def stage_workload_files(
                 continue
             src = (source_base / workload.source).resolve()
 
-            if src.suffix in (".aab", ".apks"):
+            # android_app only, and case-insensitively: `.AAB` slipped
+            # through, and a `compose` workload sourced from `stack.apks`
+            # got an "Android App Bundle" diagnostic that made no sense.
+            suffix = src.suffix.lower()
+            if workload.type == "android_app" and suffix in (".aab", ".apks"):
                 diagnostics.append(
                     Diagnostic(
                         id="config.workload.bundle_unsupported",
@@ -177,6 +183,45 @@ def stage_workload_files(
                             "(or ship the split APKs directly); see "
                             "docs/research/android-emulation/"
                             "app-install-launch.md"
+                        ),
+                    )
+                )
+                continue
+
+            # CROSS-LAYER CONTRACT (see docs/architecture/CONTRACTS.md):
+            # workload_android_app discriminates file-vs-directory by
+            # whether the STAGED path ends in `.apk`. Staging preserves the
+            # source suffix, so a single FILE that is not `*.apk` would be
+            # staged as a file and then classified by the role as a split
+            # DIRECTORY, failing as `copy: src: "<file>/"`.
+            #
+            # The realistic trigger is the very thing the docs tell
+            # operators they download: an un-extracted `.xapk` (APKPure) or
+            # `.apkm` (APKMirror). Those are ZIPs of already-built splits,
+            # so the fix for the operator is to extract them -- say that,
+            # here, instead of letting the role fail on a path shape.
+            if (
+                workload.type == "android_app"
+                and src.is_file()
+                and suffix != ".apk"
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.workload.apk_bundle_not_extracted",
+                        severity="error",
+                        message=(
+                            f"workload {workload.name!r} declares source "
+                            f"{workload.source!r}, a single {suffix!r} file. "
+                            "An android_app source must be a *.apk file, or "
+                            "a directory of split APKs"
+                        ),
+                        source=SourceLocation(path=str(src)),
+                        suggestion=(
+                            f"`.xapk` / `.apkm` are ZIP archives of built "
+                            f"splits: extract it (`unzip {src.name} -d "
+                            "<dir>/`) and point `source` at the directory, "
+                            "keeping one base APK plus the splits that match "
+                            "the device"
                         ),
                     )
                 )
