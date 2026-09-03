@@ -48,10 +48,47 @@ def remote_capture_dir(vm: str) -> str:
 
 
 def start_cmd(vm: str) -> str:
+    """Start the capture unit and confirm it actually came up.
+
+    `systemctl start` is not sufficient evidence on its own: the unit is
+    `Type=exec`, so the start job completes when /bin/sh execs -- not
+    when the wrapper's own `exec` of nsenter+tcpdump succeeds. A wrapper
+    that dies immediately (no Redroid container, an AppArmor denial)
+    still exits 0 here, and `playground capture start` would record a
+    session for a capture that is not running.
+
+    Hence the delay before the check rather than an immediate probe: with
+    `RestartSec=5` on the unit, a wrapper that died reports `activating`
+    (auto-restart pending) during the gap, so sleeping inside that gap and
+    then requiring exactly `active` separates healthy from broken.
+
+    The unit name is assigned to a shell variable ONCE
+    (``unit=<shlex.quote(...)>``) rather than interpolated at each use
+    site: `shlex.quote` produces a token that is safe to place BARE on a
+    command line, but the final diagnostic message needs the unit name
+    INSIDE an already-double-quoted `echo "..."` string, where single
+    quotes are not special. Splicing a `shlex.quote`d literal straight
+    into that context breaks (found live, via `sh -n`, for a VM name
+    containing a single quote: the embedded `'...'"'"'...'` sequence does
+    not close before the surrounding double quotes do). Assigning once
+    and referencing `$unit`/`"$unit"` sidesteps this: the shell expands a
+    variable's value verbatim, with no re-parsing for quotes, `$`, or
+    backticks in that value, so it is safe in both the bare argument
+    positions (`"$unit"`, quoted against word-splitting) and inside the
+    double-quoted message.
+    """
     # -n (non-interactive) rather than a bare `sudo`: the ssh call has no
     # tty, so a sudoers misconfiguration would otherwise hang until the
     # subprocess timeout instead of failing with a readable message.
-    return f"sudo -n systemctl start {shlex.quote(unit_name(vm))}"
+    unit_literal = shlex.quote(unit_name(vm))
+    return (
+        f"unit={unit_literal}; "
+        'sudo -n systemctl start "$unit" || exit 1; '
+        "sleep 2; "
+        'state=$(systemctl is-active "$unit" 2>/dev/null || true); '
+        '[ "$state" = active ] || { '
+        'echo "capture: $unit is $state, not active" >&2; exit 1; }'
+    )
 
 
 def stop_cmd(vm: str) -> str:
