@@ -333,6 +333,10 @@ def render_inventory(
         "",
         "[playground:vars]",
         f"pg_lab={resolved.lab_name}",
+        # Lab-level capture bounds for the `capture` role. A group var,
+        # not a host var: spec.capture is lab-scoped, so every capturable
+        # VM in the lab shares it.
+        f"pg_capture='{_capture_group_var(resolved)}'",
         "",
     ]
 
@@ -354,6 +358,18 @@ def _provisioner_group(ansible_role: str) -> str:
     aren't themselves named docker-host.
     """
     return f"needs_{ansible_role.replace('-', '_')}"
+
+
+def _capture_group_var(resolved: ResolvedLab) -> str:
+    """JSON-encode the lab's capture bounds for the `capture` role.
+
+    Same escape as `pg_workloads` / `pg_extra_hosts`: an embedded single
+    quote would end the `.ini` value early.
+    """
+    payload = json.dumps(
+        resolved.capture.model_dump(), separators=(",", ":"), sort_keys=True
+    )
+    return payload.replace("'", "'\\''")
 
 
 __all__ = [

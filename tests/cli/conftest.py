@@ -35,7 +35,13 @@ def _write_apply_shims(
     ``ansible_exit``.
     """
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    # exist_ok=True: a test that chains two CLI invocations against the
+    # same tmp_path (e.g. `start` then `stop`) calls this factory twice.
+    # `write_ssh_shim`/`write_scp_shim` below already tolerate that; this
+    # one didn't, and every existing caller happened to invoke it exactly
+    # once per test, so the gap went unnoticed until capture's start/stop
+    # tests chained two `_run` calls.
+    bin_dir.mkdir(exist_ok=True)
     default_ips = (
         '{"vm_ips": {"sensitive": false, "type": ["map","string"], '
         '"value": {"node1":"10.0.10.42","docker1":"10.0.10.43","router1":"10.0.10.44"}}}'

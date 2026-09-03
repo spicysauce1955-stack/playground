@@ -10,6 +10,7 @@ from playground.models.base import StrictModel
 from playground.models.kinds import (
     AndroidAppOptions,
     Budget,
+    CaptureOptions,
     NetworkProfileSpec,
     RetentionPolicy,
     SshConfig,
@@ -122,6 +123,9 @@ class ResolvedLab(StrictModel):
     backend: str
     offline: bool
     budget: Budget
+    capture: CaptureOptions
+    """Always populated -- falls back to ``Defaults.spec.capture`` when the
+    lab omits ``spec.capture``."""
     dns_domain: str
     """Per-lab DNS domain. Always populated — defaults to
     ``<lab_name>.lab`` when the lab YAML omits ``spec.dns_domain``."""

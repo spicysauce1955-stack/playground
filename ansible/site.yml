@@ -52,6 +52,17 @@
     # lacks support.
     - redroid
 
+- name: Install packet-capture tooling
+  hosts: needs_capture
+  become: yes
+  gather_facts: no
+  roles:
+    # Opt-in via the VmRole provisioner list, like redroid above. Runs
+    # AFTER redroid because the wrapper it installs discovers a running
+    # Redroid container. Installs tooling only -- it never starts a
+    # capture session, so a re-apply cannot disturb one in progress.
+    - capture
+
 - name: Deploy container workloads
   hosts: playground
   become: yes

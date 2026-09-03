@@ -74,6 +74,7 @@ def resolve_lab(
         backend=lab.spec.backend,
         offline=lab.spec.offline or defaults.spec.offline,
         budget=lab.spec.budget or defaults.spec.budget,
+        capture=lab.spec.capture or defaults.spec.capture,
         # Derive a default DNS domain from the lab name when the lab
         # doesn't override; tofu's libvirt_network resources serve this
         # via dnsmasq so cross-VM resolution works without /etc/hosts.

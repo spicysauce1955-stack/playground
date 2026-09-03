@@ -49,6 +49,7 @@ from playground.backend.local_libvirt.apply import (
 from playground.backend.local_libvirt.inventory import fetch_vm_ips, render_inventory
 from playground.backend.local_libvirt.verify import verify_lab
 from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
+from playground.capture.state import lab_capture_dir
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
@@ -244,10 +245,11 @@ def execute_reset(
     # ---- Step 3: clean-state-files (only when teardown is confirmed clean) ----
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
+    capture_dir = lab_capture_dir(state_dir, lab)
     bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
     cleanup_step, cleanup_diags = _clean_state_files(
         lab=lab,
-        targets=[per_lab_dir, inventory_path, workload_dir],
+        targets=[per_lab_dir, inventory_path, workload_dir, capture_dir],
         log_path=logs_dir / "clean-state-files.log",
     )
     steps.append(cleanup_step)

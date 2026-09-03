@@ -284,3 +284,123 @@ def test_scrub_lab_surfaces_unexpected_undefine_failure(
     assert step.exit_code == 1
     assert any(d.id == "runtime.reset.scrub_failed" for d in diagnostics)
     assert any("node1" in (d.message or "") for d in diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# Capture state cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_reset_removes_the_labs_capture_session_records(tmp_path) -> None:
+    """A stale record makes `capture start` refuse forever after a lab is
+    destroyed and re-applied: the record lives on the operator's machine,
+    but the unit it names went away with the guest."""
+    from playground.backend.local_libvirt.runner import _clean_state_files
+    from playground.capture.state import lab_capture_dir
+
+    capture_dir = lab_capture_dir(tmp_path, "redroid-cloud")
+    capture_dir.mkdir(parents=True)
+    (capture_dir / "droid1.json").write_text("{}")
+    other = lab_capture_dir(tmp_path, "other-lab")
+    other.mkdir(parents=True)
+    (other / "droid1.json").write_text("{}")
+
+    step, diagnostics = _clean_state_files(
+        lab="redroid-cloud",
+        targets=[capture_dir],
+        log_path=tmp_path / "clean.log",
+    )
+
+    assert step.exit_code == 0
+    assert diagnostics == []
+    assert not capture_dir.exists()
+    # Never another lab's state.
+    assert (other / "droid1.json").is_file()
+
+
+def test_all_three_backends_wire_capture_into_clean_state_files() -> None:
+    """The test above calls `_clean_state_files` directly, so it passes
+    with or without this task's change — it documents the per-lab
+    isolation invariant, it does not gate the wiring. THIS is the gate:
+    each backend's `execute_reset` must both build the capture path
+    through the SAME function `session_path` uses (`lab_capture_dir` in
+    `playground.capture.state`) and hand its result to the cleaner.
+    Building it without passing it is a silent no-op, which is the exact
+    failure mode worth a test.
+
+    This used to assert on the literal source text
+    `'state_dir / "state" / "capture" / lab'` -- if `session_path` (or
+    any runner) had ever moved off that literal, `reset` would scrub the
+    wrong directory with a green suite. Parsing the AST for an actual
+    call to `lab_capture_dir(state_dir, lab)` whose result feeds
+    `targets=[...]` ties this test to the same function every path is
+    now built from, rather than to a string every writer must
+    independently keep in sync.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    from playground.capture.state import lab_capture_dir as _lab_capture_dir
+
+    assert _lab_capture_dir.__module__ == "playground.capture.state"
+
+    backend_root = (
+        _Path(__file__).resolve().parents[4] / "src" / "playground" / "backend"
+    )
+    for backend in ("local_libvirt", "local_vbox", "cloud_digitalocean"):
+        path = backend_root / backend / "runner.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+
+        reset_fn = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "execute_reset"
+            ),
+            None,
+        )
+        assert reset_fn is not None, f"{backend}: no execute_reset() found"
+
+        # Find `<name> = lab_capture_dir(state_dir, lab)` inside execute_reset.
+        assigned_name = None
+        for node in ast.walk(reset_fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            call = node.value
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "lab_capture_dir"
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                assigned_name = node.targets[0].id
+                break
+        assert assigned_name is not None, (
+            f"{backend}: execute_reset never calls lab_capture_dir(...) to "
+            "build the per-lab capture path"
+        )
+
+        # Find the `_clean_state_files(..., targets=[...])` call and require
+        # the assigned name to be one of its elements.
+        targets_call = None
+        for node in ast.walk(reset_fn):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg == "targets" and isinstance(kw.value, ast.List):
+                    targets_call = kw.value
+                    break
+            if targets_call is not None:
+                break
+        assert targets_call is not None, (
+            f"{backend}: no _clean_state_files(targets=[...]) call found"
+        )
+        target_names = [
+            elt.id for elt in targets_call.elts if isinstance(elt, ast.Name)
+        ]
+        assert assigned_name in target_names, (
+            f"{backend}: {assigned_name} (from lab_capture_dir(...)) is "
+            "built but never passed to _clean_state_files, so reset would "
+            "silently not scrub it"
+        )

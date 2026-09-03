@@ -41,6 +41,7 @@ from playground.backend.local_libvirt.scrub import scrub_lab
 from playground.backend.local_libvirt.tfvars import render_tfvars
 from playground.backend.local_libvirt.verify import verify_lab
 from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
+from playground.capture.state import lab_capture_dir
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic
 from playground.models.resolved import ResolvedLab
@@ -369,8 +370,8 @@ def execute_reset(
        the reset — the operator chose reset precisely because tofu
        was already unreliable.
     4. **clean-state-files**: remove per-lab artifacts under
-       ``.playground/state/{tofu,inventory,workloads}/`` so the next
-       ``playground apply`` starts from a clean slate. Shared
+       ``.playground/state/{tofu,inventory,workloads,capture}/`` so the
+       next ``playground apply`` starts from a clean slate. Shared
        artifacts (tofu/terraform.tfstate, ubuntu-noble.qcow2 base
        image) are never touched.
 
@@ -388,6 +389,7 @@ def execute_reset(
     tfvars_path = state_dir / "state" / "tofu" / f"{lab}.tfvars.json"
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
+    capture_dir = lab_capture_dir(state_dir, lab)
 
     tfvars_path.parent.mkdir(parents=True, exist_ok=True)
     tfvars = render_tfvars(resolved)
@@ -472,7 +474,7 @@ def execute_reset(
     bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
     cleanup_step, cleanup_diagnostics = _clean_state_files(
         lab=lab,
-        targets=[tfvars_path, inventory_path, workload_dir],
+        targets=[tfvars_path, inventory_path, workload_dir, capture_dir],
         log_path=logs_dir / "clean-state-files.log",
     )
     steps.append(cleanup_step)
