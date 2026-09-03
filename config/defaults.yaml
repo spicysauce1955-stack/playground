@@ -39,10 +39,13 @@ spec:
 
   capture:
     enabled: true
-    # max_file_mb * max_files is a hard 1 GB ceiling per device per
-    # session. tcpdump -C counts 1,000,000-byte units, not MiB, and -C
-    # with -W is a RING: the oldest file is overwritten, so a long session
-    # keeps the most recent 1 GB. See CaptureOptions.
+    # max_file_mb * max_files bounds ONE tcpdump invocation (1 GB at
+    # these defaults), not the directory: -W counts files per base name,
+    # and a fresh timestamp -- so a fresh base name -- starts on every
+    # unit start, including every Redroid container restart. tcpdump -C
+    # counts 1,000,000-byte units, not MiB, and -C with -W overwrites the
+    # oldest file WITHIN one invocation. See CaptureOptions for the full
+    # ceiling argument.
     max_file_mb: 100
     max_files: 10
     snaplen: 0

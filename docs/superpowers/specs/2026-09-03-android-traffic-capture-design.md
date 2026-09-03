@@ -124,6 +124,19 @@ Two properties of that ceiling must be stated rather than assumed:
   `max_files` is visible as "wrapping"; raising the limits is the operator's
   call, and it is better than the alternative of filling the disk.
 
+  > **Post-implementation correction (Task 9):** "hard ceiling" is only
+  > true within one uninterrupted `tcpdump` process. `-W`'s ring counts
+  > files **per base name**, and the wrapper mints a fresh timestamp on
+  > every unit start — including every Redroid container restart, since
+  > `Restart=always` re-execs it. So the true ceiling is `max_file_mb *
+  > max_files` **per session-start**, and N restarts permit up to N times
+  > that much on disk, not one fixed cap. This is a deliberate trade
+  > (see the `capture-start` wrapper comment): one fixed filename would
+  > give a true global cap, but would silently TRUNCATE the previous
+  > session's data on every restart instead. See
+  > `docs/architecture/CONTRACTS.md` → "Capture: Redroid device traffic"
+  > for the full argument.
+
 Defaults live in `config/defaults.yaml` next to `retention`, so a lab that
 declares no `capture` block still gets the bounded ring.
 
@@ -170,10 +183,42 @@ exec nsenter --target "$pid" --net \
     -C "$max_file_mb" -W "$max_files"
 ```
 
+> **Post-implementation correction (Task 9):** the `-w` argument above
+> does not do what it looks like it does. `tcpdump` applies `strftime()`
+> to `-w` only when `-G` is also given; under `-C`/`-W` alone it writes
+> the name **verbatim** and appends a bare rotation counter. Verified
+> live: `-w '%Y%m%d-%H%M%S.pcap' -C 1 -W 3` produced a file literally
+> named `%Y%m%d-%H%M%S.pcap0`, not a timestamped one. The shipped
+> wrapper instead computes the stamp itself with `date -u
+> +%Y%m%d-%H%M%S` before invoking `tcpdump`, and passes a literal
+> `-w "${dir}/${stamp}.pcap"`. On disk this becomes
+> `<stamp>.pcap0`, `<stamp>.pcap1`, ... — so every CLI command that
+> globs these files (`status`, `fetch`, `stop`'s cleanup) matches
+> `*.pcap*`, never `*.pcap`.
+
 **`playground-capture@.service`** -- `%i` is the VM name.
 `After=docker.service`, `Restart=always`, `RestartSec=5`: if the Redroid
 container restarts and takes its netns with it, the unit re-resolves the new
 PID and resumes rather than silently ending mid-experiment.
+
+> **Post-implementation correction (Task 9):** two things this
+> paragraph omitted turned out to matter:
+>
+> - The unit is `Type=exec`. Under that type, `systemctl start`
+>   completes when `/bin/sh` execs -- not when the wrapper's final
+>   `exec nsenter ... tcpdump` succeeds -- so a wrapper that dies
+>   immediately (no container, an AppArmor denial) still reports a
+>   clean start. `playground capture start` compensates: it starts the
+>   unit, sleeps into the `RestartSec=5` gap, and requires `systemctl
+>   is-active` to report exactly `active` before it records a session.
+> - The `[Unit]` section also sets `StartLimitIntervalSec=300` /
+>   `StartLimitBurst=20`, wider than systemd's built-in default. At the
+>   default window, `Restart=always` + `RestartSec=5` never trips (5
+>   starts per 10s does not fire at a 5s interval), so a permanently
+>   broken wrapper would retry forever instead of ever reaching
+>   `failed`, where `is-active` could actually surface it. The explicit
+>   window absorbs a normal container restart (1-2 starts) while a
+>   genuinely broken wrapper burns all 20 within roughly 100 seconds.
 
 **`/etc/apparmor.d/local/usr.sbin.tcpdump`** -- a write rule for
 `/var/lib/playground/capture/**`.
@@ -189,6 +234,16 @@ fresh guest, both instances of the recurring shape `CONTRACTS.md` names
   `/var/lib/playground/` is outside it. The shipped profile includes
   `<local/usr.sbin.tcpdump>`, so a local override plus a profile reload is
   the supported fix rather than disabling confinement.
+
+> **Post-implementation correction (Task 9):** the capture directory is
+> created `0755`, not the `0750` this design implicitly assumed for a
+> root-owned, secret-adjacent path. It doesn't need to be tighter:
+> tcpdump's savefiles land as `0644 root:root` regardless of the parent
+> directory's mode, so a `0750` parent would block traversal while the
+> files underneath stayed world-readable anyway. `capture status`'s
+> `find` calls and `capture fetch`'s `scp` are deliberately
+> unprivileged (only `start`/`stop`/`clean` go through `sudo -n`), so
+> the SSH user genuinely needs to traverse this directory.
 
 `-i any` inside a netns yields the Linux "cooked" (SLL) link type rather
 than Ethernet headers. Wireshark and `tshark` read it natively; anything
@@ -224,6 +279,17 @@ Session records: `.playground/state/capture/<lab>/<vm>.json` -- session id,
 unit name, start time, the resolved limits. `playground reset` and
 `destroy` scrub `state/capture/<lab>/`.
 
+> **Post-implementation correction (Task 9):** `destroy` does not scrub
+> this. `_clean_state_files` is wired only into the three backends'
+> `execute_reset` paths; `destroy` removes no subsystem's state
+> (`tofu/`, `inventory/`, `workloads/`, `vbox/`, `cloud-digitalocean/`)
+> either, so capture matches the existing convention rather than being
+> a special case. `playground reset` alone scrubs
+> `state/capture/<lab>/`. This matters because a stale record makes
+> `capture start` refuse with `already_running` after a teardown: the
+> record lives on the operator's machine, but the unit it names left
+> with the guest.
+
 Fetched pcaps: `.playground/runs/<run-id>/artifacts/capture/<vm>/`, with the
 run allocated through the existing `start_run` / `finish_run` in
 `runs/operation.py`, so a fetch appears in `playground runs list` like any
@@ -240,6 +306,14 @@ Following the established id grammar:
 - `runtime.capture.not_running` -- `stop` / `fetch` with nothing captured
 - `runtime.backend.verb_not_supported` -- existing id, reused for
   `local-vbox`
+
+  > **Post-implementation correction (Task 9):** shipped as
+  > `config.capture.backend_unsupported` instead, a new id. The
+  > existing helper's message and suggestion are hardcoded to
+  > suspend/resume billing framing ("charge for idle compute"), which
+  > would misinform an operator hitting this on `local-vbox`, where
+  > billing is not the issue -- there is simply no Redroid device to
+  > capture.
 
 ## Idempotency
 

@@ -340,7 +340,11 @@ def test_all_three_backends_wire_capture_into_clean_state_files() -> None:
         )
         target_lines = [ln for ln in text.splitlines() if "targets=[" in ln]
         assert target_lines, f"{backend}: no _clean_state_files call found"
-        assert any("capture_dir" in ln for ln in target_lines), (
+        # Require the parameter form -- "capture_dir," (not last in the
+        # list) or "capture_dir]" (last, immediately closing the list) --
+        # rather than a bare substring match, which a trailing comment
+        # could also satisfy without the value ever being passed.
+        assert any("capture_dir," in ln or "capture_dir]" in ln for ln in target_lines), (
             f"{backend}: capture_dir is built but never passed to "
             "_clean_state_files, so reset would silently not scrub it"
         )

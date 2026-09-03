@@ -1,0 +1,59 @@
+# redroid-capture — containerized Android with traffic capture, on libvirt
+#
+# Captures the device's own network namespace from the host VM, so the
+# pcap is exactly this device's traffic:
+#
+#     playground apply redroid-capture
+#     playground capture start --lab redroid-capture
+#     playground app install --lab redroid-capture ./some.apk
+#     playground capture stop  --lab redroid-capture
+#     playground capture fetch --lab redroid-capture
+#
+# The ring below is 40 x 25 MB = 1 GB PER SESSION START, not a global
+# cap: tcpdump -C counts 1,000,000-byte units, not MiB, and -W counts
+# files per base name while every unit start mints a fresh timestamp —
+# so a Redroid container restart begins a new 1 GB ring rather than
+# continuing the old one. Within one uninterrupted session, -C with -W
+# OVERWRITES the oldest file once max_files is reached, so a long
+# session keeps the most recent 1 GB, not the first.
+apiVersion: playground/v1
+kind: Lab
+metadata:
+  name: redroid-capture
+  description: |
+    Single-VM libvirt lab running Redroid with packet capture enabled,
+    reachable over ADB through an SSH tunnel.
+  tags: [local, libvirt, redroid, android, capture]
+
+spec:
+  backend: local-libvirt
+  offline: false
+
+  capture:
+    enabled: true
+    max_file_mb: 25
+    max_files: 40
+    snaplen: 0
+
+  budget:
+    mode: permissive
+    max_vcpu: 8
+    max_memory_mb: 16384
+    max_disk_gb: 120
+    max_vms: 2
+    max_containers: 10
+
+  networks:
+    - name: lab-net
+      profile: nat
+      cidr: 10.75.0.0/24
+
+  vms:
+    - name: droid1
+      role: redroid-host
+      networks: [lab-net]
+
+  providers:
+    local-libvirt:
+      uri: qemu:///system
+      pool: default

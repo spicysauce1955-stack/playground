@@ -828,6 +828,14 @@ in `PLAYGROUND-REQUEST-barak-deploy.md`. All done.
 Items confirmed as real product needs but explicitly not urgent —
 captured here so they aren't lost.
 
+- Redroid TLS interception (phase 2 of traffic capture). Passive pcap
+  shipped; see
+  `docs/superpowers/specs/2026-09-03-android-traffic-capture-design.md`
+  → "Phase 2 seam". Needs mitmproxy on the guest, an `iptables REDIRECT`
+  in the device netns the capture role already enters, and a per-lab CA
+  under `.playground/state/capture/<lab>/` (gitignored — the private key
+  is a secret under the PRD). Blocked from bumping `redroid_image` past
+  Android 13: the system CA store moves into the Conscrypt APEX.
 - `TargetSelector.network` field — requirements §5.9 calls for
   selectors keyed on **network** in addition to name / role / tag.
   Today's `TargetSelector` has `role / vm / tag / any` only.

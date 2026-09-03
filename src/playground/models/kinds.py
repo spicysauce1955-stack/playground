@@ -85,31 +85,41 @@ class RetentionPolicy(StrictModel):
 
 
 class CaptureOptions(StrictModel):
-    """Bounds on packet capture for one device, per session.
+    """Bounds on packet capture for one device, per tcpdump invocation.
 
-    ``max_file_mb * max_files`` is a hard ceiling on disk: 1 GB at these
-    defaults. It is not optional. pcaps grow without bound, `redroid-host`
-    asks for a 60 GB disk, and filling a guest's root filesystem takes
-    sshd down and therefore every other verb with it.
+    ``max_file_mb * max_files`` bounds ONE tcpdump invocation: 1 GB at
+    these defaults. It is NOT a global cap on the directory: ``-W`` counts
+    files per base name, and every unit start (including every Redroid
+    container restart, since the unit is ``Restart=always``) mints a
+    fresh timestamp and so a fresh base name. A capture that survives N
+    starts can leave up to N times that much on disk. The alternative --
+    one fixed filename -- would give a true global cap, but would
+    silently TRUNCATE the previous session's data on every restart,
+    losing it and hiding that it happened. `capture status` reports total
+    bytes across all files, so growth stays observable. The bound is not
+    optional either way: pcaps grow without bound, `redroid-host` asks
+    for a 60 GB disk, and filling a guest's root filesystem takes sshd
+    down and therefore every other verb with it.
 
-    Two properties of that ceiling are deliberate and must not be
-    "corrected":
+    Two properties of the per-invocation ring are deliberate and must not
+    be "corrected":
 
     * ``max_file_mb`` maps to ``tcpdump -C``, which counts units of
       1,000,000 bytes -- not MiB. The field name says ``mb`` and means
       exactly what tcpdump does.
-    * ``-C`` with ``-W`` is a ring, so the OLDEST file is overwritten once
-      the ceiling is reached. A session that outlives its budget keeps the
-      most recent 1 GB and silently discards the beginning. That is better
-      than filling the disk, and `capture status` reports the file count so
-      a wrapping session is visible.
+    * ``-C`` with ``-W`` is a ring, so within ONE invocation the OLDEST
+      file is overwritten once ``max_files`` is reached. A single
+      uninterrupted invocation that outlives its budget keeps the most
+      recent 1 GB and silently discards the beginning. That is better
+      than filling the disk.
 
     ``enabled: false`` is a PROVISIONING switch, not just a CLI gate: the
-    `capture` role's tasks end the host (``meta: end_host``) at its very
-    first tasks, before the tcpdump package install, so no package is
-    installed and no unit exists. The host still lands in
-    `needs_capture` -- it opts out at the role's own guard, not by being
-    excluded from the play. It is the air-gap / lean-guest opt-out.
+    `capture` role's own guard (``meta: end_host``) is evaluated right
+    after `pg_capture` is parsed and before the tcpdump package task
+    runs, so no package is installed and no unit exists. The host still
+    lands in `needs_capture` -- it opts out at the role's own guard, not
+    by being excluded from the play. It is the air-gap / lean-guest
+    opt-out.
     """
 
     enabled: bool = True

@@ -488,6 +488,153 @@ Operators reach a device with `playground adb --lab <lab> --on <vm>`
 (SSH tunnel to the guest's 5555) or `playground app <verb> --on <vm>`
 (guest-side `adb`, no tunnel) — never by opening 5555 to a network.
 
+## Capture: Redroid device traffic
+
+**Input**: `ResolvedLab.capture` (a `CaptureOptions`), carried to Ansible
+as the `pg_capture` group var under `[playground:vars]`.
+`ansible/roles/capture/defaults/main.yml` only declares the fallback
+`pg_capture: '{}'`, so a hand-run play without the var is a no-op rather
+than an undefined-variable failure. The actual parse -- the "string or
+already-decoded dict" guard, needed because `from_json` only accepts a
+string while Ansible sometimes auto-parses the .ini value into a dict
+already -- is the "Parse pg_capture JSON payload" task in
+`ansible/roles/capture/tasks/main.yml`, the same shape
+`workload_container`'s "Parse pg_workloads JSON payload" task in
+`ansible/roles/workload_container/tasks/main.yml` uses for `pg_workloads`.
+
+**Output**: `.pcap` files at `/var/lib/playground/capture/<vm>/` on the
+guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
+
+**Contract**:
+- The capture point is the Redroid container's OWN network namespace,
+  entered with `nsenter --target <pid> --net`. Only `--net` is entered —
+  the mount namespace stays the guest's — so `tcpdump` is the guest's
+  binary, the pcap lands on the guest's disk (not inside a container
+  whose writes vanish when it is recreated), and `-i any` inside that
+  namespace is exactly one device's traffic.
+- **The container PID is resolved at unit-start time, never at
+  provision time.** The wrapper (`capture-start`) does the `docker
+  inspect` itself, on every start. The Redroid container runs
+  `restart_policy: unless-stopped`, so a PID baked in by Ansible at
+  provision time would go stale the first time the container restarts.
+- The wrapper DISCOVERS the container by the `redroid_` name prefix
+  (`capture_container_prefix`) and fails loudly — exit 1, before
+  `nsenter` runs — on zero or on more than one match. It deliberately
+  does not duplicate the redroid role's
+  `redroid_{{ inventory_hostname | regex_replace(...) }}` naming
+  expression; that would be a second copy of a naming convention living
+  in a second role, the exact "implicit cross-layer dependency hidden by
+  a hardcoded value" shape this doc warns about.
+- Provisioning (the `capture` Ansible role) installs `tcpdump`, the
+  wrapper, and the instanced unit, and converges to unit
+  enabled-but-**stopped**. It never starts, stops, or restarts a
+  session — `playground apply` on a lab that is mid-capture leaves the
+  recording untouched. Sessions start only via `playground capture
+  start`.
+- `spec.capture.enabled: false` does not skip the `needs_capture` play —
+  the host is still a member of that group. It skips *inside* the role,
+  via its own `ansible.builtin.meta: end_host` guard, evaluated right
+  after `pg_capture` is parsed and before the `tcpdump` package task
+  runs. Net effect is the same (no package, no unit) but the skip point
+  is the role's guard, not group membership — a detail that matters if
+  you ever go looking for a `when:` on the play itself and don't find
+  one.
+- `local-vbox` is excluded by construction, not by a runtime check on
+  that backend: `capture_vm_names()` only returns VMs whose role
+  declares `capabilities.capture: true`, and `redroid-host`'s capture
+  capability is meaningless without a Redroid container to attach
+  to — `local-vbox`'s `ProviderConfig` declares `redroid: false`
+  because Redroid is unverified there. Targeting also short-circuits on
+  `resolved.backend` before ever asking about capabilities: any lab on
+  `local-vbox` (or any future non-Redroid backend) gets
+  `config.capture.backend_unsupported` naming the two backends that do
+  support it.
+
+### Two Ubuntu tcpdump defaults that break a fresh guest
+
+Both are the recurring "library default wrong for fresh state" shape.
+
+1. **Privilege drop.** Debian/Ubuntu `tcpdump` `setuid()`s to the
+   unprivileged `tcpdump` user unless told otherwise, and then cannot
+   write into the root-owned capture directory. `-Z root` is required.
+   (The capture directory itself is `0755`, not `0750` — see below —
+   but ownership is still `root:root`, and the untold `tcpdump` user has
+   no write access to it either way.)
+2. **AppArmor confinement.** Ubuntu ships
+   `/etc/apparmor.d/usr.sbin.tcpdump`, which confines where `tcpdump`
+   may write; `/var/lib/playground/` is outside it. The failure
+   presents as `Permission denied` on a directory whose ownership and
+   mode look correct. The shipped profile ends with
+   `#include <local/usr.sbin.tcpdump>`, so the role writes a local
+   override at `/etc/apparmor.d/local/usr.sbin.tcpdump` and reloads with
+   `apparmor_parser -r` (tolerated with `failed_when: false` — a host
+   with AppArmor disabled has no profile to reload, and that is not a
+   capture failure). Do not disable confinement instead.
+
+The capture directory is created `0755`, not `0750`: tcpdump's savefiles
+land as `0644 root:root` regardless of the parent directory's mode, so a
+tighter parent would block traversal while the files underneath stay
+world-readable anyway. `capture status`'s `find` calls and `capture
+fetch`'s `scp` are deliberately unprivileged — only `start`/`stop`/
+`clean` go through `sudo -n` — so the unprivileged SSH user genuinely
+needs to traverse this directory to read anything back.
+
+### `-C` semantics are inherited, and the ceiling is per session-start
+
+`max_file_mb` maps to `tcpdump -C`, which counts units of **1,000,000
+bytes, not MiB**. `-C` with `-W` is a **ring within one running
+tcpdump**: the oldest file is overwritten once `max_files` is reached,
+so a session that outlives its budget keeps the most recent
+`max_file_mb * max_files` and discards the beginning.
+
+That ceiling is **per session-start, not a global cap on the
+directory**. Two facts compound: `tcpdump` applies `strftime()` to `-w`
+only when `-G` is set — under `-C`/`-W` alone it writes the name
+verbatim and appends a bare rotation counter (verified live: `-w
+'%Y%m%d-%H%M%S.pcap' -C 1 -W 3` produced a file literally named
+`%Y%m%d-%H%M%S.pcap0`) — so the wrapper computes the timestamp itself
+with `date -u` before invoking `tcpdump`, and `-W`'s ring counts files
+*per base name*. Every unit start (including every Redroid container
+restart, since `Restart=always` re-execs the wrapper) mints a new
+stamp, hence a new base name, hence a new ring. N restarts therefore
+permit up to N × (`max_file_mb` × `max_files`) on disk, not one fixed
+ceiling. This was a deliberate trade, not an oversight: one fixed
+filename would keep a true global cap, but would silently TRUNCATE the
+prior session's data on every container restart — losing data and
+hiding that it was lost. `capture status` reports the file count so a
+wrapping (or multiplying) session is visible. Because the on-disk name
+is always `<stamp>.pcap<N>`, every CLI glob that touches these files is
+`*.pcap*`, never `*.pcap` — a bare `*.pcap` glob matches nothing that
+tcpdump actually wrote.
+
+### The unit cannot self-report a wrapper failure; `capture start` verifies it
+
+The instanced unit is `Type=exec`, under which `systemctl start`
+completes when `/bin/sh` execs — not when the wrapper's own final `exec
+nsenter ... tcpdump` succeeds. A wrapper that dies immediately (no
+Redroid container found, an AppArmor denial) still makes the start job
+report exit 0. `playground capture start` therefore does not trust that
+exit code: it starts the unit, sleeps into the unit's `RestartSec=5`
+gap, and requires `systemctl is-active` to report exactly `active`
+before it records a session. The unit's `[Unit]` section also sets
+`StartLimitIntervalSec=300` / `StartLimitBurst=20`, wider than systemd's
+default start-limit window — at the default, `Restart=always` with
+`RestartSec=5` would never trip (5 starts per 10s does not fire at a 5s
+interval), so a permanently broken wrapper would retry forever instead
+of ever reaching `failed`, where `is-active` (and so `capture status`)
+can actually surface it. The wider window still absorbs a normal
+Redroid restart (1-2 starts) while a genuinely broken wrapper burns all
+20 within roughly 100 seconds.
+
+### Android 14 moves the CA store — a constraint on the image tag
+
+Not needed for passive capture, but load-bearing for the TLS-interception
+follow-up: bind-mounting a MITM CA into `/system/etc/security/cacerts`
+works because the pinned image is Android 11. **Android 14+ moved the
+trust store into the Conscrypt APEX**, so raising `redroid_image`'s tag
+past 13 would invalidate that approach entirely. This is a second
+constraint on `redroid_image`, alongside "must stay date-stamped".
+
 ## Cross-layer pitfalls (things future-you will hit)
 
 These are the gotchas we've already paid for. Each one cost
