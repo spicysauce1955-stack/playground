@@ -310,10 +310,11 @@ def execute_reset(
     vbox_state = state_dir / "state" / "vbox" / lab
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
+    capture_dir = state_dir / "state" / "capture" / lab
     bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
     cleanup_step, cleanup_diagnostics = _clean_state_files(
         lab=lab,
-        targets=[vbox_state, inventory_path, workload_dir],
+        targets=[vbox_state, inventory_path, workload_dir, capture_dir],
         log_path=logs_dir / "clean-state-files.log",
     )
     steps.append(cleanup_step)

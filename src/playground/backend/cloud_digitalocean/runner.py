@@ -244,10 +244,11 @@ def execute_reset(
     # ---- Step 3: clean-state-files (only when teardown is confirmed clean) ----
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
+    capture_dir = state_dir / "state" / "capture" / lab
     bus.publish(run.run_id, "step_started", {"step": "clean-state-files"})
     cleanup_step, cleanup_diags = _clean_state_files(
         lab=lab,
-        targets=[per_lab_dir, inventory_path, workload_dir],
+        targets=[per_lab_dir, inventory_path, workload_dir, capture_dir],
         log_path=logs_dir / "clean-state-files.log",
     )
     steps.append(cleanup_step)

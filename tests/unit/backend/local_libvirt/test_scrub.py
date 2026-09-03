@@ -284,3 +284,63 @@ def test_scrub_lab_surfaces_unexpected_undefine_failure(
     assert step.exit_code == 1
     assert any(d.id == "runtime.reset.scrub_failed" for d in diagnostics)
     assert any("node1" in (d.message or "") for d in diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# Capture state cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_reset_removes_the_labs_capture_session_records(tmp_path) -> None:
+    """A stale record makes `capture start` refuse forever after a lab is
+    destroyed and re-applied: the record lives on the operator's machine,
+    but the unit it names went away with the guest."""
+    from playground.backend.local_libvirt.runner import _clean_state_files
+
+    capture_dir = tmp_path / "state" / "capture" / "redroid-cloud"
+    capture_dir.mkdir(parents=True)
+    (capture_dir / "droid1.json").write_text("{}")
+    other = tmp_path / "state" / "capture" / "other-lab"
+    other.mkdir(parents=True)
+    (other / "droid1.json").write_text("{}")
+
+    step, diagnostics = _clean_state_files(
+        lab="redroid-cloud",
+        targets=[capture_dir],
+        log_path=tmp_path / "clean.log",
+    )
+
+    assert step.exit_code == 0
+    assert diagnostics == []
+    assert not capture_dir.exists()
+    # Never another lab's state.
+    assert (other / "droid1.json").is_file()
+
+
+def test_all_three_backends_wire_capture_into_clean_state_files() -> None:
+    """The test above calls `_clean_state_files` directly, so it passes
+    with or without this task's change — it documents the per-lab
+    isolation invariant, it does not gate the wiring. THIS is the gate:
+    each backend's `execute_reset` must both build the capture path and
+    hand it to the cleaner. Building it without passing it is a silent
+    no-op, which is the exact failure mode worth a test.
+
+    Source-text assertions follow the established house pattern in
+    `tests/unit/ansible/`.
+    """
+    from pathlib import Path as _Path
+
+    backend_root = (
+        _Path(__file__).resolve().parents[4] / "src" / "playground" / "backend"
+    )
+    for backend in ("local_libvirt", "local_vbox", "cloud_digitalocean"):
+        text = (backend_root / backend / "runner.py").read_text()
+        assert 'state_dir / "state" / "capture" / lab' in text, (
+            f"{backend}: never builds the per-lab capture state path"
+        )
+        target_lines = [ln for ln in text.splitlines() if "targets=[" in ln]
+        assert target_lines, f"{backend}: no _clean_state_files call found"
+        assert any("capture_dir" in ln for ln in target_lines), (
+            f"{backend}: capture_dir is built but never passed to "
+            "_clean_state_files, so reset would silently not scrub it"
+        )
