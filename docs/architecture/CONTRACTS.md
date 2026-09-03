@@ -525,6 +525,48 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   expression; that would be a second copy of a naming convention living
   in a second role, the exact "implicit cross-layer dependency hidden by
   a hardcoded value" shape this doc warns about.
+- **A Redroid container restart does NOT kill tcpdump, and the unit does
+  NOT restart on its own — an earlier version of this doc, the unit's
+  own comment, and the design spec all asserted the opposite, and it was
+  measured false on a live guest.** `nsenter --target <pid> --net` moves
+  tcpdump INTO the container's network namespace, and tcpdump's own
+  presence there keeps that namespace alive after every one of the
+  container's own processes has exited. So on a `docker restart`,
+  tcpdump keeps running untouched (measured: MainPID unchanged across a
+  restart that changed the container's own PID), `Restart=always` never
+  fires because nothing died, and `systemctl is-active` keeps reporting
+  `active` while tcpdump sits in an orphaned, disconnected namespace
+  capturing nothing — 5 pings inside the new container's netns produced
+  zero new captured bytes. The fix is that `capture-start.j2` is now a
+  **watchdog**, not a one-shot `exec` into tcpdump: it launches tcpdump
+  in the background, records the container's netns identity at start,
+  and runs two checks at two cadences. Every ~1 second it checks
+  tcpdump's OWN liveness — decoupled from the netns check, and load-
+  bearing for a different reason: a tcpdump that dies immediately (a bad
+  `-i`, an AppArmor denial, an unwritable savefile path) must be caught
+  well inside `capture start`'s 2-second `is-active` probe window (see
+  below), or that probe reads a lying `active` for a capture that
+  already died — the same "unit says active while nothing is captured"
+  shape as the netns bug, just triggered by an instant death instead of
+  a restart. Every ~5th tick (roughly every 5 seconds — this one forks
+  `docker` twice, so it is not run every tick) it polls the container's
+  CURRENT netns, and when it differs from the one seen at this start, it
+  stops tcpdump itself and exits NON-ZERO — THAT is what makes
+  `Restart=always` re-exec the wrapper against the new PID. Self-healing
+  is NOT one poll interval: it is up to the ~5s netns-detection latency
+  PLUS `RestartSec=5` before the new tcpdump attaches, so **up to
+  roughly 10 seconds** of lost traffic in the worst case. A container
+  that is transiently unresolvable mid-restart (as opposed to one whose
+  netns has actually changed) does not end the loop — it may simply be
+  coming back, and the two `docker` calls inside that check are wrapped
+  in `timeout 10` so a wedged daemon cannot block staleness detection
+  indefinitely. `playground capture status` additionally compares a
+  netns marker the wrapper writes at every start
+  (`/run/playground-capture/<vm>.netns` — under `/run`, not the capture
+  directory, so it is not swept up by `capture fetch`) against the
+  container's current netns and reports `state=stale` on a mismatch, as
+  a safety net for a crashed watchdog or a future regression — not as
+  the primary defence, which is the watchdog's own poll loop.
 - Provisioning (the `capture` Ansible role) installs `tcpdump`, the
   wrapper, and the instanced unit, and converges to unit
   installed-but-**stopped** — it is never `enable`d. The `capture` role
@@ -533,10 +575,10 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   though: `ansible/site.yml` runs the `redroid` role's play before the
   `capture` play, so `playground apply` on a lab that is mid-capture CAN
   still interrupt the session — if that earlier play recreates the
-  Redroid container, it tears down the network namespace `tcpdump` is
-  attached to, `Restart=always` re-execs the wrapper against the new
-  namespace, and a new `${stamp}` pcap base name begins. Sessions start
-  only via `playground capture start`. Not enabling is deliberate (an
+  Redroid container, the running session ends up stale (see the watchdog
+  paragraph below) and, once the watchdog notices and restarts the unit,
+  a new `${stamp}` pcap base name begins. Sessions start only via
+  `playground capture start`. Not enabling is deliberate (an
   enabled instance would start recording at boot, violating "provisioning
   never starts a session"), and it has a consequence nobody wrote down
   before now: **a guest reboot does not resume a capture that was
@@ -544,6 +586,11 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   capture is running; `capture status` will show `state=inactive`. The
   recovery is `capture stop` (a no-op against the guest that only clears
   the stale local record) followed by `capture start`.
+- **Confirmed live, not just claimed:** a re-apply against an already
+  converged capture-enabled host reported `changed=0` across all 41
+  tasks in the play, did not recreate the Redroid container, and did not
+  disturb a running capture session — same container id, same unit
+  `MainPID`, capture still recording throughout the re-apply.
 - `spec.capture.enabled: false` does not skip the `needs_capture` play —
   the host is still a member of that group. It skips *inside* the role,
   via its own `ansible.builtin.meta: end_host` guard, evaluated right
@@ -578,30 +625,53 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
 
 Both are the recurring "library default wrong for fresh state" shape.
 
-1. **Privilege drop.** Debian/Ubuntu `tcpdump` `setuid()`s to the
-   unprivileged `tcpdump` user unless told otherwise, and then cannot
-   write into the root-owned capture directory. `-Z root` is required.
-   (The capture directory itself is `0755`, not `0750` — see below —
-   but ownership is still `root:root`, and the untold `tcpdump` user has
-   no write access to it either way.)
-2. **AppArmor confinement.** Ubuntu ships
-   `/etc/apparmor.d/usr.sbin.tcpdump`, which confines where `tcpdump`
-   may write; `/var/lib/playground/` is outside it. The failure
-   presents as `Permission denied` on a directory whose ownership and
-   mode look correct. The shipped profile ends with
-   `#include <local/usr.sbin.tcpdump>`, so the role writes a local
-   override at `/etc/apparmor.d/local/usr.sbin.tcpdump` and reloads with
-   `apparmor_parser -r` (tolerated with `failed_when: false` — a host
-   with AppArmor disabled has no profile to reload, and that is not a
-   capture failure). Do not disable confinement instead.
+1. **Privilege drop — this is the load-bearing one, confirmed and
+   strengthened by live measurement.** Debian/Ubuntu `tcpdump`
+   `setuid()`s to the unprivileged `tcpdump` user unless told otherwise,
+   and then cannot write into the root-owned capture directory. `-Z
+   root` is required. Measured live: `sudo -u tcpdump touch` inside the
+   `0755` root-owned capture directory is denied, and running tcpdump
+   WITHOUT `-Z root` under `-C 1 -W 3` fails immediately with
+   `tcpdump: /var/lib/playground/capture/droid1/rot.pcap0: Permission
+   denied` — not at the first rotation, but on the very first file.
+   That is a `-C`-specific nuance: under `-C`, even the FIRST numbered
+   savefile is opened AFTER the privilege drop, so the failure is
+   immediate; without `-C`, tcpdump opens its one savefile BEFORE
+   dropping privileges and would succeed. (The capture directory itself
+   is `0755`, not `0750` — see below — but ownership is still
+   `root:root`, and the unprivileged `tcpdump` user has no write access
+   to it either way.)
+2. **AppArmor confinement — NOT the load-bearing protection here,
+   contrary to what an earlier version of this doc claimed.** Ubuntu
+   ships `/etc/apparmor.d/usr.sbin.tcpdump` confining where `tcpdump`
+   may write, and the role does install a local override at
+   `/etc/apparmor.d/local/usr.sbin.tcpdump` (reloaded with
+   `apparmor_parser -r`, tolerated with `failed_when: false` for a host
+   with AppArmor disabled) as defence-in-depth. But measured live on
+   Noble with the tcpdump profile in **enforce** mode: the STOCK
+   profile, with no override of ours in place, already permits
+   `**.pcap*` writes anywhere on the filesystem — `.pcap`, `.pcap0`,
+   `.pcap00`, and `.pcap39` all wrote successfully to an arbitrary
+   directory (`/var/lib/nogrant/`) outside our override's grant, while a
+   `.dat` file in the same directory was denied with `Permission
+   denied`. So the override is protection against a future filename
+   that doesn't match `**.pcap*`, not the reason capture works today —
+   downgrade any claim that AppArmor is the highest-probability
+   live-only failure; `-Z root` above is the one that actually gates
+   whether writes succeed at all. Do not disable confinement regardless
+   — it is real, correctly scoped, defence-in-depth, just not the thing
+   standing between a fresh guest and a working capture.
 
 The capture directory is created `0755`, not `0750`: tcpdump's savefiles
 land as `0644 root:root` regardless of the parent directory's mode, so a
 tighter parent would block traversal while the files underneath stay
 world-readable anyway. `capture status`'s `find` calls and `capture
-fetch`'s `scp` are deliberately unprivileged — only `start`/`stop`/
-`clean` go through `sudo -n` — so the unprivileged SSH user genuinely
-needs to traverse this directory to read anything back.
+fetch`'s `scp` stay deliberately unprivileged — `start`/`stop`/`clean`
+go through `sudo -n`, and so, now, does the ONE step of `capture
+status`'s stale-capture check that reads another (typically root-owned)
+process's `/proc/<pid>/ns/net` symlink, which an unprivileged reader
+cannot otherwise resolve — so the unprivileged SSH user genuinely needs
+to traverse this directory to read anything back.
 
 ### `-C` semantics are inherited, and the ceiling is per session-start
 
@@ -614,22 +684,30 @@ so a session that outlives its budget keeps the most recent
 That ceiling is **per session-start, not a global cap on the
 directory**. Two facts compound: `tcpdump` applies `strftime()` to `-w`
 only when `-G` is set — under `-C`/`-W` alone it writes the name
-verbatim and appends a bare rotation counter (verified live: `-w
-'%Y%m%d-%H%M%S.pcap' -C 1 -W 3` produced a file literally named
-`%Y%m%d-%H%M%S.pcap0`) — so the wrapper computes the timestamp itself
-with `date -u` before invoking `tcpdump`, and `-W`'s ring counts files
-*per base name*. Every unit start (including every Redroid container
-restart, since `Restart=always` re-execs the wrapper) mints a new
-stamp, hence a new base name, hence a new ring. N restarts therefore
-permit up to N × (`max_file_mb` × `max_files`) on disk, not one fixed
-ceiling. This was a deliberate trade, not an oversight: one fixed
-filename would keep a true global cap, but would silently TRUNCATE the
-prior session's data on every container restart — losing data and
-hiding that it was lost. `capture status` reports the file count so a
-wrapping (or multiplying) session is visible. Because the on-disk name
-is always `<stamp>.pcap<N>`, every CLI glob that touches these files is
-`*.pcap*`, never `*.pcap` — a bare `*.pcap` glob matches nothing that
-tcpdump actually wrote.
+verbatim and appends a rotation counter, ZERO-PADDED to the width of
+`-W`'s argument (verified live: `-w '%Y%m%d-%H%M%S.pcap' -C 1 -W 3`
+produced a file literally named `%Y%m%d-%H%M%S.pcap0`; with this role's
+default `max_files: 40` the real names observed on a live guest are
+`<stamp>.pcap00` through `<stamp>.pcap39`, e.g.
+`20260903-171939.pcap00` — NOT `<stamp>.pcap0` … `<stamp>.pcap1` as an
+earlier version of this doc claimed) — so the wrapper computes the
+timestamp itself with `date -u` before invoking `tcpdump`, and `-W`'s
+ring counts files *per base name*. Every unit start (including every
+restart the watchdog triggers after noticing the container moved to a
+new network namespace — see "A Redroid container restart does NOT kill
+tcpdump" above) mints a new stamp, hence a new base name, hence a new
+ring. N restarts therefore permit up to N × (`max_file_mb` ×
+`max_files`) on disk, not one fixed ceiling. This was a deliberate
+trade, not an oversight: one fixed filename would keep a true global
+cap, but would silently TRUNCATE the prior session's data on every
+container restart — losing data and hiding that it was lost. `capture
+status` reports the file count so a wrapping (or multiplying) session is
+visible. Because the on-disk name is always `<stamp>.pcap<NN...>` at
+whatever width `-W` implies, never a single un-padded digit, every CLI
+glob that touches these files is `*.pcap*`, never `*.pcap` or `*.pcap?`
+— a bare `*.pcap` glob matches nothing that tcpdump actually wrote, and
+a single-`?` glob stops matching the moment `max_files` needs two
+digits.
 
 ### The unit cannot self-report a wrapper failure; `capture start` verifies it
 

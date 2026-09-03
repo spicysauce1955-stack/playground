@@ -13,6 +13,9 @@ import pytest
 
 from playground.capture.commands import (
     CAPTURE_DIR,
+    CONTAINER_PREFIX,
+    NETNS_MARKER_DIR,
+    _netns_marker_path,
     clean_cmd,
     is_active_cmd,
     remote_capture_dir,
@@ -82,6 +85,81 @@ def test_status_survives_a_missing_capture_directory() -> None:
     report zeros, not a shell error."""
     cmd = status_cmd("droid1")
     assert "2>/dev/null" in cmd
+
+
+def test_netns_marker_lives_under_run_not_the_capture_directory() -> None:
+    """`capture fetch` copies CAPTURE_DIR wholesale; the marker must not
+    be inside it or it would show up as a bogus artifact. `/run` is
+    tmpfs, so it also vanishes on reboot the same way a running capture
+    does."""
+    assert NETNS_MARKER_DIR.startswith("/run/")
+    marker = _netns_marker_path("droid1")
+    assert marker == f"{NETNS_MARKER_DIR}/droid1.netns"
+    assert not marker.startswith(CAPTURE_DIR)
+
+
+@pytest.mark.parametrize("vm", ["../../etc", "..", ".", "a/b", "/etc"])
+def test_netns_marker_path_rejects_path_traversal(vm: str) -> None:
+    """Same traversal guard as `remote_capture_dir` -- a VM name rejected
+    everywhere else in this module must be rejected here too."""
+    with pytest.raises(ValueError):
+        _netns_marker_path(vm)
+
+
+def test_status_checks_the_marker_only_when_the_unit_is_active() -> None:
+    """The staleness probe is a safety net gated on `state = active` --
+    it must never run (and never risk failing) against a unit that is
+    inactive, dead, or has never existed."""
+    cmd = status_cmd("droid1")
+    assert 'if [ "$state" = active ]' in cmd
+
+
+def test_status_stale_detection_reads_the_marker_and_the_live_netns() -> None:
+    """`capture status` must independently re-derive the container's
+    CURRENT netns (never trust the marker alone) and compare it against
+    the marker the wrapper wrote at its own last start, downgrading
+    `state=active` to `state=stale` on a mismatch -- the fix for the
+    silent-data-loss bug where a restarted Redroid container leaves
+    tcpdump alive in an orphaned namespace while the unit still reports
+    active."""
+    cmd = status_cmd("droid1")
+    marker = shlex.quote(_netns_marker_path("droid1"))
+    assert f"cat {marker}" in cmd
+    assert "docker ps" in cmd
+    assert "docker inspect" in cmd
+    assert f"name=^{CONTAINER_PREFIX}" in cmd
+    assert "readlink" in cmd
+    assert "ns/net" in cmd
+    assert 'state=stale' in cmd
+    # The comparison, not just the word "stale" somewhere in the script.
+    assert '[ "$mns" != "$cns" ] && state=stale' in cmd
+
+
+def test_status_netns_probe_never_makes_the_command_itself_fail() -> None:
+    """Every new command this check adds must keep the same
+    2>/dev/null-guarded, `|| true`-terminated style as the rest of
+    status_cmd -- an unprivileged reader, a container that is gone, or a
+    `sudo -n` that isn't configured must never turn into a non-zero ssh
+    exit code."""
+    cmd = status_cmd("droid1")
+    assert "docker ps --filter" in cmd and "|| true" in cmd
+    assert "docker inspect -f" in cmd and "2>/dev/null || true" in cmd
+    assert 'sudo -n readlink "/proc/$cpid/ns/net" 2>/dev/null || true' in cmd
+
+
+def test_status_uses_sudo_only_for_the_netns_probe() -> None:
+    """`capture status`'s `find` calls and `capture fetch`'s `scp` stay
+    deliberately unprivileged; the ONE new privileged step is reading
+    another (typically root-owned) process's `/proc/<pid>/ns/net`
+    symlink, which an unprivileged reader cannot otherwise resolve."""
+    cmd = status_cmd("droid1")
+    assert cmd.count("sudo -n") == 1
+    assert "sudo -n readlink" in cmd
+
+
+def test_status_marker_metacharacter_cannot_become_a_second_command() -> None:
+    nasty = "a b;rm -rf x"
+    assert shlex.quote(_netns_marker_path(nasty)) in status_cmd(nasty)
 
 
 def test_a_metacharacter_in_a_vm_name_cannot_become_a_second_command_stop() -> None:

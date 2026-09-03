@@ -201,9 +201,21 @@ exec nsenter --target "$pid" --net \
 > wrapper instead computes the stamp itself with `date -u
 > +%Y%m%d-%H%M%S` before invoking `tcpdump`, and passes a literal
 > `-w "${dir}/${stamp}.pcap"`. On disk this becomes
-> `<stamp>.pcap0`, `<stamp>.pcap1`, ... — so every CLI command that
-> globs these files (`status`, `fetch`, `stop`'s cleanup) matches
-> `*.pcap*`, never `*.pcap`.
+> `<stamp>.pcap0`, `<stamp>.pcap1`, ... for a small `-W` like the `3`
+> used in this test — so every CLI command that globs these files
+> (`status`, `fetch`, `stop`'s cleanup) matches `*.pcap*`, never
+> `*.pcap`.
+>
+> **Further correction (Task 10):** the counter is zero-padded to the
+> WIDTH of `-W`'s argument, not always a single un-padded digit — the
+> `.pcap0`/`.pcap1` example above only looks unpadded because `-W 3`
+> needs just one digit. This role's actual default is `max_files: 40`,
+> and the real names observed live are `<stamp>.pcap00` …
+> `<stamp>.pcap39` (e.g. `20260903-171939.pcap00`), not
+> `<stamp>.pcap0` … `<stamp>.pcap39`. This is exactly why the glob must
+> stay `*.pcap*` rather than a fixed-width `*.pcap?` or `*.pcap??` —
+> either would silently stop matching (or wrongly match too few) files
+> the moment `max_files` crosses a power-of-ten boundary.
 
 **`playground-capture@.service`** -- `%i` is the VM name.
 `After=docker.service`, `Restart=always`, `RestartSec=5`: if the Redroid
@@ -229,6 +241,46 @@ PID and resumes rather than silently ending mid-experiment.
 >   window absorbs a normal container restart (1-2 starts) while a
 >   genuinely broken wrapper burns all 20 within roughly 100 seconds.
 
+> **Post-implementation correction (Task 10):** the paragraph above --
+> "if the Redroid container restarts and takes its netns with it, the
+> unit re-resolves the new PID" -- is false, measured live, and was a
+> silent data-loss bug. `nsenter --net` moves tcpdump INTO the
+> container's network namespace, and tcpdump's OWN PRESENCE keeps that
+> namespace alive after every one of the container's own processes has
+> exited. So a `docker restart` does NOT kill tcpdump: `MainPID` stays
+> the same PID across the container's own PID changing, `Restart=always`
+> never fires because nothing died, and `systemctl is-active` keeps
+> reporting `active` while tcpdump sits in an orphaned, disconnected
+> namespace capturing nothing -- measured as 5 pings inside the new
+> container's netns producing zero new captured bytes.
+>
+> The fix: `capture-start.j2` is now a watchdog rather than a one-shot
+> `exec` into tcpdump. It backgrounds tcpdump, records the container's
+> netns identity at its own start, polls roughly every 5 seconds for the
+> container's CURRENT netns, and when it differs, stops tcpdump itself
+> and exits NON-ZERO -- THAT is what makes `Restart=always` re-exec the
+> wrapper against the new PID. Self-healing is NOT within one poll
+> interval, though -- it is up to roughly detection latency (~5s, the
+> netns-check cadence) PLUS `RestartSec=5` before the new tcpdump
+> attaches, so up to ~10 seconds of lost traffic in the worst case, not
+> ~5. A container that is transiently unresolvable mid-restart (as
+> opposed to one whose netns has actually changed) does not end the
+> poll loop -- it may simply be coming back. The watchdog also checks
+> tcpdump's OWN liveness separately, on a faster ~1s cadence decoupled
+> from the (more expensive, two-`docker`-fork) netns check at ~5s: a
+> tcpdump that dies immediately (a bad `-i`, an AppArmor denial, an
+> unwritable savefile path) must be caught well inside `playground
+> capture start`'s 2s `is-active` probe window, or that probe reads a
+> lying `active` for a capture that already died -- a second,
+> differently-shaped version of the same "unit says active while
+> nothing is being captured" bug this fix exists to close.
+> `playground capture status` additionally READS a netns marker the
+> wrapper WRITES at every start (`/run/playground-capture/<vm>.netns` --
+> under `/run`, not the capture directory, so `capture fetch` does not
+> sweep it up as an artifact) as a safety net for a crashed watchdog or
+> a future regression, reporting `state=stale` on a mismatch -- not as
+> the primary defence, which is the watchdog's own poll loop.
+
 **`/etc/apparmor.d/local/usr.sbin.tcpdump`** -- a write rule for
 `/var/lib/playground/capture/**`.
 
@@ -253,6 +305,26 @@ fresh guest, both instances of the recurring shape `CONTRACTS.md` names
 > `find` calls and `capture fetch`'s `scp` are deliberately
 > unprivileged (only `start`/`stop`/`clean` go through `sudo -n`), so
 > the SSH user genuinely needs to traverse this directory.
+
+> **Post-implementation correction (Task 10):** "AppArmor confining
+> where tcpdump may write" is not what makes capture work, and the
+> Risks section below overstated it as the highest-probability
+> live-only failure. Measured on Noble with the tcpdump profile in
+> **enforce** mode: the STOCK profile, with no override of ours in
+> place, already permits `**.pcap*` writes anywhere on the filesystem --
+> `.pcap`, `.pcap0`, `.pcap00`, and `.pcap39` all wrote successfully to
+> an arbitrary directory outside our override's grant, while a `.dat`
+> file in the same directory was denied with `Permission denied`. Our
+> local override is real defence-in-depth against a future filename
+> that doesn't match `**.pcap*` -- not the reason capture succeeds
+> today. The bullet actually confirmed and worth strengthening instead
+> is `-Z root`: measured live, `sudo -u tcpdump touch` in the `0755`
+> root-owned capture directory is denied, and tcpdump run WITHOUT `-Z
+> root` under `-C 1 -W 3` fails immediately with `tcpdump:
+> .../rot.pcap0: Permission denied` -- immediately, not at the first
+> rotation, because under `-C` even the FIRST numbered savefile is
+> opened AFTER the privilege drop (without `-C`, tcpdump opens its one
+> savefile BEFORE dropping privileges and would succeed).
 
 `-i any` inside a netns yields the Linux "cooked" (SLL) link type rather
 than Ethernet headers. Wireshark and `tshark` read it natively; anything
@@ -384,6 +456,30 @@ in the Redroid path surfaced there, not on libvirt.
 - **Container restart mid-session** produces one pcap per netns generation
   rather than a single continuous file. The timestamped filenames make the
   discontinuity visible instead of hiding it.
+
+> **Post-implementation correction (Task 10):** both risk assessments
+> above were wrong in ways that mattered.
+>
+> - **AppArmor was NOT the highest-probability live-only failure.**
+>   Measured on Noble with the tcpdump profile enforcing: the stock
+>   profile already permits `**.pcap*` writes anywhere, with no override
+>   of ours in place. `-Z root` is the one that actually gates whether
+>   writes succeed at all -- see the correction above the `-Z root` /
+>   AppArmor paragraph in section 3.
+> - **"Container restart mid-session produces one pcap per netns
+>   generation" understated the actual failure mode, which was a SILENT
+>   DATA LOSS bug, not a cosmetic discontinuity.** A container restart
+>   does not, on its own, produce a new pcap at all: `nsenter --net`
+>   keeps tcpdump's old namespace alive after the container's own
+>   processes exit, so the OLD tcpdump keeps running, unaware, capturing
+>   nothing into a namespace nothing is attached to any more, while
+>   `capture status` kept reporting `active`. No new file, no error, no
+>   visible discontinuity -- just an increasingly stale pcap. The fix
+>   (`capture-start.j2`'s watchdog, `capture status`'s netns-marker
+>   check -- see the Task 10 correction after "playground-capture@.service"
+>   in section 3) is what actually produces "one pcap per netns
+>   generation": the watchdog notices the mismatch, stops the stale
+>   tcpdump, and exits so systemd restarts it into a fresh `${stamp}`.
 
 ## Phase 2 seam
 

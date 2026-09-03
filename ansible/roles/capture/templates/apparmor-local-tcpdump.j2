@@ -1,12 +1,20 @@
 # Managed by the playground capture Ansible role.
 #
 # Ubuntu's /etc/apparmor.d/usr.sbin.tcpdump confines where tcpdump may
-# write, and {{ capture_dir }} is outside it: without this rule the
-# capture fails as "Permission denied" on a directory that looks
-# correctly root-owned, which is a genuinely confusing way to lose an
-# afternoon. The shipped profile ends with
-# `#include <local/usr.sbin.tcpdump>`, so widening it here is the
-# supported route -- do not disable confinement instead.
+# write. NOTE this is NOT the reason a fresh guest's capture works --
+# measured live on Noble with that profile in enforce mode, the STOCK
+# profile (no override of ours in place) already permits `**.pcap*`
+# writes anywhere on the filesystem: `.pcap`, `.pcap0`, `.pcap00`, and
+# `.pcap39` all wrote successfully to an arbitrary directory outside
+# this grant, while a `.dat` file in the same directory was denied with
+# "Permission denied". `-Z root` (see capture-start.j2) is the setting
+# that actually gates whether a write into {{ capture_dir }} succeeds at
+# all; this file is defence-in-depth against a FUTURE filename that
+# doesn't match `**.pcap*`, not the thing standing between a fresh guest
+# and a working capture today. The shipped profile ends with
+# `#include <local/usr.sbin.tcpdump>`, so widening it here is still the
+# supported route if that ever changes -- do not disable confinement
+# instead.
 #
 # capture_dir defaults to /var/lib/playground/capture/ (see
 # ansible/roles/capture/defaults/main.yml); the grant below tracks

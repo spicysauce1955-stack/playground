@@ -3,11 +3,30 @@
 # Instanced unit: %i is the lab's VM name, so `systemctl start
 # playground-capture@droid1` captures droid1's device.
 #
-# Restart=always is load-bearing. If the Redroid container restarts it
-# takes its network namespace with it and tcpdump dies; without a restart
-# the capture would end silently in the middle of an experiment. The
-# wrapper re-resolves the new PID on each start. Timestamped filenames
-# make the discontinuity visible rather than hiding it.
+# Restart=always is load-bearing, but NOT for the reason an earlier
+# version of this comment claimed. Measured live: a Redroid container
+# restart does NOT kill tcpdump and does NOT make the unit exit on its
+# own. Entering the container's netns moves tcpdump INTO it, and
+# tcpdump's own presence keeps that namespace alive after the
+# container's own processes are gone -- so tcpdump keeps running,
+# `MainPID` never changes, and `systemctl is-active` reports `active`
+# while capturing nothing into an orphaned namespace. The wrapper
+# (`capture-start`, see its own header comment) is therefore a watchdog:
+# it polls the container's CURRENT netns against the one it resolved at
+# its own start, and when they differ it stops tcpdump itself and EXITS
+# NON-ZERO so that Restart=always is what re-execs the wrapper against
+# the new PID. Timestamped filenames make the discontinuity visible
+# rather than hiding it.
+#
+# Type=exec makes the unit's MainPID the wrapper shell, not tcpdump
+# (ExecStart is the wrapper; it no longer `exec`s tcpdump directly -- see
+# capture-start.j2). Default KillMode=control-group means `systemctl
+# stop`/a restart also SIGTERMs tcpdump directly, as part of the whole
+# cgroup, independently of the wrapper's own TERM trap -- both exist
+# deliberately: KillMode=control-group is what makes `systemctl stop`
+# work even if the wrapper is wedged, and the wrapper's trap is what lets
+# tcpdump flush its savefile cleanly (rather than being killed out from
+# under itself) when the wrapper's own shell gets the TERM first.
 [Unit]
 Description=playground packet capture for Redroid device %i
 After=docker.service
@@ -35,11 +54,24 @@ RestartSec=5
 # would loop silently instead of ever reaching `failed`, and with a fresh
 # ${stamp} per start could leave an orphaned pcap behind on each cycle.
 #
-# The explicit window above gets both behaviors instead: a Redroid
-# container restart costs 1-2 starts and resumes normally, while a
-# genuinely broken wrapper burns 20 starts in ~100s and lands in `failed`,
-# where `systemctl is-active` (and so `playground capture status`) can
-# actually report it.
+# The explicit window above gets both behaviors instead: an ISOLATED
+# Redroid container restart costs 1-2 starts and resumes normally, while
+# a genuinely broken wrapper burns 20 starts in ~100s and lands in
+# `failed`, where `systemctl is-active` (and so `playground capture
+# status`) can actually report it.
+#
+# That "1-2 starts and resumes normally" framing is only true for
+# ISOLATED restarts, though. A container that crash-loops enough times
+# within this window (more than StartLimitBurst restarts within
+# StartLimitIntervalSec) burns the start limit right along with a
+# genuinely broken wrapper and lands in `failed` too, with no further
+# auto-recovery once the container itself stabilizes -- systemd will not
+# retry on its own past the limit. That is the correct, visible outcome
+# (silently retrying forever would just hide a host that is actually
+# broken), but it does mean the operator has to notice and act: the
+# recovery is `capture stop` (clears the failed unit's state) followed
+# by `capture start` (starts fresh against whatever the container looks
+# like now).
 
 [Install]
 WantedBy=multi-user.target
