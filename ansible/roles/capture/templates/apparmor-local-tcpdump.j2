@@ -1,0 +1,15 @@
+# Managed by the playground capture Ansible role.
+#
+# Ubuntu's /etc/apparmor.d/usr.sbin.tcpdump confines where tcpdump may
+# write, and {{ capture_dir }} is outside it: without this rule the
+# capture fails as "Permission denied" on a directory that looks
+# correctly root-owned, which is a genuinely confusing way to lose an
+# afternoon. The shipped profile ends with
+# `#include <local/usr.sbin.tcpdump>`, so widening it here is the
+# supported route -- do not disable confinement instead.
+#
+# capture_dir defaults to /var/lib/playground/capture/ (see
+# ansible/roles/capture/defaults/main.yml); the grant below tracks
+# whatever value is actually configured.
+{{ capture_dir }}/ rw,
+{{ capture_dir }}/** rw,

@@ -1,0 +1,39 @@
+---
+# Packet capture for a Redroid device, from the host VM's side.
+#
+# Limits arrive from the lab as the `pg_capture` inventory var (see
+# src/playground/backend/local_libvirt/inventory.py); these are the
+# fallbacks used when a lab predates that var or capture is driven by
+# hand. Keep them in step with CaptureOptions' defaults.
+
+capture_dir: /var/lib/playground/capture
+
+# Ubuntu ships tcpdump in main. Set false for an air-gapped host whose
+# package source lacks it -- the role then probes and aborts rather than
+# reaching for apt.
+capture_install_tcpdump: true
+
+# tcpdump -C counts units of 1,000,000 bytes, NOT MiB. -C with -W is a
+# ring: the oldest file is overwritten once max_files is reached.
+capture_max_file_mb: 100
+capture_max_files: 10
+capture_snaplen: 0
+
+# Container-name prefix used to DISCOVER the device's netns. Deliberately
+# a prefix match rather than a copy of the redroid role's
+# `redroid_{{ inventory_hostname | regex_replace(...) }}` expression --
+# duplicating that expression across two roles is exactly the
+# "implicit cross-layer dependency hidden by a hardcoded value" shape
+# docs/architecture/CONTRACTS.md warns about. The wrapper fails loudly if
+# the prefix matches zero or several containers.
+capture_container_prefix: redroid_
+
+# Wrapper the instanced unit execs. Referenced by the unit template and
+# by tasks/main.yml.
+capture_bin: /usr/local/lib/playground/capture-start
+
+# Lab-level bounds, injected by `playground inventory render` as a group
+# var under [playground:vars]. Defaulted so a hand-run play without the
+# var is a no-op rather than an undefined-variable failure -- same reason
+# workload_container defaults pg_workloads: '[]'.
+pg_capture: '{}'

@@ -105,8 +105,11 @@ class CaptureOptions(StrictModel):
       a wrapping session is visible.
 
     ``enabled: false`` is a PROVISIONING switch, not just a CLI gate: the
-    `needs_capture` play is skipped, so no package is installed and no unit
-    exists. It is the air-gap / lean-guest opt-out.
+    `capture` role's tasks end the host (``meta: end_host``) at its very
+    first tasks, before the tcpdump package install, so no package is
+    installed and no unit exists. The host still lands in
+    `needs_capture` -- it opts out at the role's own guard, not by being
+    excluded from the play. It is the air-gap / lean-guest opt-out.
     """
 
     enabled: bool = True

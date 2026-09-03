@@ -1,0 +1,60 @@
+#!/bin/sh
+# Managed by the playground capture Ansible role.
+#
+# Resolve the Redroid container's network namespace and run tcpdump
+# inside it. Only --net is entered: the mount namespace stays the
+# guest's, so tcpdump is the guest's binary and the pcap lands on the
+# VM's disk rather than inside a container whose writes vanish when it
+# is recreated.
+#
+# The PID is resolved HERE, at every start, not baked in by Ansible: the
+# Redroid container runs `restart_policy: unless-stopped`, so its PID
+# changes across restarts and a provision-time PID goes stale.
+set -eu
+
+vm="$1"
+dir="{{ capture_dir }}/${vm}"
+
+ids=$(docker ps --filter "name=^{{ capture_container_prefix }}" --format '{% raw %}{{.ID}}{% endraw %}')
+count=$(printf '%s\n' "$ids" | grep -c . || true)
+
+if [ "$count" -eq 0 ]; then
+    echo "capture: no redroid container matching '{{ capture_container_prefix }}*' on $(hostname); nothing to capture" >&2
+    exit 1
+fi
+if [ "$count" -gt 1 ]; then
+    echo "capture: found more than one container matching '{{ capture_container_prefix }}*' on $(hostname); refusing to guess which namespace to capture" >&2
+    exit 1
+fi
+
+pid=$(docker inspect -f '{% raw %}{{.State.Pid}}{% endraw %}' "$ids")
+if [ -z "$pid" ] || [ "$pid" = "0" ]; then
+    echo "capture: redroid container $ids has no running PID; is it up?" >&2
+    exit 1
+fi
+
+mkdir -p "$dir"
+
+# tcpdump applies strftime() to -w ONLY when -G is set; with -C it copies
+# the name verbatim and appends a rotation counter. So the stamp is
+# computed here, not delegated to tcpdump.
+stamp=$(date -u +%Y%m%d-%H%M%S)
+
+# -Z root: Debian/Ubuntu tcpdump drops privileges to the `tcpdump` user
+#   by default and then cannot write into this root-owned directory.
+# -i any: inside the container's netns this is EXACTLY the device's
+#   traffic. Note it yields the Linux "cooked" (SLL) link type, not
+#   Ethernet -- Wireshark and tshark read it natively.
+# -U: pack-per-write, so a pcap is readable while the session is live.
+# -C/-W: a bounded ring. The OLDEST file is overwritten once -W is hit.
+# NOTE: -W counts files PER BASE NAME, and every unit start mints a new
+# stamp. So the max_file_mb x max_files ceiling is per session-start, not
+# a global cap on the directory. That is the deliberate trade: one fixed
+# name would keep a global cap but silently TRUNCATE the previous
+# session's data on every container restart, losing data and hiding it.
+exec nsenter --target "$pid" --net \
+    tcpdump -i any -U -Z root \
+        -s "{{ capture_snaplen }}" \
+        -w "${dir}/${stamp}.pcap" \
+        -C "{{ capture_max_file_mb }}" \
+        -W "{{ capture_max_files }}"

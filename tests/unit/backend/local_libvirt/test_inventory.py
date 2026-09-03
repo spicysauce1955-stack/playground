@@ -469,3 +469,18 @@ def test_fetch_vm_ips_reports_subprocess_filenotfound(tmp_path, monkeypatch) -> 
     assert ips == {}
     assert len(diagnostics) == 1
     assert diagnostics[0].id == "config.inventory.tofu_command_failed"
+
+
+def test_render_inventory_emits_capture_bounds_as_a_group_var(
+    resolved_generic_infra, lab_ips: dict[str, str]
+) -> None:
+    body, diagnostics = render_inventory(resolved_generic_infra, lab_ips)
+
+    assert diagnostics == []
+    assert "pg_capture=" in body
+    # A group var under [playground:vars], not a per-host var: spec.capture
+    # is lab-scoped.
+    vars_block = body.split("[playground:vars]", 1)[1]
+    assert "pg_capture=" in vars_block
+    assert '"max_file_mb":100' in vars_block
+    assert '"max_files":10' in vars_block

@@ -73,13 +73,19 @@ def status_cmd(vm: str) -> str:
     exits non-zero for a dead unit (which is a normal, reportable state,
     not an error), and the capture directory is absent until the wrapper
     creates it.
+
+    The glob is `*.pcap*`, not `*.pcap`: tcpdump's `-C` rotation appends a
+    counter to whatever `-w` names, so the files on disk are
+    `<stamp>.pcap0`, `<stamp>.pcap1`, ... A bare `*.pcap` glob matches none
+    of them, which would silently report `files=0 bytes=0` for a healthy,
+    actively recording session.
     """
     unit = shlex.quote(unit_name(vm))
     directory = shlex.quote(remote_capture_dir(vm))
     return (
         f"state=$(systemctl is-active {unit} 2>/dev/null || true); "
-        f"files=$(find {directory} -maxdepth 1 -name '*.pcap' 2>/dev/null | wc -l); "
-        f"bytes=$(find {directory} -maxdepth 1 -name '*.pcap' -printf '%s\\n' "
+        f"files=$(find {directory} -maxdepth 1 -name '*.pcap*' 2>/dev/null | wc -l); "
+        f"bytes=$(find {directory} -maxdepth 1 -name '*.pcap*' -printf '%s\\n' "
         "2>/dev/null | awk '{t+=$1} END {print t+0}'); "
         'printf "state=%s files=%s bytes=%s\\n" "$state" "$files" "$bytes"'
     )

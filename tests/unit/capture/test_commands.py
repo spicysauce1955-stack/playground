@@ -83,3 +83,14 @@ def test_status_keeps_the_capture_dir_as_one_token() -> None:
     # The directory appears inside a command substitution, so assert the
     # quoted form is present rather than tokenizing the whole script.
     assert shlex.quote(f"/var/lib/playground/capture/{nasty}") in status_cmd(nasty)
+
+
+def test_status_glob_matches_tcpdumps_rotation_suffix() -> None:
+    """tcpdump under -C appends a rotation counter to whatever -w names,
+    so the files on disk are `<stamp>.pcap0`, `<stamp>.pcap1`, ... A
+    `*.pcap` glob matches none of them, which would make `capture status`
+    report files=0 bytes=0 for a healthy, actively recording session.
+    """
+    cmd = status_cmd("droid1")
+    assert "'*.pcap*'" in cmd
+    assert "'*.pcap'" not in cmd

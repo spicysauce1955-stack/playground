@@ -26,6 +26,8 @@ spec:
   provisioners:
     # The resolver list-replaces provisioners on `extends`, so we
     # re-list docker explicitly. Order matters: docker first (redroid
-    # talks to dockerd), redroid second.
+    # talks to dockerd), redroid second, capture last (its wrapper
+    # discovers a running Redroid container).
     - ansible_role: docker
     - ansible_role: redroid
+    - ansible_role: capture

@@ -1,0 +1,145 @@
+---
+# Idempotent: package present, three templated files unchanged, unit
+# enabled but STOPPED. A converged host reports changed=0.
+#
+# This role must never start, stop, or restart a capture session --
+# `playground apply` on a lab that is mid-capture leaves the recording
+# untouched. Sessions are started only by `playground capture start`.
+
+- name: Parse pg_capture JSON payload
+  ansible.builtin.set_fact:
+    # May arrive as a JSON STRING, or as an already-decoded DICT when
+    # Ansible auto-parses the single-quoted .ini value. `from_json` only
+    # accepts a string, so guard it (BUG-6): parse a string, pass a dict
+    # through unchanged.
+    pg_capture_parsed: >-
+      {{ pg_capture if (pg_capture is not string)
+         else (pg_capture | from_json) }}
+  when: pg_capture is defined
+
+- name: Apply the lab's capture bounds over the role defaults
+  ansible.builtin.set_fact:
+    capture_max_file_mb: "{{ _pgc.max_file_mb | default(capture_max_file_mb) }}"
+    capture_max_files: "{{ _pgc.max_files | default(capture_max_files) }}"
+    capture_snaplen: "{{ _pgc.snaplen | default(capture_snaplen) }}"
+  vars:
+    _pgc: "{{ pg_capture_parsed | default({}) }}"
+
+- name: Skip the host entirely when the lab disabled capture
+  ansible.builtin.meta: end_host
+  when: not ((pg_capture_parsed | default({})).get('enabled', true) | bool)
+
+- name: Install tcpdump
+  ansible.builtin.apt:
+    name: tcpdump
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  when: capture_install_tcpdump | bool
+  # Tolerated for the same reason every apt task in the redroid role is:
+  # an unreachable archive must not abort the play, and `update_cache`
+  # fails before package state is even examined -- so this would fail
+  # even on a host where tcpdump is ALREADY installed. The probe below is
+  # the honest gate.
+  failed_when: false
+
+- name: Confirm tcpdump is on the guest
+  ansible.builtin.command: tcpdump --version
+  register: tcpdump_present
+  changed_when: false
+  failed_when: false
+
+- name: Abort when tcpdump is missing (capture needs it)
+  ansible.builtin.fail:
+    msg: |
+      Host '{{ inventory_hostname }}' has no working `tcpdump` on PATH, so
+      `playground capture start` would fail later with a bare exit code
+      and no message.
+
+      capture_install_tcpdump is currently
+      {{ capture_install_tcpdump | default(true) }}.
+
+      To resolve:
+        - Leave capture_install_tcpdump: true and make the apt archive
+          reachable (Ubuntu ships tcpdump in main), OR
+        - Install tcpdump by another route if this host is air-gapped, OR
+        - Set `capture: {enabled: false}` in the lab's spec, which drops
+          this host from the capture play entirely.
+  when: tcpdump_present.rc != 0
+
+- name: Confirm nsenter is present (util-linux; needed to enter the device netns)
+  ansible.builtin.command: nsenter --version
+  register: nsenter_present
+  changed_when: false
+  failed_when: false
+
+- name: Abort when nsenter is missing
+  ansible.builtin.fail:
+    msg: |
+      Host '{{ inventory_hostname }}' has no `nsenter` (normally shipped by
+      util-linux on every Ubuntu image). Capture enters the Redroid
+      container's network namespace with it; without it there is no way to
+      aim tcpdump at exactly one device.
+  when: nsenter_present.rc != 0
+
+- name: Create the capture directory
+  ansible.builtin.file:
+    path: "{{ capture_dir }}"
+    state: directory
+    owner: root
+    group: root
+    # 0755, not 0750: tcpdump's savefiles land as 0644 root:root
+    # regardless of this directory's mode, so a 0750 parent is
+    # incoherent -- it blocks traversal while the contents underneath are
+    # world-readable anyway. status_cmd's two `find` calls and `capture
+    # fetch`'s `scp` are both deliberately unprivileged (only start/stop
+    # go through sudo), so the `ubuntu` user genuinely needs to traverse
+    # this directory to read anything back.
+    mode: "0755"
+
+- name: Create the playground lib directory
+  ansible.builtin.file:
+    path: "{{ capture_bin | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the capture wrapper (resolves the container PID at run time)
+  ansible.builtin.template:
+    src: capture-start.j2
+    dest: "{{ capture_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Widen the tcpdump AppArmor profile for the capture directory
+  ansible.builtin.template:
+    src: apparmor-local-tcpdump.j2
+    dest: /etc/apparmor.d/local/usr.sbin.tcpdump
+    owner: root
+    group: root
+    mode: "0644"
+  register: apparmor_local
+
+- name: Reload the tcpdump AppArmor profile
+  ansible.builtin.command: apparmor_parser -r /etc/apparmor.d/usr.sbin.tcpdump
+  when: apparmor_local.changed
+  changed_when: apparmor_local.changed
+  # A host with AppArmor disabled has no profile to reload; that is not a
+  # capture failure, and the wrapper's own write is the real gate.
+  failed_when: false
+
+- name: Install the instanced capture unit
+  ansible.builtin.template:
+    src: playground-capture@.service.j2
+    dest: /etc/systemd/system/playground-capture@.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: capture_unit
+
+- name: Reload systemd when the unit definition changed
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  when: capture_unit.changed

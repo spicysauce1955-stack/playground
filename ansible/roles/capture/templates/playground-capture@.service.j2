@@ -1,0 +1,45 @@
+# Managed by the playground capture Ansible role.
+#
+# Instanced unit: %i is the lab's VM name, so `systemctl start
+# playground-capture@droid1` captures droid1's device.
+#
+# Restart=always is load-bearing. If the Redroid container restarts it
+# takes its network namespace with it and tcpdump dies; without a restart
+# the capture would end silently in the middle of an experiment. The
+# wrapper re-resolves the new PID on each start. Timestamped filenames
+# make the discontinuity visible rather than hiding it.
+[Unit]
+Description=playground packet capture for Redroid device %i
+After=docker.service
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=exec
+# capture_bin defaults to /usr/local/lib/playground/capture-start (the
+# wrapper installed by this role's tasks/main.yml).
+ExecStart={{ capture_bin }} %i
+Restart=always
+RestartSec=5
+
+# Type=exec completes the start job when /bin/sh execs, NOT when the
+# wrapper's own `exec` succeeds -- so a wrapper that exits 1 (no redroid
+# container, AppArmor denial) still makes `systemctl start` return 0.
+# `playground capture start` therefore verifies the unit reached `active`
+# rather than trusting the start's exit code.
+#
+# Restart=always with RestartSec=5 would retry forever under systemd's
+# DEFAULT start limit (5 starts / 10s never trips at a 5s interval), which
+# means a permanently broken host -- no container, an AppArmor denial --
+# would loop silently instead of ever reaching `failed`, and with a fresh
+# ${stamp} per start could leave an orphaned pcap behind on each cycle.
+#
+# The explicit window above gets both behaviors instead: a Redroid
+# container restart costs 1-2 starts and resumes normally, while a
+# genuinely broken wrapper burns 20 starts in ~100s and lands in `failed`,
+# where `systemctl is-active` (and so `playground capture status`) can
+# actually report it.
+
+[Install]
+WantedBy=multi-user.target
