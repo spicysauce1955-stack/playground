@@ -202,7 +202,14 @@ class PlaygroundTui(App[None]):
 
         warnings = [d for d in validation_diagnostics if d.severity == "warning"]
         plan = render_plan(resolved, warnings=warnings)
-        status, _ = query_status(resolved, self.tofu_dir, self.state_dir)
+        # `_render_lab` never displays `status.devices`, so this
+        # deliberately does NOT pass `self.state_dir` -- doing so would
+        # make every lab highlight in the list also shell out to `adb
+        # devices -l` plus a registry read on the UI thread, for data
+        # nothing on screen shows. A hung/slow adb would then freeze
+        # the TUI with no escape. Revisit if this screen ever grows a
+        # device section.
+        status, _ = query_status(resolved, self.tofu_dir)
 
         lines = [
             f"# {resolved.lab_name}",

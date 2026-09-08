@@ -19,6 +19,7 @@ from playground.config.resolver import resolve_lab
 from playground.devices.adb import AttachedDevice, DeviceFacts
 from playground.devices.binding import read_binding, write_binding
 from playground.devices.registry import record_seen
+from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import DeviceStatus, LabStatus, VmStatus
 
@@ -210,3 +211,74 @@ def test_query_status_default_state_dir_matches_the_rest_of_the_cli(
     status, _diagnostics = dispatch.query_status(resolved, tmp_path / "tofu")
 
     assert status.devices[0].state == "connected"
+
+
+def test_list_attached_error_is_downgraded_to_a_warning_and_surfaced(
+    tmp_path, monkeypatch
+) -> None:
+    """`list_attached`'s own diagnostic (e.g. `device.adb_unavailable`,
+    severity=error, for a missing/hung adb) must not propagate unchanged:
+    every `query_status` caller (status, exec, cp, app, adb, capture)
+    would hard-fail on `_exit_on_errors` for a reason unrelated to what
+    it's doing. It must also not be silently dropped -- that would
+    reintroduce "adb is broken" presenting as "no devices attached",
+    exactly what handoff (c) exists to prevent. The fix: downgrade to
+    warning and return it.
+    """
+    write_binding(tmp_path, "device-lab", "pixel7", "S1")
+    adb_unavailable = Diagnostic(
+        id="device.adb_unavailable",
+        severity="error",
+        message="`adb devices -l` failed: adb not found on PATH",
+        source=SourceLocation(path="adb"),
+        suggestion="install android-platform-tools and re-run `playground doctor`",
+    )
+    monkeypatch.setattr(dispatch, "list_attached", lambda: ([], [adb_unavailable]))
+    monkeypatch.setattr(dispatch.local_libvirt, "query_status", _stub_vm_status)
+
+    resolved = _resolved_device_lab(tmp_path)
+    status, diagnostics = dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
+
+    assert status.devices == [DeviceStatus(name="pixel7", state="missing", serial="S1")]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == "device.adb_unavailable"
+    assert diagnostics[0].severity == "warning"
+
+
+def test_a_device_less_lab_never_surfaces_adb_diagnostics_either(
+    tmp_path, monkeypatch
+) -> None:
+    """Companion to the no-regression guarantee above: a device-less lab
+    doesn't call `list_attached` at all, so there's nothing to downgrade
+    or surface -- `diagnostics` stays exactly what the backend returned."""
+    monkeypatch.setattr(
+        dispatch, "list_attached", lambda: (_ for _ in ()).throw(AssertionError("unexpected"))
+    )
+    monkeypatch.setattr(dispatch.local_libvirt, "query_status", _stub_vm_status)
+
+    resolved = _resolved_generic_infra()
+    status, diagnostics = dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
+
+    assert status.devices == []
+    assert diagnostics == []
+
+
+def test_registry_none_model_does_not_beat_a_live_reported_model(
+    tmp_path, monkeypatch
+) -> None:
+    """Minor-5 regression: a registry entry recorded with `model=None`
+    (e.g. probed before the handset finished booting) must not shadow a
+    model the CURRENT `adb devices -l` listing does report."""
+    write_binding(tmp_path, "device-lab", "pixel7", "S1")
+    record_seen(tmp_path, DeviceFacts(serial="S1", model=None))
+    monkeypatch.setattr(
+        dispatch,
+        "list_attached",
+        lambda: ([AttachedDevice(serial="S1", state="connected", model="Pixel 7")], []),
+    )
+    monkeypatch.setattr(dispatch.local_libvirt, "query_status", _stub_vm_status)
+
+    resolved = _resolved_device_lab(tmp_path)
+    status, _diagnostics = dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
+
+    assert status.devices[0].model == "Pixel 7"

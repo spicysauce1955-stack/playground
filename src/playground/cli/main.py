@@ -1712,7 +1712,12 @@ def destroy_command(
     if resolved.devices:
         release_diagnostics = release(state_dir, lab, resolved.devices)
         if release_diagnostics:
-            _print_diagnostics(release_diagnostics)
+            # err=True (not the per-diagnostic-severity default `None`):
+            # `release` returns `[]` today, but the moment it grows the
+            # uninstall bookkeeping its own docstring promises, a warning
+            # printed to stdout here would pollute `--output json`'s
+            # otherwise-clean stdout. Free to fix now, before that lands.
+            _print_diagnostics(release_diagnostics, err=True)
 
     if output is OutputFormat.json:
         _print_json(finished.model_dump(mode="json", exclude_none=True))

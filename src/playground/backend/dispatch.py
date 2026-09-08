@@ -223,18 +223,19 @@ def query_status(
         status, diagnostics = local_libvirt.query_status(resolved, tofu_dir)
 
     if resolved.devices:
-        status = status.model_copy(
-            update={
-                "devices": _device_statuses(state_dir, resolved.lab_name, resolved.devices)
-            }
+        device_statuses, device_diagnostics = _device_statuses(
+            state_dir, resolved.lab_name, resolved.devices
         )
+        status = status.model_copy(update={"devices": device_statuses})
+        diagnostics = [*diagnostics, *device_diagnostics]
     return status, diagnostics
 
 
 def _device_statuses(
     state_dir: Path, lab: str, devices: list[ResolvedDevice]
-) -> list[DeviceStatus]:
-    """Read-only ``DeviceStatus`` for every declared slot.
+) -> tuple[list[DeviceStatus], list[Diagnostic]]:
+    """Read-only ``DeviceStatus`` for every declared slot, plus any
+    diagnostic explaining why a slot reads as ``missing``.
 
     Deliberately does NOT call ``resolve_binding`` -- that function can
     auto-bind (and persist) an unbound slot with exactly one matching
@@ -249,8 +250,22 @@ def _device_statuses(
     un-adopted device is not a live target yet, matching the same
     "never adopted/probed" semantics `android.targets.resolve_targets`
     already applies to a slot absent from `status.devices` entirely.
+
+    `list_attached`'s own diagnostics (e.g. `device.adb_unavailable` for
+    a missing or hung `adb`) are severity=error, but propagating that
+    unchanged into `query_status`'s return would make `_exit_on_errors`
+    hard-fail every caller of `query_status` -- `status`, `exec`, `cp`,
+    `app`, `adb`, `capture` -- for a reason that has nothing to do with
+    what any of them are actually doing. So they are downgraded to a
+    warning and returned rather than dropped: every device then reads
+    `state=missing` exactly as it would if genuinely unplugged, but the
+    warning names the real cause (no adb / adb timed out) instead of
+    leaving the operator to conclude "no devices attached" -- the same
+    confusion handoff (c) exists to eliminate on `doctor`, reintroduced
+    here if this were silently swallowed instead.
     """
-    attached, _adb_diagnostics = list_attached()
+    attached, adb_diagnostics = list_attached()
+    diagnostics = [d.model_copy(update={"severity": "warning"}) for d in adb_diagnostics]
     attached_by_serial = {candidate.serial: candidate for candidate in attached}
     registry = read_registry(state_dir)
 
@@ -273,7 +288,7 @@ def _device_statuses(
                 name=device.name,
                 state=candidate.state,
                 serial=binding.serial,
-                model=facts.model if facts is not None else candidate.model,
+                model=(facts.model if facts is not None else None) or candidate.model,
                 manufacturer=facts.manufacturer if facts is not None else None,
                 sdk=facts.sdk if facts is not None else None,
                 abi=facts.abi if facts is not None else None,
@@ -281,7 +296,7 @@ def _device_statuses(
                 last_verified=entry.last_verified if entry is not None else None,
             )
         )
-    return statuses
+    return statuses, diagnostics
 
 
 def estimate_cost(

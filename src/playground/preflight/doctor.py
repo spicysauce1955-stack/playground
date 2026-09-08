@@ -32,7 +32,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from playground.devices.adb import list_attached
+from playground.devices.adb import parse_devices_l
 from playground.models.diagnostic import Diagnostic, SourceLocation
 
 # Required ansible collections — matches ansible/requirements.yml.
@@ -1751,14 +1751,17 @@ def check_adb_available() -> Diagnostic | None:
 def _raw_adb_devices_l() -> str | None:
     """Raw ``adb devices -l`` stdout, or ``None`` when it cannot be read.
 
-    Read independently of :func:`playground.devices.adb.list_attached`
-    because that module's ``parse_devices_l`` silently DROPS the ``no
-    permissions`` and ``authorizing`` states -- adb vocabulary that never
-    makes it into the shared ``DeviceState`` literal. Widening that
-    literal for two doctor-only states would ripple into every
-    `DeviceStatus` consumer for no benefit to them; reading the raw
-    listing here keeps the doctor-local representation contained to this
-    module, per the design note this check exists to satisfy.
+    Read directly here -- rather than through
+    :func:`playground.devices.adb.list_attached` -- because that
+    module's ``parse_devices_l`` silently DROPS the ``no permissions``
+    and ``authorizing`` states -- adb vocabulary that never makes it
+    into the shared ``DeviceState`` literal. Widening that literal for
+    two doctor-only states would ripple into every `DeviceStatus`
+    consumer for no benefit to them; reading the raw listing here keeps
+    the doctor-local representation contained to this module. This is
+    the ONLY ``adb devices -l`` invocation `check_attached_devices`
+    makes -- its own ``unauthorized`` check and the dropped-state scan
+    both parse this same text rather than each shelling out again.
     """
     try:
         result = subprocess.run(  # noqa: S603 — explicit args, no shell
@@ -1772,7 +1775,7 @@ def _raw_adb_devices_l() -> str | None:
     return result.stdout
 
 
-def _dropped_adb_state_diagnostics() -> list[Diagnostic]:
+def _dropped_adb_state_diagnostics(raw: str) -> list[Diagnostic]:
     """``no permissions`` and ``authorizing`` lines from a raw ``adb
     devices -l``, translated into diagnostics naming the actual remedy.
 
@@ -1782,9 +1785,6 @@ def _dropped_adb_state_diagnostics() -> list[Diagnostic]:
     permissions` -- looks to the operator exactly like "no devices
     attached", the least informative message doctor could give them.
     """
-    raw = _raw_adb_devices_l()
-    if not raw:
-        return []
     found: list[Diagnostic] = []
     for line in raw.splitlines():
         line = line.strip()
@@ -1831,15 +1831,27 @@ def check_attached_devices() -> list[Diagnostic]:
 
     `unauthorized` gets the RSA-tap remedy -- the most common real-world
     failure. `no permissions` (a udev misconfiguration) and
-    `authorizing` (a pairing still mid-flight) are two more adb states
-    that a naive read of `list_attached()` alone would never surface at
-    all, so `doctor` reads the raw listing a second time for those; see
-    `_dropped_adb_state_diagnostics`.
+    `authorizing` (a pairing still mid-flight) are two more adb states a
+    naive parse would never surface at all; see
+    `_dropped_adb_state_diagnostics`. Both checks parse ONE raw `adb
+    devices -l` read (`_raw_adb_devices_l`) rather than shelling out
+    twice for the same bytes.
     """
     if not shutil.which("adb"):
         return []
-    attached, diagnostics = list_attached()
-    for device in attached:
+    raw = _raw_adb_devices_l()
+    if raw is None:
+        return [
+            Diagnostic(
+                id="preflight.adb.unavailable",
+                severity="warning",
+                message="`adb devices -l` failed to run (timed out, or adb is misbehaving)",
+                source=SourceLocation(path="adb"),
+                suggestion="run `adb devices -l` manually to see the underlying error",
+            )
+        ]
+    diagnostics: list[Diagnostic] = []
+    for device in parse_devices_l(raw):
         if device.state == "unauthorized":
             diagnostics.append(
                 Diagnostic(
@@ -1850,7 +1862,7 @@ def check_attached_devices() -> list[Diagnostic]:
                     suggestion="tap Allow on the handset's RSA prompt",
                 )
             )
-    diagnostics.extend(_dropped_adb_state_diagnostics())
+    diagnostics.extend(_dropped_adb_state_diagnostics(raw))
     return diagnostics
 
 
