@@ -36,6 +36,8 @@ from playground.android.commands import (
     launch_cmd,
     list_packages_cmd,
     logcat_cmd,
+    pull_cmd,
+    push_cmd,
     screenshot_cmd,
     stop_cmd,
     ui_dump_cmd,
@@ -46,7 +48,7 @@ from playground.android.splits import find_base_apk
 from playground.android.targets import AndroidTarget, resolve_targets
 from playground.android.transport import (
     AdbInvocation,
-    guest_prefix,
+    LocalAdb,
     render_guest_command,
     require_guest,
 )
@@ -256,9 +258,14 @@ def _stream(target: AndroidTarget, inv: AdbInvocation) -> None:
 
 
 def _scp_one(
-    local: Path, target: AndroidTarget, remote_path: str, *, timeout: float = _SCP_TIMEOUT
+    target: AndroidTarget, local: Path, remote_path: str, *, timeout: float = _SCP_TIMEOUT
 ) -> bool:
-    """scp ``local`` to ``remote_path`` on ``target``. Prints and returns False on failure."""
+    """scp ``local`` to ``remote_path`` on ``target``. Prints and returns False on failure.
+
+    ``target`` leads (not ``local``) so this matches the argument order
+    every other guest-facing helper in this module uses (``target`` first)
+    -- `stage_for` calls this positionally.
+    """
     # scp's `host:path` operand IS shell-interpreted on the remote side
     # (legacy scp protocol execs a remote shell; even the SFTP-based
     # default still tokenizes it for some servers/older clients). Without
@@ -279,6 +286,48 @@ def _scp_one(
         typer.echo(f"[{target.name}] scp failed: {completed.stderr.strip()}", err=True)
         return False
     return True
+
+
+def stage_for(target: AndroidTarget, local_path: Path) -> str:
+    """Return the path adb should be handed for ``local_path``.
+
+    A guest target runs adb on the VM, so the file has to travel there
+    first (scp'd to a fresh, uuid-suffixed name under `/tmp` -- collision-
+    safe the same way every other guest staging path in this module
+    already is). A local target runs adb on this machine, where the file
+    already is -- copying it would be a no-op at best and a wrong path at
+    worst.
+
+    Deliberately does not branch on `_scp_one`'s return value: a failed
+    scp already prints its own `[target] scp failed: ...` message, and the
+    adb command this path is handed to next will fail cleanly too (the
+    guest has no such file) -- one failure surfaces either way, just
+    through the adb round trip rather than a short-circuit here.
+    """
+    if isinstance(target.transport, LocalAdb):
+        return str(local_path)
+    remote = f"/tmp/playground-stage-{uuid4().hex}-{local_path.name}"
+    _scp_one(target, local_path, remote)
+    return remote
+
+
+def _guest_cleanup(target: AndroidTarget, remote_path: str) -> None:
+    """Delete a guest-side staging file, best-effort.
+
+    A local target never has one -- adb ran directly on this machine, so
+    there is nothing on any guest to remove. This used to ride along
+    inside the adb command itself as `; rm -f <tmp>; exit $status`, which
+    only worked because a guest shell was there to parse that trailing
+    `;` -- see `push_command`'s history.
+
+    Goes through `run_guest_shell` (not a bare `subprocess.run`) so a
+    missing `ssh` binary or a timeout is swallowed the same way every
+    other guest round trip in this module handles it, rather than raising
+    out of what is meant to be a best-effort cleanup.
+    """
+    if isinstance(target.transport, LocalAdb):
+        return
+    run_guest_shell([target], f"rm -f {shlex.quote(remote_path)}", timeout=_DEFAULT_TIMEOUT)
 
 
 def _capture_to_local(
@@ -329,15 +378,17 @@ def _capture_to_local(
     """
     guest = require_guest(target)
     guest_tmp = f"/tmp/playground-pull-{uuid4().hex}"
-    prefix = guest_prefix()
     capture_cmd_str = (
         render_guest_command(capture_cmd) if capture_cmd is not None else "true"
     )
     capture_group = f"{{ {capture_cmd_str}; }}"
-    pull_group = (
-        f"{{ {prefix} pull {shlex.quote(device_path)} "
-        f"{shlex.quote(guest_tmp)} >/dev/null 2>&1; }}"
-    )
+    # `render_guest_command(pull_cmd(...))`, not a hand-built `{prefix}
+    # pull ...` string -- every adb invocation in this module goes
+    # through a real builder now (Task 4). Byte-identical to the old
+    # string: neither `device_path` nor `guest_tmp` has shell
+    # metacharacters in practice, but even if one did, this is the exact
+    # quoting `render_guest_command` already applies everywhere else.
+    pull_group = f"{{ {render_guest_command(pull_cmd(device_path, guest_tmp))} >/dev/null 2>&1; }}"
     chain = f"{capture_group} && {pull_group}"
     if clean_device_path_first:
         # `adb_shell`, not a hand-rolled `{prefix} shell rm -f ...`: it
@@ -403,6 +454,90 @@ def _capture_to_local(
         return False
     typer.echo(f"[{target.name}] wrote {local_path}")
     return True
+
+
+class _RetrievalFailed(Exception):
+    """Raised by `retrieve_from` when bringing a device file back to the
+    controller fails.
+
+    The operator-facing message has already been echoed by the time this
+    is raised (mirroring `_capture_to_local`'s echo-then-return-False
+    pattern); this only carries enough for a caller's fan-out loop to add
+    the target to its failed list, the same way a `False` return used to.
+    """
+
+
+def retrieve_from(target: AndroidTarget, remote_path: str, dest: Path) -> None:
+    """Bring a device-side file at ``remote_path`` back to ``dest`` on this
+    machine, raising `_RetrievalFailed` if it cannot.
+
+    Guest: `adb pull` runs on the VM, so the file lands there first --
+    `_capture_to_local` (with no capture step of its own, and
+    `clean_device_path_first=False` since ``remote_path`` is an existing
+    file this call did not create, not a synthetic path to pre-clean)
+    streams it the rest of the way back over the same ssh session. Local:
+    `adb pull` already runs on this machine, so ``dest`` is the direct
+    destination and there is no second hop.
+    """
+    if isinstance(target.transport, LocalAdb):
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            typer.echo(f"[{target.name}] cannot create {dest.parent}: {exc}", err=True)
+            raise _RetrievalFailed(target.name) from exc
+        if dest.is_dir():
+            typer.echo(
+                f"[{target.name}] {dest} is a directory, expected a file path", err=True
+            )
+            raise _RetrievalFailed(target.name)
+        result = run_on_targets(
+            [target], pull_cmd(remote_path, str(dest)), timeout=_PUSH_PULL_TIMEOUT
+        )[0]
+        if not result.ok:
+            _echo_target_output(result)
+            raise _RetrievalFailed(target.name)
+        typer.echo(f"[{target.name}] wrote {dest}")
+        return
+    if not _capture_to_local(
+        target, None, remote_path, dest, timeout=_PUSH_PULL_TIMEOUT, clean_device_path_first=False
+    ):
+        raise _RetrievalFailed(target.name)
+
+
+def _capture_and_retrieve(
+    target: AndroidTarget,
+    capture_cmd: AdbInvocation,
+    device_path: str,
+    local_path: Path,
+    *,
+    timeout: float = _CAPTURE_TIMEOUT,
+) -> bool:
+    """Run ``capture_cmd`` on the device, then bring ``device_path`` back to
+    ``local_path``. Used by `screenshot_command`/`ui_dump_command`, which
+    both need "run a capture, then fetch its output" rather than a plain
+    pull of a pre-existing file.
+
+    Guest transport keeps `_capture_to_local`'s single atomic ssh chain
+    (clean-before-capture, capture, pull, cat-back, all gated by one `&&`
+    chain -- see that function's BUG A docstring) untouched: it is already
+    correct and its exact command shape is exercised by real-bash
+    regression tests. Local transport has no shell chain to defend --
+    adb runs right here, so a failed capture is just a nonzero
+    `TargetResult` this function can check in Python before ever calling
+    `retrieve_from`, which is what keeps a failed local capture from
+    handing back a stale file the same way the guest chain does.
+    """
+    if isinstance(target.transport, LocalAdb):
+        cap_result = run_on_targets([target], capture_cmd, timeout=timeout)[0]
+        if not cap_result.ok:
+            _echo_target_output(cap_result)
+            return False
+        try:
+            retrieve_from(target, device_path, local_path)
+        except _RetrievalFailed:
+            return False
+        return True
+    return _capture_to_local(target, capture_cmd, device_path, local_path, timeout=timeout)
 
 
 def _timestamp() -> str:
@@ -557,49 +692,28 @@ def install_command(
             failed.append(target.name)
             continue
 
-        # Stage on the VM's own filesystem, NOT /data/local/tmp: that is an
-        # ANDROID path, and scp's destination is the Ubuntu guest, which has
-        # no such directory. `adb install` reads the APK from the machine
-        # running adb (the guest) and pushes it to the device itself.
-        # Found live -- the ssh/scp test shim accepts any path, so this
-        # passed every unit test while failing on a real VM with
+        # `stage_for` is a no-op path rewrite on a local target (adb
+        # already runs where the APK is) and an scp-to-`/tmp` on a guest
+        # target -- NOT `/data/local/tmp`, which is an ANDROID path, while
+        # scp's destination is the Ubuntu guest. `adb install` reads the
+        # APK from wherever adb itself is running and pushes it to the
+        # device. Found live -- the ssh/scp test shim accepts any path, so
+        # this passed every unit test while failing on a real VM with
         # `scp: dest open "/data/local/tmp/...": No such file or directory`.
-        stage_dir = f"/tmp/playground-apk-{uuid4().hex}"
-        remote_paths = [f"{stage_dir}/{apk.name}" for apk in apks]
-        mkdir = run_guest_shell(
-            [target], f"mkdir -p {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
-        )[0]
-        if not mkdir.ok:
-            _echo_target_output(mkdir)
-            failed.append(target.name)
-            continue
-        if not all(
-            _scp_one(apk, target, remote_path)
-            for apk, remote_path in zip(apks, remote_paths, strict=True)
-        ):
-            # Best-effort: some APKs may have already landed on the guest
-            # even though the whole install did not go ahead (BUG D — this
-            # stage_dir is otherwise never removed and fills the disk).
-            run_guest_shell(
-                [target], f"rm -rf {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
-            )
-            failed.append(target.name)
-            continue
+        remote_paths = [stage_for(target, apk) for apk in apks]
         install_inv = (
             install_multiple_cmd(remote_paths)
             if len(remote_paths) > 1
             else install_cmd(remote_paths[0])
         )
-        # Fold stage_dir cleanup into the SAME ssh round trip as the
-        # install (rather than a separate call) so a failed install still
-        # removes the staged APK(s), and the real install exit status is
-        # still what decides pass/fail.
-        full_command = (
-            f"{render_guest_command(install_inv)}; status=$?; "
-            f"rm -rf {shlex.quote(stage_dir)}; exit $status"
-        )
-        result = run_guest_shell([target], full_command, timeout=_INSTALL_TIMEOUT)[0]
+        result = run_on_targets([target], install_inv, timeout=_INSTALL_TIMEOUT)[0]
         _echo_target_output(result)
+        # Best-effort, after the install attempt either way (BUG D — a
+        # staged APK left on the guest is otherwise never removed and
+        # fills the disk); a no-op for a local target, which never staged
+        # anything to begin with.
+        for remote_path in remote_paths:
+            _guest_cleanup(target, remote_path)
         if not result.ok:
             failed.append(target.name)
 
@@ -740,7 +854,7 @@ def screenshot_command(
         # Fan-out writes <out>/<vm>-<timestamp>.png so concurrent devices
         # cannot collide on one filename.
         local_path = out / f"{target.name}-{_timestamp()}.png"
-        if not _capture_to_local(target, screenshot_cmd(device_path), device_path, local_path):
+        if not _capture_and_retrieve(target, screenshot_cmd(device_path), device_path, local_path):
             failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
@@ -775,7 +889,7 @@ def ui_dump_command(
     failed: list[str] = []
     for target in targets:
         local_path = out / f"{target.name}-{_timestamp()}.xml" if multi else out
-        if not _capture_to_local(target, ui_dump_cmd(device_path), device_path, local_path):
+        if not _capture_and_retrieve(target, ui_dump_cmd(device_path), device_path, local_path):
             failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
@@ -965,22 +1079,18 @@ def push_command(
     )
     failed: list[str] = []
     for target in targets:
-        guest_tmp = f"/tmp/playground-push-{uuid4().hex}-{src.name}"
-        if not _scp_one(src, target, guest_tmp):
-            failed.append(target.name)
-            continue
-        # BUG D: guest_tmp was never removed. Clean it up in the same ssh
-        # round trip, after the push attempt, regardless of outcome
-        # (`; status=$?; rm -f ...; exit $status`, plain sequencing after
-        # a `;` — not `&&` — is exactly what makes the cleanup unconditional).
-        # Hand-built adb string, not an `AdbInvocation` -- `adb_prefix()`
-        # bypassed the transport seam and Task 3 only inlines its
-        # replacement (`guest_prefix()`) to keep this working; a real
-        # `push_cmd` builder lands in Task 4 and absorbs this.
-        push_cmd = f"{guest_prefix()} push {shlex.quote(guest_tmp)} {shlex.quote(dest)}"
-        command = f"{push_cmd}; status=$?; rm -f {shlex.quote(guest_tmp)}; exit $status"
-        result = run_guest_shell([target], command, timeout=_PUSH_PULL_TIMEOUT)[0]
+        # `stage_for` scps to a guest target's `/tmp` (adb runs there) and
+        # is a no-op path rewrite on a local target (adb runs right here,
+        # where `src` already is).
+        staged = stage_for(target, src)
+        result = run_on_targets(
+            [target], push_cmd(staged, dest), timeout=_PUSH_PULL_TIMEOUT
+        )[0]
         _echo_target_output(result)
+        # BUG D: a staged file was never removed. Best-effort, after the
+        # push attempt either way; a no-op for a local target, which never
+        # staged anything to begin with.
+        _guest_cleanup(target, staged)
         if not result.ok:
             failed.append(target.name)
     _exit_for_failures(failed, len(targets))
@@ -1016,14 +1126,13 @@ def pull_command(
             )
         )
     target = targets[0]
-    # `pull`'s device_path is an arbitrary, pre-existing file the caller
-    # wants to read, not a synthetic path this CLI owns and recreates
-    # every call (unlike screenshot/ui-dump) — deleting it first would
-    # destroy the very file being pulled.
-    if not _capture_to_local(
-        target, None, src, dest, timeout=_PUSH_PULL_TIMEOUT, clean_device_path_first=False
-    ):
-        raise typer.Exit(code=1)
+    # `retrieve_from` never deletes `src` first: it is an arbitrary,
+    # pre-existing file the caller wants to read, not a synthetic path
+    # this CLI owns and recreates every call (unlike screenshot/ui-dump).
+    try:
+        retrieve_from(target, src, dest)
+    except _RetrievalFailed:
+        raise typer.Exit(code=1) from None
 
 
 @app_app.command(

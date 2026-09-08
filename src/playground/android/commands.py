@@ -28,6 +28,8 @@ __all__ = [
     "launch_cmd",
     "list_packages_cmd",
     "logcat_cmd",
+    "pull_cmd",
+    "push_cmd",
     "screenshot_cmd",
     "stop_cmd",
     "ui_dump_cmd",
@@ -63,6 +65,27 @@ def install_multiple_cmd(remote_apks: list[str]) -> AdbInvocation:
 
 def uninstall_cmd(package: str) -> AdbInvocation:
     return AdbInvocation(("uninstall", package))
+
+
+def push_cmd(src: str, dest: str) -> AdbInvocation:
+    """Copy a file from wherever adb is running onto the device.
+
+    ``src``/``dest`` are UNQUOTED, like every other builder here -- see
+    the module docstring. On a guest transport ``src`` is a path already
+    staged onto the VM (`app_commands.stage_for`); on a local transport
+    it is the caller's own path, since adb reads it directly.
+    """
+    return AdbInvocation(("push", src, dest))
+
+
+def pull_cmd(src: str, dest: str) -> AdbInvocation:
+    """Copy a file off the device to wherever adb is running.
+
+    On a guest transport ``dest`` lands on the VM and still needs a
+    second hop back to the controller (`app_commands.retrieve_from`); on
+    a local transport ``dest`` is already the controller path adb wrote.
+    """
+    return AdbInvocation(("pull", src, dest))
 
 
 def launch_cmd(package: str, *, activity: str | None, url: str | None) -> AdbInvocation:

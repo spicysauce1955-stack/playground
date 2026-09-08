@@ -24,6 +24,8 @@ from playground.android.commands import (
     launch_cmd,
     list_packages_cmd,
     logcat_cmd,
+    pull_cmd,
+    push_cmd,
     screenshot_cmd,
     stop_cmd,
     ui_dump_cmd,
@@ -120,6 +122,26 @@ def test_screenshot_and_ui_dump_write_to_the_given_remote_path() -> None:
     ui_dump = render_guest_command(ui_dump_cmd("/sdcard/ui.xml"))
     assert "uiautomator dump" in ui_dump
     assert "/sdcard/ui.xml" in ui_dump
+
+
+def test_push_cmd_operand_order_is_source_then_destination() -> None:
+    cmd = render_guest_command(push_cmd("/tmp/staged.apk", "/sdcard/dest.apk"))
+    assert "push /tmp/staged.apk /sdcard/dest.apk" in cmd
+
+
+def test_pull_cmd_operand_order_is_source_then_destination() -> None:
+    cmd = render_guest_command(pull_cmd("/sdcard/source.bin", "/tmp/local.bin"))
+    assert "pull /sdcard/source.bin /tmp/local.bin" in cmd
+
+
+def test_push_and_pull_cmd_return_unquoted_args() -> None:
+    """`AdbInvocation.args` must stay UNQUOTED -- outer quoting is
+    `render_guest_command`'s job, not a builder's (see the module
+    docstring); a path with a space proves neither builder pre-quotes."""
+    push = push_cmd("/tmp/my app.apk", "/sdcard/dest.apk")
+    assert push.args == ("push", "/tmp/my app.apk", "/sdcard/dest.apk")
+    pull = pull_cmd("/sdcard/my file.bin", "/tmp/my file.bin")
+    assert pull.args == ("pull", "/sdcard/my file.bin", "/tmp/my file.bin")
 
 
 def test_logcat_dump_vs_follow() -> None:

@@ -24,6 +24,7 @@ import subprocess
 
 import pytest
 
+from playground.android.commands import pull_cmd, push_cmd
 from playground.android.runner import TargetResult, _run_one, run_guest_shell, run_on_targets
 from playground.android.transport import AdbInvocation, AndroidTarget, GuestAdb, LocalAdb
 
@@ -123,6 +124,37 @@ def test_local_target_with_a_guest_shell_command_raises() -> None:
 
     with pytest.raises(TypeError):
         run_guest_shell([target], "mkdir -p /tmp/x", timeout=5.0)
+
+
+def test_local_target_push_runs_adb_push_directly(fake_run) -> None:
+    """`push_cmd`/`pull_cmd` (Task 4) are just another `AdbInvocation` to
+    the runner -- a local target dispatches them through `local_argv`
+    exactly like any other builder's output, with `app_commands.stage_for`
+    (not this module) responsible for the local path never needing a scp
+    hop first."""
+    target = AndroidTarget(name="phone1", transport=LocalAdb("1A2B3C"))
+    inv = push_cmd("/local/payload.bin", "/sdcard/dest.bin")
+
+    result = _run_one(target, inv, timeout=5.0)
+
+    assert result.ok
+    assert fake_run == [
+        ["adb", "-s", "1A2B3C", "push", "/local/payload.bin", "/sdcard/dest.bin"]
+    ]
+
+
+def test_guest_target_pull_dispatches_through_ssh(fake_run) -> None:
+    target = AndroidTarget(name="vm1", transport=GuestAdb("10.0.0.5", 22, "ubuntu"))
+    inv = pull_cmd("/sdcard/source.bin", "/tmp/staged.bin")
+
+    result = _run_one(target, inv, timeout=5.0)
+
+    assert result.ok
+    assert fake_run[0][0] == "ssh"
+    assert fake_run[0][-1] == (
+        "adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true; "
+        "adb -s 127.0.0.1:5555 pull /sdcard/source.bin /tmp/staged.bin"
+    )
 
 
 def test_target_result_type_still_matches() -> None:
