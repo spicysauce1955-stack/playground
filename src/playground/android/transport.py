@@ -8,7 +8,9 @@ string, prefixed with `adb connect`, and handed to ssh. Because a shell
 is involved, this renderer applies the outer `shlex.quote` that used to
 live in the builders. Output is byte-identical to the pre-refactor
 strings; `tests/unit/android/test_commands_characterization.py` is the
-proof, and it must never be edited to accommodate a change here.
+proof -- every expected string literal in that file is unchanged from
+before this refactor, even though the calls producing them now route
+through `render_guest_command`.
 
 `LocalAdb` -- a handset on the operator's own USB bus. The invocation
 becomes an argv executed with no shell anywhere in the chain, so the
@@ -34,47 +36,11 @@ ADB_PORT = 5555
 GUEST_SERIAL = f"127.0.0.1:{ADB_PORT}"
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class AdbInvocation:
-    """The adb arguments that follow `-s <serial>`.
-
-    Compatibility shim: `==`, `in`, and string methods (`.startswith`,
-    `.count`, `.split`, ...) called on an `AdbInvocation` delegate to its
-    OWN guest-rendered form -- exactly the string every builder in
-    `commands.py` returned before this refactor. That is what lets
-    `tests/unit/android/test_commands_characterization.py`, written and
-    frozen BEFORE this refactor and comparing builder output directly
-    against plain strings, keep passing completely unedited: its
-    authority depends on never being touched, so the compatibility has
-    to live here instead. Nothing about LOCAL-transport correctness
-    depends on this shim -- `local_argv` reads `.args` directly and never
-    touches `==`/`in`/string methods on an invocation.
-    """
+    """The adb arguments that follow `-s <serial>`."""
 
     args: tuple[str, ...]
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, AdbInvocation):
-            return self.args == other.args
-        if isinstance(other, str):
-            return render_guest_command(self) == other
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(self.args)
-
-    def __str__(self) -> str:
-        return render_guest_command(self)
-
-    def __contains__(self, item: str) -> bool:
-        return item in render_guest_command(self)
-
-    def __getattr__(self, name: str) -> object:
-        # Reached only when normal attribute lookup (a real dataclass
-        # field, a method defined above) has already failed -- so this
-        # never intercepts `.args` itself, only legacy string-method
-        # calls left over from when builders returned `str`.
-        return getattr(render_guest_command(self), name)
 
 
 @dataclass(frozen=True)

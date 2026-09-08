@@ -340,7 +340,17 @@ def _capture_to_local(
     """
     guest_tmp = f"/tmp/playground-pull-{uuid4().hex}"
     prefix = adb_prefix()
-    capture_group = f"{{ {capture_cmd}; }}"
+    # `capture_cmd` is an `AdbInvocation` from a real builder (screenshot,
+    # ui-dump) for every caller except `pull_command`, which passes the
+    # literal string `"true"` (no capture step -- the file already exists
+    # on the device). Render the former explicitly rather than relying on
+    # implicit `str()` conversion in the f-string below.
+    capture_cmd_str = (
+        render_guest_command(capture_cmd)
+        if isinstance(capture_cmd, AdbInvocation)
+        else capture_cmd
+    )
+    capture_group = f"{{ {capture_cmd_str}; }}"
     pull_group = (
         f"{{ {prefix} pull {shlex.quote(device_path)} "
         f"{shlex.quote(guest_tmp)} >/dev/null 2>&1; }}"
@@ -353,7 +363,10 @@ def _capture_to_local(
         # own sh -c reparses it) cannot split or mis-parse it -- the same
         # double-hop hazard every other device-shell command in this
         # module is built to avoid.
-        clean_group = f"{{ {adb_shell(f'rm -f {shlex.quote(device_path)}')}; }}"
+        clean_cmd_str = render_guest_command(
+            adb_shell(f"rm -f {shlex.quote(device_path)}")
+        )
+        clean_group = f"{{ {clean_cmd_str}; }}"
         chain = f"{clean_group} && {chain}"
     # `[ -s guest_tmp ]` rejects a capture that exited 0 but wrote zero
     # bytes (observed live: `screencap` can do this). The trailing
@@ -592,7 +605,7 @@ def install_command(
             )
             failed.append(target.name)
             continue
-        install_command_str = (
+        install_inv = (
             install_multiple_cmd(remote_paths)
             if len(remote_paths) > 1
             else install_cmd(remote_paths[0])
@@ -602,7 +615,7 @@ def install_command(
         # removes the staged APK(s), and the real install exit status is
         # still what decides pass/fail.
         full_command = (
-            f"{install_command_str}; status=$?; "
+            f"{render_guest_command(install_inv)}; status=$?; "
             f"rm -rf {shlex.quote(stage_dir)}; exit $status"
         )
         result = run_on_targets([target], full_command, timeout=_INSTALL_TIMEOUT)[0]
