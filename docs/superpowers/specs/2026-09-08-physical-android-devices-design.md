@@ -200,7 +200,7 @@ without a signature change.
 |---|---|---|
 | Owner | machine | operator |
 | Written by | every probe, automatically | only on an explicit yes |
-| Holds | serial, model, SDK, ABI, root, first/last/verified seen, **private notes** | `match`, `require`, `tags` |
+| Holds | serial, model, SDK, ABI, root, first/last/verified seen, private notes | `match`, `require`, `tags`, shared notes (`.md` sidecar) |
 | Committed to git | no | yes |
 
 The **registry** is every handset this machine has ever seen. It is what
@@ -220,45 +220,68 @@ with the cross-lab registry at the subdirectory root.
 
 **Nothing is ever written under `config/` without an explicit human yes.**
 Auto-writing tracked files would put churn in `git status` on every adb
-poll. Only two paths create a profile: answering yes to the discovery
-prompt, and `playground device save <serial> --as <name>`.
+poll. Only three paths create a profile, each an explicit human action:
+answering yes to the discovery prompt, `playground device save <serial>
+--as <name>`, and writing a shared note against a device that has no
+profile yet.
 
 ### Notes
 
-Two note surfaces, keyed differently and stored differently, because they
-answer different questions. The safe one is the default.
+Two note surfaces, keyed and stored differently because they answer
+different questions. **The shared, committed surface is the default**
+(operator decision, 2026-09-08; the rationale for the alternative is
+preserved below).
 
-| | private note | shared note |
+| | shared note | private note |
 |---|---|---|
-| Path | `.playground/state/devices/<serial>/notes.md` | `config/devices/<name>.md` |
-| Keyed by | **serial** | profile name |
-| Committed to git | no (`.playground/` is gitignored) | yes |
-| Holds | accounts, installed app state, anything about *this* handset | hardware quirks a second operator needs |
-| API default | yes | requires `--shared` |
+| Path | `config/devices/<name>.md` | `.playground/state/devices/<serial>/notes.md` |
+| Keyed by | profile name | **serial** |
+| Committed to git | yes | no (`.playground/` is gitignored) |
+| Holds | anything about this handset a second operator should also see | anything that must not leave this machine |
+| API default | yes | requires `--private` |
 
-**The private note keys on serial, not on the profile.** Three reasons,
-all of which a review trace surfaced:
+**A note is portable by default.** Keeping it beside the profile means it
+travels with the repository, survives a re-clone, and is visible to
+whoever else works the lab -- which is what makes it worth writing at
+all for a shared fleet.
 
-1. Under `discovery: silent` no profile is ever created, so a
-   profile-keyed note would have nowhere to live.
-2. A note like "this phone has Telegram installed under account X"
-   describes the *physical handset*, not a lab-local slot. It must follow
-   the hardware into every lab that uses it.
-3. It exists from the moment the device is first probed, with no
-   ceremony in between.
+#### Consequence: writing a note may create a profile
 
-**The private note is the default target because a note about a handset
-is very likely to contain credentials.** `config/` is tracked;
-`.gitignore` excludes only `.playground/`. A note-writing API that
-defaulted to the committed surface would walk account passwords into the
-repository, against the PRD's non-negotiable "no hardcoded secrets".
-`--shared` is therefore an explicit opt-in, and it **refuses** -- not
-warns -- when the text is credential-shaped.
+The shared surface keys on profile name, and under `discovery: silent` no
+profile exists. Rather than leave the default surface unwritable in that
+state, `device note` **creates the profile when one is missing**. This
+does not violate "nothing is written under `config/` without an explicit
+human yes" -- writing a note *is* that yes, which is why it is the third
+and last path that may create a profile, alongside the discovery prompt
+and `device save`.
 
-**Private does not mean secret, and the docs must not imply it does.**
-The file is plaintext on the operator's disk. It is out of git and off a
-teammate's machine; it is not a secret store and playground must not be
-described as one.
+The profile needs a name. `--as <name>` supplies it; an interactive
+session may prompt; a non-TTY session with neither fails with
+`config.device.note_name_required` rather than inventing one.
+
+#### Consequence: credential-shaped text warns, it does not refuse
+
+An earlier draft made `--shared` **refuse** credential-shaped text. That
+rule cannot survive shared becoming the default: the motivating example
+for the whole feature ("this phone has Telegram with account X and
+password Y") is itself credential-shaped, so a refusing default would
+reject the use case it exists to serve.
+
+The detector stays, downgraded to a warning that names `--private` as
+the alternative, and it is advisory only -- **substring heuristics do not
+reliably detect secrets and must never be described as a safety
+guarantee.**
+
+**The standing constraint is unchanged and now applies to a default
+path.** `config/` is tracked; `.gitignore` excludes only `.playground/`.
+Notes written the default way are committed, so anything genuinely
+sensitive needs `--private` -- and the CLI help, the `device note`
+first-run output and the docs must all say so plainly, because the safe
+choice is now the one requiring a flag.
+
+**Neither surface is a secret store.** Both are plaintext on disk;
+`--private` only keeps the file out of git and off a teammate's machine.
+Playground must not be described as protecting note contents.
 
 A sidecar `.md` rather than a `notes:` key inside YAML, because
 multi-paragraph markdown inside a block scalar means fighting
@@ -279,18 +302,22 @@ over.
 ### The note API
 
 ```
-playground device note <device>                  # $EDITOR on the private note
+playground device note <device>                  # $EDITOR on the shared note
 playground device note <device> --set -          # read markdown from stdin
 playground device note <device> --append "..."
 playground device note <device> --show [--json]
 playground device note <device> --clear
-playground device note <device> --shared ...     # target the committed profile note
+playground device note <device> --as <name>      # name the profile to create
+playground device note <device> --private ...    # the gitignored, serial-keyed note
 ```
 
-`<device>` accepts a profile name **or** a raw serial, so the API works
-before any profile exists -- which is the point of keying on serial.
+`<device>` accepts a profile name **or** a raw serial. A serial with no
+profile yet is the case `--as` exists for; `--private` accepts a bare
+serial unconditionally, since it keys on serial and needs no profile at
+all.
+
 `--json` returns `{device, serial, scope, path, markdown, updated_at}`
-for programmatic use.
+for programmatic use, where `scope` is `shared` or `private`.
 
 The body stays free markdown in this slice. The motivating example
 ("Telegram version X, account Y") is key-value shaped and invites YAML
@@ -298,10 +325,20 @@ front matter with typed fields, but schema creep would cost the feature
 the thing that makes it useful -- being free-form. Revisit once there are
 real notes to look at.
 
+#### Why the private surface still keys on serial
+
+Unchanged by the default flip, and still the right key for that surface:
+it needs no profile, it exists from the first probe, and a note about
+what is installed on a handset describes the *hardware* rather than a
+lab-local slot, so it should follow the device into every lab that uses
+it.
+
 ### Identity across a disconnect
 
-The reconnect cycle is the case that justifies keying on serial, and it
-has three edges worth writing down.
+The serial is what re-identifies a handset across a disconnect, whichever
+note surface is in play: the shared note is reached through the profile
+whose `match.serial` resolved, and the private note is keyed on that
+serial directly. Three edges are worth writing down.
 
 **Serial collision.** Cheap and cloned handsets sometimes ship duplicate
 USB serials, and `adb` itself cannot tell two such devices apart. The
@@ -470,10 +507,13 @@ Matching the existing `tests/unit` and `tests/cli` split:
 - `tests/cli/test_device.py` -- `list` / `save` / `show`, prompt versus
   silent, and the non-TTY forcing rule.
 - `tests/unit/devices/test_notes.py` -- the note API's scopes and paths,
-  that the default target is the gitignored private surface, that
-  `--shared` refuses credential-shaped text, that a note written against
-  a bare serial survives a disconnect/reconnect cycle with no profile in
-  existence, and that re-probe refreshes facts without touching notes.
+  that the default target is the committed shared surface, that a shared
+  note written against a profile-less serial creates the profile (and
+  fails `config.device.note_name_required` in a non-TTY session with no
+  `--as`), that credential-shaped text warns without blocking the write,
+  that `--private` writes the gitignored serial-keyed file and survives a
+  disconnect/reconnect cycle with no profile in existence, and that
+  re-probe refreshes facts without touching either note.
 - Serial collision: two fake devices reporting one serial with differing
   fingerprints must raise `device.serial_collision` rather than merge.
 
@@ -498,9 +538,11 @@ New IDs, following existing naming:
   device's markdown note alongside.
 - `device.serial_collision` -- two handsets report the same serial with
   differing fingerprints; the registry refuses to merge them.
-- `device.note_shared_rejected` -- `--shared` was asked to commit
-  credential-shaped text; refused, with the private surface named as the
-  alternative.
+- `device.note_credential_warning` -- a note being written to the
+  committed surface looks credential-shaped; advisory warning naming
+  `--private`, never a refusal.
+- `config.device.note_name_required` -- a shared note was written against
+  a serial with no profile, in a non-TTY session, with no `--as <name>`.
 
 ## Rejected alternatives
 
