@@ -29,7 +29,8 @@ import typer
 from ruamel.yaml import YAML
 
 from playground.config.loader import load_config
-from playground.devices.adb import list_attached
+from playground.devices.adb import AttachedDevice, list_attached
+from playground.devices.binding import device_matches
 from playground.devices.notes import NoteScope, note_path, read_note, write_note
 from playground.devices.registry import RegistryEntry, read_registry
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -52,6 +53,16 @@ def _main() -> Any:  # noqa: ANN401 - deferred cross-module import, see module d
     from playground.cli import main as cli_main
 
     return cli_main
+
+
+def _is_interactive() -> bool:
+    """Whether this session can be prompted, rather than calling
+    `sys.stdin.isatty()` inline -- a thin, monkeypatchable seam so a test
+    can drive the interactive `device note` prompt through
+    `CliRunner(..., input=...)` without an actual terminal. `CliRunner`'s
+    piped stdin is never a tty, so the seam is what makes the branch
+    reachable at all under test."""
+    return sys.stdin.isatty()
 
 
 def _fail(diagnostic: Diagnostic) -> NoReturn:
@@ -108,18 +119,40 @@ def _device_profiles(config_dir: Path) -> dict[str, DeviceProfile]:
     return loaded.device_profiles
 
 
-def _profile_for_serial(profiles: dict[str, DeviceProfile], serial: str) -> str | None:
-    """The name of the profile that selects `serial`, if any.
+def _matching_profiles(
+    profiles: dict[str, DeviceProfile], serial: str, model: str | None
+) -> list[str]:
+    """Names of every profile whose selector matches this device.
 
-    Shared notes are keyed by profile name, not serial, so this is what
-    lets `device list`/`device show` find a shared note for a device the
-    operator only knows by serial.
+    Uses `devices.binding.device_matches` -- the exact serial/model
+    predicate `match_candidates` uses to bind a lab slot -- rather than a
+    second, independently-written matcher. Two matchers that disagree
+    about what "matches" means is exactly the kind of silent
+    inconsistency this module must not introduce: a model-only selector
+    binds a lab slot just fine, and had to be able to surface its note
+    here too, under the same rule.
     """
-    for name, profile in profiles.items():
-        match = profile.spec.match
-        if match is not None and match.serial == serial:
-            return name
-    return None
+    candidate = AttachedDevice(serial=serial, state="missing", model=model)
+    return [
+        name
+        for name, profile in profiles.items()
+        if device_matches(profile.spec.match, candidate)
+    ]
+
+
+def _unambiguous_profile_for(
+    profiles: dict[str, DeviceProfile], serial: str, model: str | None
+) -> str | None:
+    """The one profile that selects this device, or `None` when zero or
+    more than one profile matches.
+
+    Ambiguity across profiles is real -- two loosely-selected profiles can
+    both match one handset -- and must never be resolved by guessing which
+    one's note to show; showing no note is the honest answer when the
+    match isn't unique.
+    """
+    matches = _matching_profiles(profiles, serial, model)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _resolve_identity(
@@ -137,8 +170,9 @@ def _resolve_identity(
         serial = match.serial if match is not None else None
         return device, serial
     if device in registry:
-        return _profile_for_serial(profiles, device), device
-    return _profile_for_serial(profiles, device), device
+        model = registry[device].facts.model
+        return _unambiguous_profile_for(profiles, device, model), device
+    return _unambiguous_profile_for(profiles, device, None), device
 
 
 def _read_scoped_note(
@@ -300,12 +334,13 @@ def _build_row(
     state_dir: Path,
 ) -> _DeviceRow:
     facts = entry.facts if entry is not None else None
-    profile_name = _profile_for_serial(profiles, serial)
+    model = facts.model if facts is not None else attached_model
+    profile_name = _unambiguous_profile_for(profiles, serial, model)
     note = _note_for(config_dir, state_dir, profile_name, serial)
     return _DeviceRow(
         serial=serial,
         state=state,
-        model=facts.model if facts is not None else attached_model,
+        model=model,
         sdk=facts.sdk if facts is not None else None,
         rooted=facts.rooted if facts is not None else None,
         note=_first_line(note),
@@ -517,7 +552,7 @@ def note_command(
     else:
         name = device if device in profiles else as_name
         if name is None:
-            if sys.stdin.isatty():
+            if _is_interactive():
                 name = typer.prompt("No DeviceProfile named that -- name one to create")
             else:
                 _fail(

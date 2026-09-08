@@ -28,12 +28,14 @@ from pydantic import ValidationError
 from playground.devices.adb import AttachedDevice
 from playground.models.base import StrictModel
 from playground.models.diagnostic import Diagnostic, SourceLocation
+from playground.models.kinds import DeviceMatch
 from playground.models.resolved import ResolvedDevice
 
 __all__ = [
     "Binding",
     "binding_path",
     "clear_binding",
+    "device_matches",
     "lab_devices_dir",
     "match_candidates",
     "read_binding",
@@ -99,28 +101,36 @@ def clear_binding(state_dir: Path, lab: str, slot: str) -> None:
     binding_path(state_dir, lab, slot).unlink(missing_ok=True)
 
 
+def device_matches(match: DeviceMatch | None, candidate: AttachedDevice) -> bool:
+    """Whether `candidate` satisfies every field a selector actually sets.
+
+    An absent selector (`match is None`) matches everything -- that is what
+    lets a single-handset lab need no serial in its YAML at all. Only
+    `serial` and `model` are checked: `DeviceMatch` carries no
+    `manufacturer` field (`adb devices -l` never reports one), and neither
+    does `AttachedDevice`.
+
+    The single shared predicate behind `match_candidates` below AND
+    `playground.cli.device_commands`' "which profile does this listed
+    device belong to" lookup -- two matchers that disagree about what
+    "matches" means is exactly the kind of silent inconsistency this
+    module exists to prevent for bindings, so it must not be re-implemented
+    a second time for notes either.
+    """
+    if match is None:
+        return True
+    if match.serial is not None and candidate.serial != match.serial:
+        return False
+    if match.model is not None and candidate.model != match.model:
+        return False
+    return True
+
+
 def match_candidates(
     device: ResolvedDevice, attached: list[AttachedDevice]
 ) -> list[AttachedDevice]:
-    """Attached devices satisfying every field the selector actually sets.
-
-    An absent selector (`device.match is None`) matches everything -- that
-    is what lets a single-handset lab need no serial in its YAML at all.
-    Only `serial` and `model` are checked: `DeviceMatch` carries no
-    `manufacturer` field (`adb devices -l` never reports one), and neither
-    does `AttachedDevice`.
-    """
-    match = device.match
-    if match is None:
-        return list(attached)
-    candidates = []
-    for candidate in attached:
-        if match.serial is not None and candidate.serial != match.serial:
-            continue
-        if match.model is not None and candidate.model != match.model:
-            continue
-        candidates.append(candidate)
-    return candidates
+    """Attached devices satisfying every field the selector actually sets."""
+    return [candidate for candidate in attached if device_matches(device.match, candidate)]
 
 
 def _source(lab: str) -> SourceLocation:
