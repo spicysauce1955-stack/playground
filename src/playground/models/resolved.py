@@ -11,6 +11,8 @@ from playground.models.kinds import (
     AndroidAppOptions,
     Budget,
     CaptureOptions,
+    DeviceMatch,
+    DeviceRequire,
     NetworkProfileSpec,
     RetentionPolicy,
     SshConfig,
@@ -57,6 +59,23 @@ class ResolvedVm(StrictModel):
     """Raw ``/etc/hosts`` lines to append on this VM at provision time.
     Workaround for missing lab-scoped DNS (roadmap backlog)."""
     provider_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResolvedDevice(StrictModel):
+    """A device slot, fully resolved -- and intent ONLY.
+
+    The resolver runs from configuration with no handset attached, so it
+    cannot hold a probed fact. Bound serial, model, SDK, ABI and root live
+    in `DeviceStatus` and the registry. Do not add a `capabilities` field
+    here; an earlier draft of the design did, and it was wrong.
+    """
+
+    name: str
+    kind: Literal["android"]
+    match: DeviceMatch | None = None
+    require: DeviceRequire | None = None
+    tags: list[str] = Field(default_factory=list)
+    required: bool = True
 
 
 class ResolvedWorkload(StrictModel):
@@ -133,6 +152,7 @@ class ResolvedLab(StrictModel):
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     networks: list[ResolvedNetwork]
     vms: list[ResolvedVm]
+    devices: list[ResolvedDevice] = Field(default_factory=list)
     workloads: list[ResolvedWorkload] = Field(default_factory=list)
     commands: list[ResolvedCommand] = Field(default_factory=list)
     artifacts: ResolvedArtifacts
@@ -146,6 +166,7 @@ __all__ = [
     "ResolvedArtifacts",
     "ResolvedCommand",
     "ResolvedDefaults",
+    "ResolvedDevice",
     "ResolvedLab",
     "ResolvedNetwork",
     "ResolvedVm",

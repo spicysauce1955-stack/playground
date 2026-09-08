@@ -20,12 +20,13 @@ from __future__ import annotations
 from typing import Any
 
 from playground.config.loader import LoadedConfig
-from playground.models.kinds import Defaults, Lab, LabVm, VmRoleSpec
+from playground.models.kinds import Defaults, Lab, LabDevice, LabVm, VmRoleSpec
 from playground.models.resolved import (
     ResolvedArtifactImage,
     ResolvedArtifacts,
     ResolvedCommand,
     ResolvedDefaults,
+    ResolvedDevice,
     ResolvedLab,
     ResolvedNetwork,
     ResolvedVm,
@@ -58,6 +59,7 @@ def resolve_lab(
 
     networks = [_resolve_network(net, lab, loaded) for net in lab.spec.networks]
     vms = [_resolve_vm(vm, lab, loaded, defaults) for vm in lab.spec.vms]
+    devices = [_resolve_device(device) for device in lab.spec.devices]
     workloads = [_resolve_workload(wl) for wl in lab.spec.workloads]
     commands = [_resolve_command(name, loaded) for name in lab.spec.commands.enabled]
     artifacts = _resolve_artifacts(loaded)
@@ -83,6 +85,7 @@ def resolve_lab(
         providers={name: dict(overrides) for name, overrides in lab.spec.providers.items()},
         networks=networks,
         vms=vms,
+        devices=devices,
         workloads=workloads,
         commands=commands,
         artifacts=artifacts,
@@ -104,6 +107,23 @@ def _resolve_network(net: Any, lab: Lab, loaded: LoadedConfig) -> ResolvedNetwor
         cidr=net.cidr,
         internet_access=profile_spec.internet_access,
         dns_enabled=profile_spec.dns.enabled,
+    )
+
+
+def _resolve_device(device: LabDevice) -> ResolvedDevice:
+    """Map a `LabDevice` straight through -- intent only.
+
+    `match`/`require` carry unchanged: no handset is attached at resolve
+    time, so there is nothing to layer against them yet. Profile layering
+    (via `LabDevice.profile`) arrives in a later task.
+    """
+    return ResolvedDevice(
+        name=device.name,
+        kind=device.kind,
+        match=device.match,
+        require=device.require,
+        tags=list(device.tags),
+        required=device.required,
     )
 
 

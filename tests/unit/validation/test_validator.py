@@ -993,3 +993,102 @@ def test_unknown_image_reference_against_artifact_sources(
     # invariant is that *each* diagnostic points at the offending image.
     assert len(matching) >= 1
     assert all("alpine-mystery" in d.message for d in matching)
+
+
+def test_devices_are_excluded_from_max_vms_budget(committed_load: LoadedConfig) -> None:
+    """A device consumes no host vcpu/memory/disk -- only spec.vms counts
+    against max_vms."""
+    lab = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: device-budget
+        spec:
+          backend: local-libvirt
+          budget:
+            mode: strict
+            max_vcpu: 8
+            max_memory_mb: 16384
+            max_disk_gb: 200
+            max_vms: 1
+            max_containers: 0
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          vms:
+            - name: vm1
+              role: generic-node
+              networks: [net]
+          devices:
+            - name: phone1
+            - name: phone2
+            - name: phone3
+        """
+    )
+    committed_load.labs[lab.metadata.name] = lab
+
+    diagnostics = validate(committed_load, lab=lab.metadata.name)
+
+    errors = [d for d in diagnostics if d.severity == "error"]
+    assert errors == [], f"expected no errors, got: {errors}"
+
+
+def test_duplicate_device_name_is_rejected(committed_load: LoadedConfig) -> None:
+    lab = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: dup-device
+        spec:
+          backend: local-libvirt
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          devices:
+            - name: phone1
+            - name: phone1
+        """
+    )
+    committed_load.labs[lab.metadata.name] = lab
+
+    diagnostics = validate(committed_load, lab=lab.metadata.name)
+
+    matching = [d for d in diagnostics if d.id == "config.device.duplicate_name"]
+    assert len(matching) == 1
+    assert matching[0].severity == "error"
+    assert matching[0].key_path == "spec.devices[1].name"
+
+
+def test_device_name_colliding_with_vm_is_rejected(committed_load: LoadedConfig) -> None:
+    lab = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: device-vm-collision
+        spec:
+          backend: local-libvirt
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          vms:
+            - name: shared-name
+              role: generic-node
+              networks: [net]
+          devices:
+            - name: shared-name
+        """
+    )
+    committed_load.labs[lab.metadata.name] = lab
+
+    diagnostics = validate(committed_load, lab=lab.metadata.name)
+
+    matching = [d for d in diagnostics if d.id == "config.device.name_collides_with_vm"]
+    assert len(matching) == 1
+    assert matching[0].severity == "error"
+    assert matching[0].key_path == "spec.devices[0].name"

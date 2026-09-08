@@ -455,6 +455,49 @@ class LabVm(BaseModel):
         return value
 
 
+class DeviceMatch(StrictModel):
+    """Selector, not a description. Every field is optional; the fields that
+    ARE set must all match for a device to be a candidate.
+
+    No ``manufacturer`` field: the only listing source is
+    ``adb devices -l``, which emits ``model:`` but never a manufacturer, so
+    a manufacturer selector could never match anything. A later slice can
+    add it together with the per-device ``getprop`` probe needed to
+    populate it.
+    """
+
+    serial: str | None = None
+    model: str | None = None
+
+
+class DeviceRequire(StrictModel):
+    """Assertions checked at adopt time against the live handset.
+
+    This is the honest direction of the dependency: config cannot know a
+    phone is rooted, but it can say this lab needs one that is.
+    """
+
+    root: bool | None = None
+    min_sdk: int | None = Field(default=None, ge=1)
+
+
+class LabDevice(StrictModel):
+    """One physical-device slot in a lab.
+
+    Deliberately NOT a `LabVm`: a handset has no image, no vcpu/memory
+    sizing and no Ansible provisioners, and bending the VM schema to fit
+    would make role resolution answer questions it cannot answer.
+    """
+
+    name: str = Field(min_length=1)
+    kind: Literal["android"] = "android"
+    profile: str | None = None
+    match: DeviceMatch | None = None
+    require: DeviceRequire | None = None
+    tags: list[str] = Field(default_factory=list)
+    required: bool = True
+
+
 class LabCommands(StrictModel):
     enabled: list[str] = Field(default_factory=list)
 
@@ -479,6 +522,10 @@ class LabSpec(BaseModel):
     works without ``extra_hosts``."""
     networks: list[LabNetwork] = Field(default_factory=list)
     vms: list[LabVm] = Field(default_factory=list)
+    devices: list[LabDevice] = Field(default_factory=list)
+    """Physical device slots. Backend-independent -- a handset is never
+    provisioned, so it is not gated on `spec.backend` and consumes no
+    host vcpu/memory/disk (excluded from budget accounting)."""
     workloads: list[LabWorkload] = Field(default_factory=list)
     commands: LabCommands = Field(default_factory=LabCommands)
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -565,9 +612,12 @@ __all__ = [
     "DefaultsNetwork",
     "DefaultsSpec",
     "DefaultsVm",
+    "DeviceMatch",
+    "DeviceRequire",
     "DockerImageSource",
     "Lab",
     "LabCommands",
+    "LabDevice",
     "LabNetwork",
     "LabSpec",
     "LabVm",

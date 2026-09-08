@@ -39,6 +39,11 @@ Diagnostic IDs:
 - ``config.workload.android_target_not_capable`` (warning; an
   ``android_app`` workload's placement matches no VM with the ``redroid``
   capability)
+- ``config.device.duplicate_name`` (two devices in the same lab share a
+  name)
+- ``config.device.name_collides_with_vm`` (a device name matches a VM
+  name in the same lab -- a later task resolves ``--on <name>`` against
+  VMs and devices in one namespace)
 """
 
 from __future__ import annotations
@@ -345,6 +350,53 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
     diagnostics.extend(_check_dns_domain(lab, source))
+    diagnostics.extend(_check_devices(lab, source))
+
+    return diagnostics
+
+
+def _check_devices(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
+    """Reject duplicate device names and device/VM name collisions.
+
+    Both matter because a later task resolves ``--on <name>`` against
+    VMs and devices in one namespace -- a collision there would silently
+    target the wrong thing.
+    """
+    diagnostics: list[Diagnostic] = []
+    vm_names = {vm.name for vm in lab.spec.vms}
+    seen: set[str] = set()
+
+    for idx, device in enumerate(lab.spec.devices):
+        if device.name in vm_names:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.device.name_collides_with_vm",
+                    severity="error",
+                    message=(
+                        f"device {device.name!r} in lab {lab.metadata.name!r} "
+                        "has the same name as a VM in the same lab"
+                    ),
+                    source=source,
+                    key_path=f"spec.devices[{idx}].name",
+                    suggestion="rename the device or the VM so names are unique",
+                )
+            )
+        if device.name in seen:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.device.duplicate_name",
+                    severity="error",
+                    message=(
+                        f"duplicate device name {device.name!r} in lab "
+                        f"{lab.metadata.name!r}"
+                    ),
+                    source=source,
+                    key_path=f"spec.devices[{idx}].name",
+                    suggestion="give each device slot a unique name",
+                )
+            )
+        else:
+            seen.add(device.name)
 
     return diagnostics
 
