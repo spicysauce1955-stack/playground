@@ -87,3 +87,17 @@ def test_logcat_package_script_is_frozen():
     assert "PID=$(pidof com.example 2>/dev/null)" in built
     assert '--pid="$PID"' in built
     assert "| tail -n 3" in built
+
+
+def test_wait_booted_cmd_is_frozen():
+    built = c.wait_booted_cmd(30)
+    # Full string equality: every character must match, including the double
+    # prefix (once bare at the start, once nested in the command substitution)
+    # and the timeout argument reflected in the seq range.
+    assert built == (
+        f"{PREFIX} wait-for-device >/dev/null 2>&1; "
+        f"for i in $(seq 1 30); do "
+        f'[ "$(adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true; adb -s '
+        f"127.0.0.1:5555 shell getprop sys.boot_completed 2>/dev/null "
+        f"| tr -d '\\r')\" = 1 ] && exit 0; sleep 1; done; exit 1"
+    )
