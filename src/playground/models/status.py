@@ -20,6 +20,26 @@ VmState = Literal["provisioned", "missing", "running", "failed", "degraded"]
 ansible reachability and docker readiness — widening the literal then would
 break older JSON consumers and pattern-matches, so they're declared now."""
 
+DeviceState = Literal["connected", "unauthorized", "offline", "missing"]
+"""``unauthorized`` is deliberately distinct from ``missing``: the handset
+is attached and visible, but its RSA trust prompt was never accepted. It
+is the most common real-world failure and needs a diagnostic that names
+the remedy rather than one that says "not reachable"."""
+
+
+class DeviceStatus(StrictModel):
+    """Intent + observed state for one physical device slot."""
+
+    name: str
+    state: DeviceState
+    serial: str | None = None
+    model: str | None = None
+    manufacturer: str | None = None
+    sdk: int | None = None
+    abi: str | None = None
+    rooted: bool | None = None
+    last_verified: str | None = None
+
 
 class VmStatus(StrictModel):
     """Intent + observed state for one VM."""
@@ -59,6 +79,7 @@ class LabStatus(StrictModel):
     """Backend domain names present in observed state but not declared
     in the lab. Backend-neutral — even though today's data comes from
     libvirt domains, the field name avoids leaking that vocabulary."""
+    devices: list[DeviceStatus] = Field(default_factory=list)
 
 
-__all__ = ["LabStatus", "VmState", "VmStatus"]
+__all__ = ["DeviceState", "DeviceStatus", "LabStatus", "VmState", "VmStatus"]
