@@ -13,6 +13,7 @@ from playground.models.kinds import (
     CaptureOptions,
     DeviceMatch,
     DeviceRequire,
+    DiscoveryMode,
     NetworkProfileSpec,
     RetentionPolicy,
     SshConfig,
@@ -148,6 +149,9 @@ class ResolvedLab(StrictModel):
     dns_domain: str
     """Per-lab DNS domain. Always populated — defaults to
     ``<lab_name>.lab`` when the lab YAML omits ``spec.dns_domain``."""
+    device_discovery: DiscoveryMode
+    """Always populated -- resolved lab-value-then-defaults from
+    ``LabSpec.device_discovery`` / ``DefaultsSpec.device_discovery``."""
     defaults: ResolvedDefaults
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     networks: list[ResolvedNetwork]

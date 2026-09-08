@@ -20,6 +20,14 @@ from playground.models.base import ResourceEnvelope, StrictModel
 # Common value objects
 # ---------------------------------------------------------------------------
 
+DiscoveryMode = Literal["prompt", "silent"]
+"""Whether an unknown attached handset raises a question or is filed
+silently. Lives on `DefaultsSpec.device_discovery` / `LabSpec.device_discovery`
+-- deliberately NOT nested under `spec.devices`, because `LabSpec.devices`
+is a list and a same-named mapping on `Defaults` would make two config
+kinds disagree about one key's shape. See `playground.devices.discovery`
+for the resolution policy and the operator-facing prompt."""
+
 
 class Resources(StrictModel):
     vcpu: int = Field(ge=1)
@@ -152,6 +160,10 @@ class DefaultsSpec(StrictModel):
     network: DefaultsNetwork
     retention: RetentionPolicy
     capture: CaptureOptions = Field(default_factory=CaptureOptions)
+    device_discovery: DiscoveryMode = "prompt"
+    """Whether an unknown attached handset is offered a saved profile.
+    See `DiscoveryMode` above for why this key is not nested under
+    `spec.devices`."""
 
 
 class Defaults(ResourceEnvelope):
@@ -557,6 +569,10 @@ class LabSpec(BaseModel):
     capture: CaptureOptions | None = None
     """Per-lab capture bounds. When unset the resolver falls back to
     ``Defaults.spec.capture``."""
+    device_discovery: DiscoveryMode | None = None
+    """Per-lab override of `Defaults.spec.device_discovery`. When unset
+    the resolver falls back to the default. Not nested under
+    `spec.devices` -- see `DiscoveryMode`."""
 
     @field_validator("networks", "vms", "workloads")
     @classmethod
@@ -643,6 +659,7 @@ __all__ = [
     "DeviceProfile",
     "DeviceProfileSpec",
     "DeviceRequire",
+    "DiscoveryMode",
     "DockerImageSource",
     "Lab",
     "LabCommands",

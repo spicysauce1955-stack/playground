@@ -90,6 +90,7 @@ def resolve_lab(
         # doesn't override; tofu's libvirt_network resources serve this
         # via dnsmasq so cross-VM resolution works without /etc/hosts.
         dns_domain=lab.spec.dns_domain or f"{lab.metadata.name}.lab",
+        device_discovery=lab.spec.device_discovery or defaults.spec.device_discovery,
         defaults=resolved_defaults,
         providers={name: dict(overrides) for name, overrides in lab.spec.providers.items()},
         networks=networks,
