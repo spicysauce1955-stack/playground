@@ -200,7 +200,7 @@ without a signature change.
 |---|---|---|
 | Owner | machine | operator |
 | Written by | every probe, automatically | only on an explicit yes |
-| Holds | serial, model, SDK, ABI, root, first/last seen | `match`, `require`, `tags` |
+| Holds | serial, model, SDK, ABI, root, first/last/verified seen, **private notes** | `match`, `require`, `tags` |
 | Committed to git | no | yes |
 
 The **registry** is every handset this machine has ever seen. It is what
@@ -225,25 +225,101 @@ prompt, and `playground device save <serial> --as <name>`.
 
 ### Notes
 
-An optional sibling markdown file, associated by basename:
-`config/devices/my-pixel.md`. Free-form prose -- bootloader state, which
-OTA broke root, which drawer the phone lives in.
+Two note surfaces, keyed differently and stored differently, because they
+answer different questions. The safe one is the default.
 
-A sidecar rather than a `notes:` key inside the YAML, because
+| | private note | shared note |
+|---|---|---|
+| Path | `.playground/state/devices/<serial>/notes.md` | `config/devices/<name>.md` |
+| Keyed by | **serial** | profile name |
+| Committed to git | no (`.playground/` is gitignored) | yes |
+| Holds | accounts, installed app state, anything about *this* handset | hardware quirks a second operator needs |
+| API default | yes | requires `--shared` |
+
+**The private note keys on serial, not on the profile.** Three reasons,
+all of which a review trace surfaced:
+
+1. Under `discovery: silent` no profile is ever created, so a
+   profile-keyed note would have nowhere to live.
+2. A note like "this phone has Telegram installed under account X"
+   describes the *physical handset*, not a lab-local slot. It must follow
+   the hardware into every lab that uses it.
+3. It exists from the moment the device is first probed, with no
+   ceremony in between.
+
+**The private note is the default target because a note about a handset
+is very likely to contain credentials.** `config/` is tracked;
+`.gitignore` excludes only `.playground/`. A note-writing API that
+defaulted to the committed surface would walk account passwords into the
+repository, against the PRD's non-negotiable "no hardcoded secrets".
+`--shared` is therefore an explicit opt-in, and it **refuses** -- not
+warns -- when the text is credential-shaped.
+
+**Private does not mean secret, and the docs must not imply it does.**
+The file is plaintext on the operator's disk. It is out of git and off a
+teammate's machine; it is not a secret store and playground must not be
+described as one.
+
+A sidecar `.md` rather than a `notes:` key inside YAML, because
 multi-paragraph markdown inside a block scalar means fighting
 indentation, and a real `.md` file is what editors and `git diff` handle
 well.
 
-It surfaces in three places: `device show` renders it, `device list`
-shows its first line, and **a failed `require` check prints it alongside
-the failure**. That last one is the reason the feature earns its keep --
-when adoption reports `require.root: true not satisfied`, the operator's
-own note reading "root broken since the September OTA, needs Magisk
-re-flash" is exactly the context they would otherwise go hunting for.
+Notes surface in three places, and the third is why the feature earns its
+keep: `device show` renders them, `device list` shows the first line, and
+**a failed `require` check prints them alongside the failure**. When
+adoption reports `require.root: true not satisfied`, the operator's own
+note reading "root broken since the September OTA, needs Magisk re-flash"
+is exactly the context they would otherwise go hunting for.
 
 **Loader caveat:** `config/` discovery globs YAML and validates every file
 as a `kind:`. The `.md` sidecars must be skipped explicitly, not tripped
 over.
+
+### The note API
+
+```
+playground device note <device>                  # $EDITOR on the private note
+playground device note <device> --set -          # read markdown from stdin
+playground device note <device> --append "..."
+playground device note <device> --show [--json]
+playground device note <device> --clear
+playground device note <device> --shared ...     # target the committed profile note
+```
+
+`<device>` accepts a profile name **or** a raw serial, so the API works
+before any profile exists -- which is the point of keying on serial.
+`--json` returns `{device, serial, scope, path, markdown, updated_at}`
+for programmatic use.
+
+The body stays free markdown in this slice. The motivating example
+("Telegram version X, account Y") is key-value shaped and invites YAML
+front matter with typed fields, but schema creep would cost the feature
+the thing that makes it useful -- being free-form. Revisit once there are
+real notes to look at.
+
+### Identity across a disconnect
+
+The reconnect cycle is the case that justifies keying on serial, and it
+has three edges worth writing down.
+
+**Serial collision.** Cheap and cloned handsets sometimes ship duplicate
+USB serials, and `adb` itself cannot tell two such devices apart. The
+registry must detect same-serial-different-fingerprint and refuse, rather
+than silently merging two handsets' notes and probe history into one
+record.
+
+**Factory reset.** The serial survives a reset; the adb key does not, so
+the handset returns as `unauthorized` and still matches its profile --
+while the note now describes an account that no longer exists on it.
+Playground cannot detect this. The mitigation is honest display rather
+than cleverness: record `last_verified` in the registry and show the
+note's age beside it.
+
+**Refreshed facts on reconnect.** Re-probe overwrites facts and never
+touches notes. A handset that lost root to an OTA therefore fails
+`require: {root: true}` at the next adopt and prints the operator's note
+with the failure -- the intended behaviour, not a regression.
 
 ## Decision 4: discovery policy, prompt or silent
 
@@ -393,6 +469,13 @@ Matching the existing `tests/unit` and `tests/cli` split:
   different-device-now-matches (which must refuse, not rebind).
 - `tests/cli/test_device.py` -- `list` / `save` / `show`, prompt versus
   silent, and the non-TTY forcing rule.
+- `tests/unit/devices/test_notes.py` -- the note API's scopes and paths,
+  that the default target is the gitignored private surface, that
+  `--shared` refuses credential-shaped text, that a note written against
+  a bare serial survives a disconnect/reconnect cycle with no profile in
+  existence, and that re-probe refreshes facts without touching notes.
+- Serial collision: two fake devices reporting one serial with differing
+  fingerprints must raise `device.serial_collision` rather than merge.
 
 A fake `adb` on PATH emitting canned `devices -l` output keeps all of the
 above hardware-free. Live handset runs are manual, as the live libvirt and
@@ -413,6 +496,11 @@ New IDs, following existing naming:
 - `device.rebind_required` -- a different device now matches the selector.
 - `device.require_unmet` -- a `require` assertion failed; prints the
   device's markdown note alongside.
+- `device.serial_collision` -- two handsets report the same serial with
+  differing fingerprints; the registry refuses to merge them.
+- `device.note_shared_rejected` -- `--shared` was asked to commit
+  credential-shaped text; refused, with the private surface named as the
+  alternative.
 
 ## Rejected alternatives
 
