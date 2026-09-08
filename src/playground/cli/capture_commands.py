@@ -23,7 +23,7 @@ from typing import Annotated, Any, NoReturn
 
 import typer
 
-from playground.android.runner import TargetResult, run_on_targets
+from playground.android.runner import TargetResult, run_guest_shell
 from playground.android.targets import AndroidTarget
 from playground.android.transport import require_guest
 from playground.backend.dispatch import query_status
@@ -249,13 +249,13 @@ def start_command(
             continue
         startable.append(target)
 
-    # One command per target: `run_on_targets` sends ONE command string to
+    # One command per target: `run_guest_shell` sends ONE command string to
     # every target, but each device's command names its own unit instance,
     # so capture calls it per-target. Identical for a single device (the
     # common case); with --all it serializes. A parallel variant belongs in
     # `android/runner.py`, and only once something needs it.
     results = [
-        run_on_targets([t], start_cmd(t.name), timeout=_START_TIMEOUT)[0]
+        run_guest_shell([t], start_cmd(t.name), timeout=_START_TIMEOUT)[0]
         for t in startable
     ]
     for result in results:
@@ -369,7 +369,7 @@ def stop_command(
         stoppable.append(target)
 
     for target in stoppable:
-        result = run_on_targets(
+        result = run_guest_shell(
             [target], stop_cmd(target.name), timeout=_DEFAULT_TIMEOUT
         )[0]
         _echo(result)
@@ -407,7 +407,7 @@ def status_command(
     )
     failed: list[str] = []
     for target in targets:
-        result = run_on_targets(
+        result = run_guest_shell(
             [target], status_cmd(target.name), timeout=_DEFAULT_TIMEOUT
         )[0]
         _echo(result)
@@ -545,7 +545,7 @@ def fetch_command(
             # reported until the next `-C` rotation. The transfer above
             # has already succeeded either way, so the operator's data
             # is safe -- only the guest-side copy is at stake here.
-            probe = run_on_targets(
+            probe = run_guest_shell(
                 [target], is_active_cmd(target.name), timeout=_DEFAULT_TIMEOUT
             )[0]
             if probe.stdout.strip() == "active":
@@ -573,7 +573,7 @@ def fetch_command(
                 )
                 clean_failed.append(target.name)
                 continue
-            removal = run_on_targets(
+            removal = run_guest_shell(
                 [target], clean_cmd(target.name), timeout=_DEFAULT_TIMEOUT
             )[0]
             _echo(removal)

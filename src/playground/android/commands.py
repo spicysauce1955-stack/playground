@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import shlex
 
-from playground.android.transport import ADB_PORT, AdbInvocation, guest_prefix
+from playground.android.transport import ADB_PORT, AdbInvocation
 
 __all__ = [
     "ADB_PORT",
-    "adb_prefix",
     "adb_shell",
     "clear_cmd",
     "input_cmd",
@@ -33,17 +32,7 @@ __all__ = [
     "stop_cmd",
     "ui_dump_cmd",
     "uninstall_cmd",
-    "wait_booted_cmd",
 ]
-
-
-def adb_prefix() -> str:
-    """Deprecated alias for `transport.guest_prefix()`.
-
-    Retained so the pre-refactor characterization suite passes unedited
-    through this refactor. Removed with `wait_booted_cmd` in the next task.
-    """
-    return guest_prefix()
 
 
 def adb_shell(command: str) -> AdbInvocation:
@@ -301,22 +290,3 @@ def input_cmd(kind: str, args: list[str]) -> AdbInvocation:
     subcommand = _INPUT_SUBCOMMANDS.get(kind, kind)
     quoted = " ".join(shlex.quote(a) for a in args)
     return adb_shell(f"input {subcommand} {quoted}")
-
-
-def wait_booted_cmd(timeout_seconds: int) -> str:
-    """Block until Android reports a completed boot.
-
-    Immediately after apply the container is up but Android is still
-    booting, so an install would fail on a device that is merely slow.
-
-    Still returns a plain ``str`` (not `AdbInvocation`): it calls
-    `adb_prefix()` twice, once bare and once nested inside a command
-    substitution, which is not an adb-invocation shape at all. Task 3
-    deletes this builder along with `adb_prefix`.
-    """
-    return (
-        f"{adb_prefix()} wait-for-device >/dev/null 2>&1; "
-        f"for i in $(seq 1 {int(timeout_seconds)}); do "
-        f'[ "$({adb_prefix()} shell getprop sys.boot_completed 2>/dev/null '
-        "| tr -d '\\r')\" = 1 ] && exit 0; sleep 1; done; exit 1"
-    )

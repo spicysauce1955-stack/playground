@@ -7,6 +7,15 @@ under ssh, a `LocalAdb` target must render through `local_argv` and run
 branch before this file: `local_argv` itself was only unit-tested in
 isolation (tests/unit/android/test_transport.py), never through the
 runner that actually dispatches to it.
+
+`run_on_targets` is now typed to `AdbInvocation` only -- guest-shell
+strings that are not adb at all (systemctl wrappers, `mkdir -p` staging,
+...) go through the separate `run_guest_shell` entry point, which is
+typed to `str` and requires a `GuestAdb` transport structurally via
+`_run_shell_one`/`require_guest` rather than an isinstance check buried
+in a shared dispatcher. That split is what makes pairing a `LocalAdb`
+target with a guest-only command a type error at the call site instead
+of a runtime raise discovered inside `_run_one`.
 """
 
 from __future__ import annotations
@@ -15,7 +24,7 @@ import subprocess
 
 import pytest
 
-from playground.android.runner import TargetResult, _run_one, run_on_targets
+from playground.android.runner import TargetResult, _run_one, run_guest_shell, run_on_targets
 from playground.android.transport import AdbInvocation, AndroidTarget, GuestAdb, LocalAdb
 
 
@@ -89,17 +98,31 @@ def test_run_on_targets_mixes_guest_and_local_transports(fake_run) -> None:
     assert len(ssh_argvs) == 1
 
 
-def test_local_target_with_a_raw_string_command_raises() -> None:
+def test_guest_shell_command_dispatches_verbatim_over_ssh(fake_run) -> None:
+    """`run_guest_shell` hands its ``command`` straight to ssh -- it is
+    already a full guest shell string (a systemctl wrapper, `mkdir -p`
+    staging, ...), not an `AdbInvocation` to render."""
+    target = AndroidTarget(name="vm1", transport=GuestAdb("10.0.0.5", 22, "ubuntu"))
+
+    results = run_guest_shell([target], "mkdir -p /tmp/x", timeout=5.0)
+
+    assert results[0].ok
+    assert fake_run[0][0] == "ssh"
+    assert fake_run[0][-1] == "mkdir -p /tmp/x"
+
+
+def test_local_target_with_a_guest_shell_command_raises() -> None:
     """A bare `str` command (a guest-shell script, not an adb invocation)
     has no meaning on a USB-attached device: there is no shell to run it
-    in. This is a programming error (a caller building a raw command for
-    a target it never checked was a guest), not an operator error, so it
-    raises rather than reporting a device failure -- mirrors
-    `transport.require_guest`."""
+    in. This is a programming error (a caller building a guest command
+    for a target it never checked was a guest), not an operator error, so
+    it raises rather than reporting a device failure -- mirrors
+    `transport.require_guest`, which is exactly what `run_guest_shell`
+    routes through."""
     target = AndroidTarget(name="phone1", transport=LocalAdb("1A2B3C"))
 
     with pytest.raises(TypeError):
-        _run_one(target, "mkdir -p /tmp/x", timeout=5.0)
+        run_guest_shell([target], "mkdir -p /tmp/x", timeout=5.0)
 
 
 def test_target_result_type_still_matches() -> None:

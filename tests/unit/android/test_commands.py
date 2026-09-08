@@ -16,7 +16,6 @@ import shlex
 
 from playground.android.commands import (
     ADB_PORT,
-    adb_prefix,
     adb_shell,
     clear_cmd,
     input_cmd,
@@ -29,9 +28,8 @@ from playground.android.commands import (
     stop_cmd,
     ui_dump_cmd,
     uninstall_cmd,
-    wait_booted_cmd,
 )
-from playground.android.transport import render_guest_command
+from playground.android.transport import guest_prefix, render_guest_command
 
 
 def _simulate_device_argv(cmd: str) -> list[str]:
@@ -49,14 +47,14 @@ def _simulate_device_argv(cmd: str) -> list[str]:
 
 def test_every_command_connects_first() -> None:
     """adb must not depend on a pre-existing server on the guest."""
-    assert f"adb connect 127.0.0.1:{ADB_PORT}" in adb_prefix()
-    assert "|| true" in adb_prefix(), "a stale connect must not fail the command"
+    assert f"adb connect 127.0.0.1:{ADB_PORT}" in guest_prefix()
+    assert "|| true" in guest_prefix(), "a stale connect must not fail the command"
 
 
 def test_adb_shell_targets_the_serial() -> None:
     cmd = render_guest_command(adb_shell("getprop sys.boot_completed"))
     assert f"-s 127.0.0.1:{ADB_PORT}" in cmd
-    assert cmd.startswith(adb_prefix())
+    assert cmd.startswith(guest_prefix())
 
 
 def test_install_uses_r_so_reinstall_is_allowed() -> None:
@@ -142,12 +140,6 @@ def test_shell_metacharacters_are_quoted() -> None:
     """A package or text argument must not be able to inject a shell command."""
     cmd = render_guest_command(input_cmd("text", ["a; rm -rf /"]))
     assert "; rm -rf /" not in cmd.replace("'a; rm -rf /'", "")
-
-
-def test_wait_booted_polls_sys_boot_completed() -> None:
-    cmd = wait_booted_cmd(60)
-    assert "sys.boot_completed" in cmd
-    assert "60" in cmd
 
 
 def test_monkey_launch_uses_pidof_as_the_success_signal() -> None:
@@ -270,7 +262,7 @@ def test_logcat_clear_uses_dash_c_and_ignores_other_flags() -> None:
     passed alongside it are irrelevant because the CLI layer rejects that
     combination before this builder is ever called (see app_commands.py)."""
     cmd = render_guest_command(logcat_cmd(follow=False, lines=None, clear=True))
-    assert cmd == f"{adb_prefix()} logcat -c"
+    assert cmd == f"{guest_prefix()} logcat -c"
 
 
 def test_logcat_tag_uses_dash_s_with_default_verbose_priority() -> None:

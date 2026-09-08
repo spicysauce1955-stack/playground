@@ -646,7 +646,11 @@ def test_scp_quotes_a_remote_path_containing_a_space(
     apk.write_bytes(b"fake apk bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    # stdout="1": `install` now gates on `wait_booted`, a Python-side poll
+    # of `getprop sys.boot_completed` (android/runner.py) rather than a
+    # single guest-shell round trip -- the shim's exit code alone no
+    # longer signals "booted", so it must also answer the getprop check.
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="1")
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
@@ -675,22 +679,31 @@ def test_scp_quotes_a_remote_path_containing_a_space(
 def test_install_waits_for_android_to_finish_booting(
     tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
 ) -> None:
-    """BUG C regression test: `install` must gate on `wait_booted_cmd`
-    before staging/installing anything. `write_ssh_shim` overwrites its
-    log on every call, so this drives the failure path (the very first
-    ssh call -- the boot gate -- fails) and asserts install never reaches
-    scp, rather than trying to observe an intermediate successful call
-    that a later call would overwrite in the log."""
+    """BUG C regression test: `install` must gate on `wait_booted` before
+    staging/installing anything.
+
+    The boot gate is now a Python-side poll (`android/runner.py:wait_booted`)
+    rather than a single guest-shell round trip, so a fixed-exit-code ssh
+    shim can no longer stand in for "boot never completes" -- it would
+    make `wait_booted` retry for real, `time.sleep`-ing between every one
+    of its `_BOOT_WAIT_SECONDS` attempts. `wait_booted` itself is unit
+    tested directly in `tests/unit/android/test_runner_wait.py`; this
+    test only needs to prove `install` gates on it and reports plainly,
+    so it monkeypatches `wait_booted` to fail immediately instead.
+    """
     apk = tmp_path / "app.apk"
     apk.write_bytes(b"fake apk bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=1)  # boot-wait never succeeds
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
     )
     monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    monkeypatch.setattr(
+        app_commands, "wait_booted", lambda targets, **_: [t.name for t in targets]
+    )
     tofu_dir = tmp_path / "tofu"
     tofu_dir.mkdir(exist_ok=True)
 
@@ -719,7 +732,9 @@ def test_install_command_includes_stage_dir_cleanup(
     apk.write_bytes(b"fake apk bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    # stdout="1": satisfies the `wait_booted` getprop poll (see the BUG C
+    # test above) so the boot gate passes on its first attempt.
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="1")
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
@@ -921,7 +936,9 @@ def test_install_still_accepts_apkm_and_xapk_single_files(
     f.write_bytes(b"fake zip bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    # stdout="1": satisfies the `wait_booted` getprop poll (see the BUG C
+    # test above) so the boot gate passes on its first attempt.
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="1")
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"

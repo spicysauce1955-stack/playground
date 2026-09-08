@@ -28,7 +28,6 @@ from uuid import uuid4
 import typer
 
 from playground.android.commands import (
-    adb_prefix,
     adb_shell,
     clear_cmd,
     input_cmd,
@@ -41,12 +40,16 @@ from playground.android.commands import (
     stop_cmd,
     ui_dump_cmd,
     uninstall_cmd,
-    wait_booted_cmd,
 )
-from playground.android.runner import TargetResult, run_on_targets
+from playground.android.runner import TargetResult, run_guest_shell, run_on_targets, wait_booted
 from playground.android.splits import find_base_apk
 from playground.android.targets import AndroidTarget, resolve_targets
-from playground.android.transport import AdbInvocation, render_guest_command, require_guest
+from playground.android.transport import (
+    AdbInvocation,
+    guest_prefix,
+    render_guest_command,
+    require_guest,
+)
 from playground.backend.dispatch import query_status
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.ssh.argv import build_scp_argv, build_ssh_argv
@@ -87,17 +90,14 @@ _DEFAULT_TIMEOUT = 30.0
 # libvirt guest and are tight for a large (100+MB) split install or a
 # slow cloud-VM upload link — see BUG note in the audit that introduced
 # this comment. `install` now also pays for a boot-wait round trip before
-# either of these ever runs (see _BOOT_WAIT_TIMEOUT below).
+# either of these ever runs (see _BOOT_WAIT_SECONDS below).
 _INSTALL_TIMEOUT = 300.0
 _SCP_TIMEOUT = 180.0
 _CAPTURE_TIMEOUT = 30.0
 _PUSH_PULL_TIMEOUT = 60.0
 _BOOT_WAIT_SECONDS = 120
-"""Passed to `wait_booted_cmd`: how long the GUEST-side poll loop waits."""
-_BOOT_WAIT_TIMEOUT = float(_BOOT_WAIT_SECONDS + 30)
-"""ssh/subprocess timeout for the boot-wait call itself — must exceed the
-guest-side loop's own budget or we would time out the ssh call before the
-loop has a chance to give up on its own and report a clean failure."""
+"""Passed to `wait_booted` as `attempts`: one getprop round trip per
+second, so this doubles as the wait's budget in seconds."""
 
 # Shared targeting/connection flags, reused verbatim across every verb.
 LabOpt = Annotated[
@@ -299,7 +299,7 @@ def _capture_to_local(
     without a second network round trip or a dependency on a separately
     invoked `scp` for what is, from the guest's point of view, a `cat`.
 
-    ``adb_prefix()`` is NOT a single command — it is
+    ``guest_prefix()`` is NOT a single command — it is
     ``adb connect ... || true; adb -s ...`` — so interpolating it after a
     bare ``&&`` splits the chain at that embedded ``;``: bash treats
     everything from there on as a NEW, unconditional statement list, and
@@ -307,7 +307,7 @@ def _capture_to_local(
     ``device_path`` is a fixed, reused filename for screenshot/ui-dump,
     that let a failed capture silently `adb pull` (and `cat` back) a
     STALE file from a previous run while reporting success. Every step
-    that is itself built from ``adb_prefix()`` is therefore wrapped in a
+    that is itself built from ``guest_prefix()`` is therefore wrapped in a
     `{ ...; }` group before being used as an `&&` operand, so its own
     internal `;` cannot escape the group and its exit status is what the
     surrounding `&&` actually sees.
@@ -329,7 +329,7 @@ def _capture_to_local(
     """
     guest = require_guest(target)
     guest_tmp = f"/tmp/playground-pull-{uuid4().hex}"
-    prefix = adb_prefix()
+    prefix = guest_prefix()
     capture_cmd_str = (
         render_guest_command(capture_cmd) if capture_cmd is not None else "true"
     )
@@ -547,10 +547,8 @@ def install_command(
         # `Can't find service: package`. Gate on a real boot signal instead
         # of racing it, and report plainly rather than surfacing whatever
         # raw adb error the race happened to produce.
-        boot = run_on_targets(
-            [target], wait_booted_cmd(_BOOT_WAIT_SECONDS), timeout=_BOOT_WAIT_TIMEOUT
-        )[0]
-        if not boot.ok:
+        stragglers = wait_booted([target], attempts=_BOOT_WAIT_SECONDS, interval=1.0)
+        if stragglers:
             typer.echo(
                 f"[{target.name}] Android did not finish booting within "
                 f"{_BOOT_WAIT_SECONDS}s; not installing",
@@ -568,7 +566,7 @@ def install_command(
         # `scp: dest open "/data/local/tmp/...": No such file or directory`.
         stage_dir = f"/tmp/playground-apk-{uuid4().hex}"
         remote_paths = [f"{stage_dir}/{apk.name}" for apk in apks]
-        mkdir = run_on_targets(
+        mkdir = run_guest_shell(
             [target], f"mkdir -p {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
         )[0]
         if not mkdir.ok:
@@ -582,7 +580,7 @@ def install_command(
             # Best-effort: some APKs may have already landed on the guest
             # even though the whole install did not go ahead (BUG D — this
             # stage_dir is otherwise never removed and fills the disk).
-            run_on_targets(
+            run_guest_shell(
                 [target], f"rm -rf {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
             )
             failed.append(target.name)
@@ -600,7 +598,7 @@ def install_command(
             f"{render_guest_command(install_inv)}; status=$?; "
             f"rm -rf {shlex.quote(stage_dir)}; exit $status"
         )
-        result = run_on_targets([target], full_command, timeout=_INSTALL_TIMEOUT)[0]
+        result = run_guest_shell([target], full_command, timeout=_INSTALL_TIMEOUT)[0]
         _echo_target_output(result)
         if not result.ok:
             failed.append(target.name)
@@ -975,9 +973,13 @@ def push_command(
         # round trip, after the push attempt, regardless of outcome
         # (`; status=$?; rm -f ...; exit $status`, plain sequencing after
         # a `;` — not `&&` — is exactly what makes the cleanup unconditional).
-        push_cmd = f"{adb_prefix()} push {shlex.quote(guest_tmp)} {shlex.quote(dest)}"
+        # Hand-built adb string, not an `AdbInvocation` -- `adb_prefix()`
+        # bypassed the transport seam and Task 3 only inlines its
+        # replacement (`guest_prefix()`) to keep this working; a real
+        # `push_cmd` builder lands in Task 4 and absorbs this.
+        push_cmd = f"{guest_prefix()} push {shlex.quote(guest_tmp)} {shlex.quote(dest)}"
         command = f"{push_cmd}; status=$?; rm -f {shlex.quote(guest_tmp)}; exit $status"
-        result = run_on_targets([target], command, timeout=_PUSH_PULL_TIMEOUT)[0]
+        result = run_guest_shell([target], command, timeout=_PUSH_PULL_TIMEOUT)[0]
         _echo_target_output(result)
         if not result.ok:
             failed.append(target.name)
