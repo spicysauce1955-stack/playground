@@ -22,6 +22,7 @@ from playground.cli.app_commands import (
     _capture_and_retrieve,
     _guest_cleanup,
     _RetrievalFailed,
+    _StagingFailed,
     retrieve_from,
     stage_for,
 )
@@ -38,10 +39,12 @@ def test_guest_target_stages_under_tmp(tmp_path, monkeypatch):
     apk = tmp_path / "a.apk"
     apk.write_bytes(b"x")
     copied: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        "playground.cli.app_commands._scp_one",
-        lambda target, src, dst: copied.append((str(src), dst)),
-    )
+
+    def _fake_scp_one(target, src, dst):
+        copied.append((str(src), dst))
+        return True  # the real `_scp_one` returns True on success
+
+    monkeypatch.setattr("playground.cli.app_commands._scp_one", _fake_scp_one)
     target = AndroidTarget(name="droid1", transport=GuestAdb("10.0.0.5", 22, "ubuntu"))
     remote = stage_for(target, apk)
     assert remote.startswith("/tmp/")
@@ -64,17 +67,18 @@ def test_guest_target_stages_each_file_under_a_distinct_name(tmp_path, monkeypat
     assert remote1 != remote2
 
 
-def test_scp_failure_still_returns_a_path(tmp_path, monkeypatch):
-    """`stage_for` does not branch on `_scp_one`'s return value: a failed
-    scp already prints its own message, and the adb command the caller
-    hands this path to next will fail cleanly too (the guest has no such
-    file) -- one failure surfaces either way."""
+def test_scp_failure_raises_staging_failed(tmp_path, monkeypatch):
+    """`stage_for` propagates a failed scp rather than swallowing it:
+    `_scp_one` is declared `-> bool` and documents "returns False on
+    failure" precisely so staging failure is a signal a caller can act
+    on, not one it has to infer later from an adb command failing on a
+    file that was never actually staged."""
     apk = tmp_path / "a.apk"
     apk.write_bytes(b"x")
     monkeypatch.setattr("playground.cli.app_commands._scp_one", lambda target, src, dst: False)
     target = AndroidTarget(name="droid1", transport=GuestAdb("10.0.0.5", 22, "ubuntu"))
-    remote = stage_for(target, apk)
-    assert remote.startswith("/tmp/")
+    with pytest.raises(_StagingFailed):
+        stage_for(target, apk)
 
 
 def test_guest_cleanup_is_a_no_op_for_a_local_target(monkeypatch):

@@ -288,26 +288,40 @@ def _scp_one(
     return True
 
 
+class _StagingFailed(Exception):
+    """Raised by `stage_for` when scp to a guest target fails.
+
+    `_scp_one` is declared `-> bool` and documents "returns False on
+    failure" for exactly this reason: staging is a precondition for the
+    adb command that follows, not a detail that command can be trusted to
+    surface on its own. The `uuid4()`-suffixed staging path (see
+    `stage_for`) already stops a failed scp from leaving a STALE file at
+    the destination for that next adb command to silently pick up -- but
+    relying on that as the failure signal makes correctness at the call
+    site depend on a decision (the path being fresh, not deterministic)
+    made somewhere else entirely. Raising here, like `_RetrievalFailed`
+    does for the symmetric retrieval path, keeps the failure signal local
+    and explicit instead of resting on a non-local invariant.
+    """
+
+
 def stage_for(target: AndroidTarget, local_path: Path) -> str:
-    """Return the path adb should be handed for ``local_path``.
+    """Return the path adb should be handed for ``local_path``, raising
+    `_StagingFailed` if a guest target's scp fails.
 
     A guest target runs adb on the VM, so the file has to travel there
     first (scp'd to a fresh, uuid-suffixed name under `/tmp` -- collision-
     safe the same way every other guest staging path in this module
-    already is). A local target runs adb on this machine, where the file
-    already is -- copying it would be a no-op at best and a wrong path at
-    worst.
-
-    Deliberately does not branch on `_scp_one`'s return value: a failed
-    scp already prints its own `[target] scp failed: ...` message, and the
-    adb command this path is handed to next will fail cleanly too (the
-    guest has no such file) -- one failure surfaces either way, just
-    through the adb round trip rather than a short-circuit here.
+    already is, and the reason a failed scp here can never leave a STALE
+    file for the next call to mistake for a fresh one). A local target
+    runs adb on this machine, where the file already is -- copying it
+    would be a no-op at best and a wrong path at worst.
     """
     if isinstance(target.transport, LocalAdb):
         return str(local_path)
     remote = f"/tmp/playground-stage-{uuid4().hex}-{local_path.name}"
-    _scp_one(target, local_path, remote)
+    if not _scp_one(target, local_path, remote):
+        raise _StagingFailed(target.name)
     return remote
 
 
@@ -700,7 +714,18 @@ def install_command(
         # device. Found live -- the ssh/scp test shim accepts any path, so
         # this passed every unit test while failing on a real VM with
         # `scp: dest open "/data/local/tmp/...": No such file or directory`.
-        remote_paths = [stage_for(target, apk) for apk in apks]
+        remote_paths: list[str] = []
+        try:
+            for apk in apks:
+                remote_paths.append(stage_for(target, apk))
+        except _StagingFailed:
+            # Best-effort: earlier APKs in this split set may have already
+            # landed on the guest even though staging did not finish (BUG
+            # D — otherwise never removed, filling the disk).
+            for remote_path in remote_paths:
+                _guest_cleanup(target, remote_path)
+            failed.append(target.name)
+            continue
         install_inv = (
             install_multiple_cmd(remote_paths)
             if len(remote_paths) > 1
@@ -1082,7 +1107,11 @@ def push_command(
         # `stage_for` scps to a guest target's `/tmp` (adb runs there) and
         # is a no-op path rewrite on a local target (adb runs right here,
         # where `src` already is).
-        staged = stage_for(target, src)
+        try:
+            staged = stage_for(target, src)
+        except _StagingFailed:
+            failed.append(target.name)
+            continue
         result = run_on_targets(
             [target], push_cmd(staged, dest), timeout=_PUSH_PULL_TIMEOUT
         )[0]

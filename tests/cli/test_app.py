@@ -705,6 +705,68 @@ def test_scp_quotes_a_remote_path_containing_a_space(
     assert "ubuntu@127.0.0.1:/tmp/playground-stage-" not in scp_log
 
 
+def test_install_skips_the_install_when_staging_fails(
+    tmp_path, monkeypatch, write_apply_shims, write_scp_shim
+) -> None:
+    """`stage_for` now raises `_StagingFailed` on a failed scp instead of
+    silently handing back a path as though staging had succeeded --
+    `install_command` must catch that, report the target as failed, and
+    never proceed to `adb install` for it (there is nothing on the guest
+    to install)."""
+    apk = tmp_path / "app.apk"
+    apk.write_bytes(b"fake apk bytes")
+
+    bin_dir = write_apply_shims(tmp_path)
+    # stdout="1": satisfies the `wait_booted` getprop poll so the boot
+    # gate passes on its first attempt and staging is what fails next.
+    ssh_bin = _write_appending_ssh_shim(tmp_path, exit_code=0, stdout="1")
+    write_scp_shim(tmp_path, exit_code=1)  # scp fails
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["app", "install", str(apk), "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 1
+    assert "failed on 1/1 device(s)" in result.output + str(result.stderr)
+    ssh_log = (tmp_path / "ssh.log").read_text()
+    assert "install -r" not in ssh_log
+
+
+def test_push_skips_the_push_when_staging_fails(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """Same guard as `install`, for `push_command`'s single-file staging."""
+    src = tmp_path / "payload.bin"
+    src.write_bytes(b"local file contents")
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    write_scp_shim(tmp_path, exit_code=1)  # scp fails
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["app", "push", str(src), "/sdcard/dest.bin", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 1
+    # no adb push (or cleanup) round trip ever happened -- ssh was never invoked.
+    assert not (tmp_path / "ssh.log").exists()
+
+
 def test_install_waits_for_android_to_finish_booting(
     tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
 ) -> None:
