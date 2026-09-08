@@ -498,6 +498,31 @@ class LabDevice(StrictModel):
     required: bool = True
 
 
+# ---------------------------------------------------------------------------
+# DeviceProfile — reusable, committable handset profile
+# ---------------------------------------------------------------------------
+
+
+class DeviceProfileSpec(StrictModel):
+    """A reusable selector plus assertions for one physical handset.
+
+    Sits alongside VmRole / NetworkProfile / CommandPreset so it inherits
+    the existing envelope, loader and validator machinery. Deliberately
+    NOT a `DeviceRole`: the VM role system carries an image, resource
+    sizing and Ansible provisioners, none of which mean anything for a
+    handset.
+    """
+
+    match: DeviceMatch | None = None
+    require: DeviceRequire | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class DeviceProfile(ResourceEnvelope):
+    kind: Literal["DeviceProfile"]
+    spec: DeviceProfileSpec
+
+
 class LabCommands(StrictModel):
     enabled: list[str] = Field(default_factory=list)
 
@@ -559,6 +584,7 @@ AnyResource = (
     | NetworkProfile
     | VmRole
     | CommandPreset
+    | DeviceProfile
     | Lab
 )
 """Discriminated union by ``kind`` field. Use ``parse_resource`` to dispatch."""
@@ -571,6 +597,7 @@ _KIND_MODELS: dict[str, type[ResourceEnvelope]] = {
     "NetworkProfile": NetworkProfile,
     "VmRole": VmRole,
     "CommandPreset": CommandPreset,
+    "DeviceProfile": DeviceProfile,
     "Lab": Lab,
 }
 
@@ -613,6 +640,8 @@ __all__ = [
     "DefaultsSpec",
     "DefaultsVm",
     "DeviceMatch",
+    "DeviceProfile",
+    "DeviceProfileSpec",
     "DeviceRequire",
     "DockerImageSource",
     "Lab",

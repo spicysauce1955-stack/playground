@@ -1092,3 +1092,31 @@ def test_device_name_colliding_with_vm_is_rejected(committed_load: LoadedConfig)
     assert len(matching) == 1
     assert matching[0].severity == "error"
     assert matching[0].key_path == "spec.devices[0].name"
+
+
+def test_device_profile_reference_must_exist(committed_load: LoadedConfig) -> None:
+    lab = _yaml_to_lab(
+        """
+        apiVersion: playground/v1
+        kind: Lab
+        metadata:
+          name: device-unknown-profile
+        spec:
+          backend: local-libvirt
+          networks:
+            - name: net
+              profile: nat
+              cidr: 10.99.0.0/24
+          devices:
+            - name: phone1
+              profile: no-such-profile
+        """
+    )
+    committed_load.labs[lab.metadata.name] = lab
+
+    diagnostics = validate(committed_load, lab=lab.metadata.name)
+
+    matching = [d for d in diagnostics if d.id == "config.device.profile_not_found"]
+    assert len(matching) == 1
+    assert matching[0].severity == "error"
+    assert matching[0].key_path == "spec.devices[0].profile"

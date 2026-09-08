@@ -44,6 +44,8 @@ Diagnostic IDs:
 - ``config.device.name_collides_with_vm`` (a device name matches a VM
   name in the same lab -- a later task resolves ``--on <name>`` against
   VMs and devices in one namespace)
+- ``config.device.profile_not_found`` (a ``LabDevice.profile`` names a
+  ``DeviceProfile`` that was not loaded)
 """
 
 from __future__ import annotations
@@ -350,23 +352,45 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
     diagnostics.extend(_check_dns_domain(lab, source))
-    diagnostics.extend(_check_devices(lab, source))
+    diagnostics.extend(_check_devices(lab, source, loaded))
 
     return diagnostics
 
 
-def _check_devices(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
-    """Reject duplicate device names and device/VM name collisions.
+def _check_devices(lab: Lab, source: SourceLocation, loaded: LoadedConfig) -> list[Diagnostic]:
+    """Reject duplicate device names, device/VM name collisions, and
+    devices referencing an undefined ``DeviceProfile``.
 
-    Both matter because a later task resolves ``--on <name>`` against
-    VMs and devices in one namespace -- a collision there would silently
-    target the wrong thing.
+    Duplicate/collision checks matter because a later task resolves
+    ``--on <name>`` against VMs and devices in one namespace -- a
+    collision there would silently target the wrong thing. The profile
+    check matters because the resolver (``config/resolver.py``) trusts
+    that every ``LabDevice.profile`` it sees already resolves -- it
+    indexes ``loaded.device_profiles`` directly and raises ``KeyError``
+    rather than re-checking, per this module's cross-reference contract.
     """
     diagnostics: list[Diagnostic] = []
     vm_names = {vm.name for vm in lab.spec.vms}
     seen: set[str] = set()
 
     for idx, device in enumerate(lab.spec.devices):
+        if device.profile is not None and device.profile not in loaded.device_profiles:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.device.profile_not_found",
+                    severity="error",
+                    message=(
+                        f"device {device.name!r} in lab {lab.metadata.name!r} "
+                        f"references unknown profile {device.profile!r}"
+                    ),
+                    source=source,
+                    key_path=f"spec.devices[{idx}].profile",
+                    suggestion=(
+                        f"add config/devices/{device.profile}.yaml or fix the "
+                        "profile name"
+                    ),
+                )
+            )
         if device.name in vm_names:
             diagnostics.append(
                 Diagnostic(

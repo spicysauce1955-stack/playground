@@ -32,6 +32,7 @@ from playground.models.kinds import (
     ArtifactSources,
     CommandPreset,
     Defaults,
+    DeviceProfile,
     Lab,
     NetworkProfile,
     ProviderConfig,
@@ -56,6 +57,7 @@ class LoadedConfig:
     networks: dict[str, NetworkProfile] = field(default_factory=dict)
     roles: dict[str, VmRole] = field(default_factory=dict)
     commands: dict[str, CommandPreset] = field(default_factory=dict)
+    device_profiles: dict[str, DeviceProfile] = field(default_factory=dict)
     labs: dict[str, Lab] = field(default_factory=dict)
     sources: dict[tuple[str, str], SourceLocation] = field(default_factory=dict)
 
@@ -266,6 +268,10 @@ def _file_into_collection(
         if not _check_duplicate(loaded.commands):
             loaded.commands[name] = resource
             loaded.sources[("CommandPreset", name)] = source
+    elif isinstance(resource, DeviceProfile):
+        if not _check_duplicate(loaded.device_profiles):
+            loaded.device_profiles[name] = resource
+            loaded.sources[("DeviceProfile", name)] = source
     elif isinstance(resource, Lab):
         if not _check_duplicate(loaded.labs):
             loaded.labs[name] = resource
@@ -280,8 +286,19 @@ def _dir_for_kind(kind: str) -> str:
         "NetworkProfile": "networks",
         "VmRole": "roles",
         "CommandPreset": "commands",
+        "DeviceProfile": "devices",
         "Lab": "labs",
     }.get(kind, "?")
 
 
-__all__ = ["LoadedConfig", "load_config"]
+def shared_note_path(config_dir: Path, name: str) -> Path:
+    """The committed note sidecar for a profile, associated by basename.
+
+    ``discover_config_files`` globs ``*.yaml`` only, so this sidecar is
+    never handed to the YAML parser -- it is plain markdown, read (or
+    written) directly by whatever surfaces device notes.
+    """
+    return config_dir / "devices" / f"{name}.md"
+
+
+__all__ = ["LoadedConfig", "load_config", "shared_note_path"]
