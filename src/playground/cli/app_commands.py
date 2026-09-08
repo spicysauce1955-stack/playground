@@ -46,7 +46,7 @@ from playground.android.commands import (
 from playground.android.runner import TargetResult, run_on_targets
 from playground.android.splits import find_base_apk
 from playground.android.targets import AndroidTarget, resolve_targets
-from playground.android.transport import AdbInvocation, GuestAdb, render_guest_command
+from playground.android.transport import AdbInvocation, render_guest_command, require_guest
 from playground.backend.dispatch import query_status
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.ssh.argv import build_scp_argv, build_ssh_argv
@@ -213,23 +213,6 @@ def _exit_for_failures(failed: list[str], total: int) -> None:
     raise typer.Exit(code=0)
 
 
-def _require_guest(target: AndroidTarget) -> GuestAdb:
-    """`_stream`/`_scp_one`/`_capture_to_local` reach a device by ssh-ing
-    into a guest VM; a USB-attached `LocalAdb` handset has no such guest.
-    `_resolve` only ever builds `GuestAdb` targets today (there is no
-    local-device targeting flag yet), so this should never actually
-    raise -- it exists so a future `LocalAdb` target fails loudly here
-    rather than crashing deep inside scp/ssh argv construction on a
-    missing `.ssh_host`.
-    """
-    transport = target.transport
-    if not isinstance(transport, GuestAdb):
-        raise TypeError(
-            f"{target.name!r} has no guest ssh transport (got {transport!r})"
-        )
-    return transport
-
-
 def _dispatch(
     targets: list[AndroidTarget], inv: AdbInvocation, *, timeout: float = _DEFAULT_TIMEOUT
 ) -> None:
@@ -247,7 +230,7 @@ def _stream(target: AndroidTarget, inv: AdbInvocation) -> None:
     stdio (rather than `run_on_targets`' capture) so output streams as it
     is produced instead of waiting for the process to exit.
     """
-    guest = _require_guest(target)
+    guest = require_guest(target)
     argv = build_ssh_argv(
         guest.ssh_host,
         user=guest.ssh_user,
@@ -282,7 +265,7 @@ def _scp_one(
     # quoting, a filename with a space is "ambiguous target" and one with
     # a backtick or `$(...)` runs on the guest. Only the path half is
     # quoted -- the user@host half must stay bare.
-    guest = _require_guest(target)
+    guest = require_guest(target)
     dst = f"{guest.ssh_user}@{guest.ssh_host}:{shlex.quote(remote_path)}"
     argv = build_scp_argv(str(local), dst, port=guest.ssh_port)
     try:
@@ -300,7 +283,7 @@ def _scp_one(
 
 def _capture_to_local(
     target: AndroidTarget,
-    capture_cmd: AdbInvocation | str,
+    capture_cmd: AdbInvocation | None,
     device_path: str,
     local_path: Path,
     *,
@@ -337,18 +320,18 @@ def _capture_to_local(
     verb, where ``device_path`` is an arbitrary, pre-existing file the
     caller wants to read — deleting it before "capturing" would destroy
     the very thing being pulled.
+
+    ``capture_cmd`` is ``None`` for `pull_command`: the file already
+    exists on the device, so there is no capture step to run, only the
+    pull below. `"true"` (a real, guaranteed-successful no-op) stands in
+    for it in the chain -- a sentinel value, not a command, which is why
+    it is expressed as `None` here rather than the literal string.
     """
+    guest = require_guest(target)
     guest_tmp = f"/tmp/playground-pull-{uuid4().hex}"
     prefix = adb_prefix()
-    # `capture_cmd` is an `AdbInvocation` from a real builder (screenshot,
-    # ui-dump) for every caller except `pull_command`, which passes the
-    # literal string `"true"` (no capture step -- the file already exists
-    # on the device). Render the former explicitly rather than relying on
-    # implicit `str()` conversion in the f-string below.
     capture_cmd_str = (
-        render_guest_command(capture_cmd)
-        if isinstance(capture_cmd, AdbInvocation)
-        else capture_cmd
+        render_guest_command(capture_cmd) if capture_cmd is not None else "true"
     )
     capture_group = f"{{ {capture_cmd_str}; }}"
     pull_group = (
@@ -379,7 +362,6 @@ def _capture_to_local(
         f"{chain} && [ -s {shlex.quote(guest_tmp)} ] && cat {shlex.quote(guest_tmp)}; "
         f"status=$?; rm -f {shlex.quote(guest_tmp)}; exit $status"
     )
-    guest = _require_guest(target)
     argv = build_ssh_argv(
         guest.ssh_host,
         user=guest.ssh_user,
@@ -1037,7 +1019,7 @@ def pull_command(
     # every call (unlike screenshot/ui-dump) — deleting it first would
     # destroy the very file being pulled.
     if not _capture_to_local(
-        target, "true", src, dest, timeout=_PUSH_PULL_TIMEOUT, clean_device_path_first=False
+        target, None, src, dest, timeout=_PUSH_PULL_TIMEOUT, clean_device_path_first=False
     ):
         raise typer.Exit(code=1)
 

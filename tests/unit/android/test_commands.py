@@ -344,6 +344,29 @@ def test_logcat_package_combines_with_tag_and_priority() -> None:
     assert "-s MyTag:I" in cmd
 
 
+def test_logcat_package_tag_metacharacters_are_quoted_against_device_injection() -> None:
+    """LIVE BUG: `_logcat_package_cmd` extended its device-script argv
+    with the (deliberately unquoted, for the plain protocol form)
+    `_logcat_filterspec` tokens directly, then handed the result to a
+    device shell via `adb_shell` -- an unquoted `;` in `--tag` (free
+    text; only `--priority` is validated by the CLI layer) closed the
+    `logcat` statement early and started a second one. `--tag 'A; id #'`
+    executed `id` on the device. `test_logcat_package_combines_with_tag_
+    and_priority` above cannot catch this: `shlex.quote("MyTag:I")` is a
+    no-op, so it asserts the same substring whether or not the fix is
+    applied. This one needs an actual shell metacharacter, and must
+    verify quoting held, not merely that the value appears somewhere."""
+    cmd = render_guest_command(
+        logcat_cmd(follow=False, lines=None, package="com.x", tag="A; id #")
+    )
+    argv = _simulate_device_argv(cmd)
+    # The filterspec must survive the device-side parse as ONE argument
+    # attached to `-s` -- if the `;` were unquoted it would instead split
+    # into separate tokens and `id` would appear as its own command.
+    assert argv[argv.index("-s") + 1] == "A; id #:V"
+    assert "id" not in argv, "the semicolon must not start a second device command"
+
+
 def test_priority_filterspec_is_quoted_against_guest_globbing() -> None:
     """`*:W` is interpreted by the GUEST shell for the plain `adb logcat`
     form. Unquoted, a file matching `*:W` in the ssh working directory

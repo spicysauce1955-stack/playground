@@ -92,6 +92,28 @@ def local_argv(transport: LocalAdb, inv: AdbInvocation) -> list[str]:
     return ["adb", "-s", transport.serial, *inv.args]
 
 
+def require_guest(target: AndroidTarget) -> GuestAdb:
+    """Narrow ``target.transport`` to `GuestAdb`, for callers that reach a
+    device by ssh-ing into a guest VM (scp, a hand-built guest-shell
+    string, ...) rather than through `AdbInvocation`/`render_guest_command`.
+
+    Raises `TypeError` rather than returning a `Diagnostic`, unlike this
+    codebase's usual `_fail(Diagnostic(...))` CLI-error style: a
+    `LocalAdb` target reaching one of these call sites is not an operator
+    mistake to explain -- there is no flag an operator could have passed
+    differently -- it is a caller that built a guest-only command for a
+    target it never checked was a guest. That is a programming error, and
+    the asymmetry with the surrounding Diagnostic-based style is
+    deliberate.
+    """
+    transport = target.transport
+    if not isinstance(transport, GuestAdb):
+        raise TypeError(
+            f"{target.name!r} has no guest ssh transport (got {transport!r})"
+        )
+    return transport
+
+
 __all__ = [
     "ADB_PORT",
     "AdbInvocation",
@@ -103,4 +125,5 @@ __all__ = [
     "guest_prefix",
     "local_argv",
     "render_guest_command",
+    "require_guest",
 ]

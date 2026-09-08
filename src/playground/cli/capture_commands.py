@@ -25,7 +25,7 @@ import typer
 
 from playground.android.runner import TargetResult, run_on_targets
 from playground.android.targets import AndroidTarget
-from playground.android.transport import GuestAdb
+from playground.android.transport import require_guest
 from playground.backend.dispatch import query_status
 from playground.capture.commands import (
     clean_cmd,
@@ -175,20 +175,6 @@ def _resolve(
         target_diagnostics, cli_main.OutputFormat.human, json_errors=False
     )
     return lab, resolved, targets
-
-
-def _require_guest(target: AndroidTarget) -> GuestAdb:
-    """`fetch`'s scp step reaches a device by scp-ing off a guest VM; a
-    USB-attached `LocalAdb` handset has no such guest. `_resolve` only
-    ever builds `GuestAdb` targets today, so this should never actually
-    raise -- see the identical helper in `app_commands.py`.
-    """
-    transport = target.transport
-    if not isinstance(transport, GuestAdb):
-        raise TypeError(
-            f"{target.name!r} has no guest ssh transport (got {transport!r})"
-        )
-    return transport
 
 
 def _echo(result: TargetResult) -> None:
@@ -497,7 +483,7 @@ def fetch_command(
         # "ambiguous target" and one with a backtick or `$(...)` runs on
         # the guest. Only the path half is quoted -- the user@host half
         # must stay bare. Mirrors `_scp_one` in `app_commands.py`.
-        guest = _require_guest(target)
+        guest = require_guest(target)
         source = (
             f"{guest.ssh_user}@{guest.ssh_host}:"
             f"{shlex.quote(f'{remote_capture_dir(target.name)}/.')}"

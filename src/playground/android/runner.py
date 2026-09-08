@@ -38,8 +38,14 @@ def _run_one(target: AndroidTarget, inv: AdbInvocation | str, timeout: float) ->
     guest-rendered ``str`` (see their own modules for why). Those are
     guest-shell commands, not adb invocations, and only ever make sense
     on `GuestAdb` -- there is no shell to run them in on a USB-attached
-    `LocalAdb` handset, so that combination is rejected rather than
-    silently mis-dispatched.
+    `LocalAdb` handset.
+
+    A `LocalAdb` target paired with a raw `str` command RAISES rather
+    than returning a failing `TargetResult`, consistent with
+    `transport.require_guest`: it is a caller bug (something built a
+    guest-only command for a target it never checked was a guest), not a
+    device failure, and reporting it as an ordinary non-zero exit code
+    would mislead the operator into thinking the DEVICE failed.
     """
     transport = target.transport
     if isinstance(transport, GuestAdb):
@@ -53,9 +59,10 @@ def _run_one(target: AndroidTarget, inv: AdbInvocation | str, timeout: float) ->
         )
     else:
         if not isinstance(inv, AdbInvocation):
-            return TargetResult(
-                target, 1, "",
-                "raw guest shell commands have no meaning on a USB-attached device",
+            raise TypeError(
+                f"{target.name!r} is a LocalAdb target; raw guest-shell commands "
+                "have no meaning on a USB-attached device (there is no shell to "
+                "run them in)"
             )
         argv = local_argv(transport, inv)
     try:

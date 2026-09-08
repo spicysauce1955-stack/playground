@@ -224,7 +224,17 @@ def _logcat_package_cmd(
     if not follow:
         args.append("-d")
     args.append('--pid="$PID"')
-    args.extend(_logcat_filterspec(tag=tag, priority=priority))
+    # shlex.quote each filterspec token here: this whole `args` list is
+    # about to become ONE argument to `adb_shell` (a device shell script
+    # parsed by the device's own `sh -c`), not adb argv -- unlike
+    # `logcat_cmd`'s plain protocol form, where the filterspec reaches
+    # adb directly and must stay unquoted (see `_logcat_filterspec`'s
+    # docstring). `--tag`/`--priority` are free text from the operator,
+    # unvalidated beyond `--priority`'s enum in the CLI layer, so an
+    # unquoted `;` or `` ` `` here is device-side command injection --
+    # found live: `--tag 'A; id #'` ran `id` on the device. Mirrors the
+    # identical quoting `logcat_cmd`'s device-pipe branch already does.
+    args.extend(shlex.quote(f) for f in _logcat_filterspec(tag=tag, priority=priority))
     # NOT `-t N`. Verified live on Redroid 11: `-t N` seeks to the last N
     # RAW lines and only then applies the filter, so `-t 5 -s Zygote:V`
     # returns nothing whenever the newest 5 lines are not Zygote's --
