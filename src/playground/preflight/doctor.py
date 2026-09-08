@@ -32,6 +32,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from playground.devices.adb import list_attached
 from playground.models.diagnostic import Diagnostic, SourceLocation
 
 # Required ansible collections — matches ansible/requirements.yml.
@@ -1726,6 +1727,134 @@ def check_cloud_do_provider_config(
 
 
 # ---------------------------------------------------------------------------
+# Physical Android devices
+# ---------------------------------------------------------------------------
+
+
+def check_adb_available() -> Diagnostic | None:
+    """`adb` on PATH -- required only for labs declaring `spec.devices`.
+
+    A warning rather than an error: a lab with no handset never touches
+    adb on the controller, and the Redroid path runs adb inside the guest.
+    """
+    if shutil.which("adb"):
+        return None
+    return Diagnostic(
+        id="preflight.adb.missing",
+        severity="warning",
+        message="`adb` is not on PATH; required only for labs with spec.devices",
+        source=SourceLocation(path="PATH"),
+        suggestion="install android-platform-tools (Debian/Ubuntu: apt install adb)",
+    )
+
+
+def _raw_adb_devices_l() -> str | None:
+    """Raw ``adb devices -l`` stdout, or ``None`` when it cannot be read.
+
+    Read independently of :func:`playground.devices.adb.list_attached`
+    because that module's ``parse_devices_l`` silently DROPS the ``no
+    permissions`` and ``authorizing`` states -- adb vocabulary that never
+    makes it into the shared ``DeviceState`` literal. Widening that
+    literal for two doctor-only states would ripple into every
+    `DeviceStatus` consumer for no benefit to them; reading the raw
+    listing here keeps the doctor-local representation contained to this
+    module, per the design note this check exists to satisfy.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603 — explicit args, no shell
+            ["adb", "devices", "-l"],
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _dropped_adb_state_diagnostics() -> list[Diagnostic]:
+    """``no permissions`` and ``authorizing`` lines from a raw ``adb
+    devices -l``, translated into diagnostics naming the actual remedy.
+
+    Without this, both states are silently dropped by `parse_devices_l`
+    (see its docstring), so the single most common real-world handset
+    failure -- a udev rule misconfiguration presenting as `no
+    permissions` -- looks to the operator exactly like "no devices
+    attached", the least informative message doctor could give them.
+    """
+    raw = _raw_adb_devices_l()
+    if not raw:
+        return []
+    found: list[Diagnostic] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split(maxsplit=1)
+        serial = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        if rest.startswith("no permissions"):
+            found.append(
+                Diagnostic(
+                    id="preflight.adb.no_permissions",
+                    severity="warning",
+                    message=(
+                        f"handset {serial} reports `no permissions` -- this is a "
+                        "udev rule misconfiguration, not a missing device"
+                    ),
+                    source=SourceLocation(path="adb"),
+                    suggestion=(
+                        "install udev rules for your handset's vendor (Ubuntu: "
+                        "apt install android-sdk-platform-tools-common) and "
+                        "replug it, or add your user to the group those rules "
+                        "grant `adb` access to (often `plugdev`)"
+                    ),
+                )
+            )
+            continue
+        state_word = rest.split(maxsplit=1)[0] if rest else ""
+        if state_word == "authorizing":
+            found.append(
+                Diagnostic(
+                    id="preflight.adb.authorizing",
+                    severity="warning",
+                    message=f"handset {serial} is `authorizing` -- a pairing is still in progress",
+                    source=SourceLocation(path="adb"),
+                    suggestion="wait for the RSA trust prompt on the handset and tap Allow",
+                )
+            )
+    return found
+
+
+def check_attached_devices() -> list[Diagnostic]:
+    """Report every attached handset that needs operator attention.
+
+    `unauthorized` gets the RSA-tap remedy -- the most common real-world
+    failure. `no permissions` (a udev misconfiguration) and
+    `authorizing` (a pairing still mid-flight) are two more adb states
+    that a naive read of `list_attached()` alone would never surface at
+    all, so `doctor` reads the raw listing a second time for those; see
+    `_dropped_adb_state_diagnostics`.
+    """
+    if not shutil.which("adb"):
+        return []
+    attached, diagnostics = list_attached()
+    for device in attached:
+        if device.state == "unauthorized":
+            diagnostics.append(
+                Diagnostic(
+                    id="preflight.adb.unauthorized",
+                    severity="warning",
+                    message=f"handset {device.serial} has not accepted this machine's adb key",
+                    source=SourceLocation(path="adb"),
+                    suggestion="tap Allow on the handset's RSA prompt",
+                )
+            )
+    diagnostics.extend(_dropped_adb_state_diagnostics())
+    return diagnostics
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1765,6 +1894,12 @@ def run_all_checks(
         diagnostics.extend(check_cloud_do_state_writable(_state_dir))
         if config_dir is not None:
             diagnostics.extend(check_cloud_do_provider_config(config_dir))
+        # Physical devices are backend-independent -- a cloud lab can
+        # declare `spec.devices` exactly like a local one.
+        adb_diag = check_adb_available()
+        if adb_diag is not None:
+            diagnostics.append(adb_diag)
+        diagnostics.extend(check_attached_devices())
         return diagnostics
 
     # Default: full libvirt/vbox suite (unchanged).
@@ -1787,4 +1922,8 @@ def run_all_checks(
     diagnostics.extend(check_kvm_nested_enabled())
     diagnostics.extend(check_no_recent_vmx_failures())
     diagnostics.extend(check_running_inside_hypervisor())
+    adb_diag = check_adb_available()
+    if adb_diag is not None:
+        diagnostics.append(adb_diag)
+    diagnostics.extend(check_attached_devices())
     return diagnostics

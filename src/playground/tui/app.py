@@ -202,7 +202,7 @@ class PlaygroundTui(App[None]):
 
         warnings = [d for d in validation_diagnostics if d.severity == "warning"]
         plan = render_plan(resolved, warnings=warnings)
-        status, _ = query_status(resolved, self.tofu_dir)
+        status, _ = query_status(resolved, self.tofu_dir, self.state_dir)
 
         lines = [
             f"# {resolved.lab_name}",

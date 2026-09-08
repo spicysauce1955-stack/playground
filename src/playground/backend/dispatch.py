@@ -25,10 +25,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from playground.backend import cloud_digitalocean, local_libvirt, local_vbox
+from playground.devices.adb import list_attached
+from playground.devices.binding import read_binding
+from playground.devices.registry import read_registry
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
-from playground.models.resolved import ResolvedLab
-from playground.models.status import LabStatus
+from playground.models.resolved import ResolvedDevice, ResolvedLab
+from playground.models.status import DeviceStatus, LabStatus
 from playground.planner.plan import CostEstimate
 from playground.runs import OperationRun
 
@@ -199,13 +202,86 @@ def execute_resume(
 
 
 def query_status(
-    resolved: ResolvedLab, tofu_dir: Path,
+    resolved: ResolvedLab, tofu_dir: Path, state_dir: Path = Path(".playground"),
 ) -> tuple[LabStatus, list[Diagnostic]]:
+    """Backend-observed status, plus BACKEND-NEUTRAL device status.
+
+    No backend provisions a physical handset -- `local-libvirt`,
+    `local-vbox` and `cloud-digitalocean` all delegate their VM-shaped
+    status to the matching adapter below, then this function alone fills
+    in ``LabStatus.devices`` from the same device machinery every other
+    device-aware verb uses, so a handset works identically regardless of
+    which backend the rest of the lab uses. ``state_dir`` defaults to
+    the same ``.playground`` every other command defaults to, so callers
+    that pass none still see live device state for the common case.
+    """
     if resolved.backend == VBOX:
-        return local_vbox.query_status(resolved)
-    if resolved.backend == DIGITALOCEAN:
-        return cloud_digitalocean.query_status(resolved)
-    return local_libvirt.query_status(resolved, tofu_dir)
+        status, diagnostics = local_vbox.query_status(resolved)
+    elif resolved.backend == DIGITALOCEAN:
+        status, diagnostics = cloud_digitalocean.query_status(resolved)
+    else:
+        status, diagnostics = local_libvirt.query_status(resolved, tofu_dir)
+
+    if resolved.devices:
+        status = status.model_copy(
+            update={
+                "devices": _device_statuses(state_dir, resolved.lab_name, resolved.devices)
+            }
+        )
+    return status, diagnostics
+
+
+def _device_statuses(
+    state_dir: Path, lab: str, devices: list[ResolvedDevice]
+) -> list[DeviceStatus]:
+    """Read-only ``DeviceStatus`` for every declared slot.
+
+    Deliberately does NOT call ``resolve_binding`` -- that function can
+    auto-bind (and persist) an unbound slot with exactly one matching
+    candidate, which is exactly the mutation a `status` query must never
+    cause as a side effect. Instead it reads the already-persisted
+    binding (`read_binding`) and cross-checks it against a live `adb
+    devices -l` (`list_attached`) for the slot's CURRENT connectivity, and
+    the registry (`read_registry`) for the facts recorded at the slot's
+    last adoption -- no `probe_facts` re-probe, so this stays as cheap as
+    any other status query. A slot with no persisted binding, or whose
+    bound serial is not currently attached, reads as ``missing``: an
+    un-adopted device is not a live target yet, matching the same
+    "never adopted/probed" semantics `android.targets.resolve_targets`
+    already applies to a slot absent from `status.devices` entirely.
+    """
+    attached, _adb_diagnostics = list_attached()
+    attached_by_serial = {candidate.serial: candidate for candidate in attached}
+    registry = read_registry(state_dir)
+
+    statuses: list[DeviceStatus] = []
+    for device in devices:
+        binding = read_binding(state_dir, lab, device.name)
+        if binding is None:
+            statuses.append(DeviceStatus(name=device.name, state="missing"))
+            continue
+        candidate = attached_by_serial.get(binding.serial)
+        if candidate is None:
+            statuses.append(
+                DeviceStatus(name=device.name, state="missing", serial=binding.serial)
+            )
+            continue
+        entry = registry.get(binding.serial)
+        facts = entry.facts if entry is not None else None
+        statuses.append(
+            DeviceStatus(
+                name=device.name,
+                state=candidate.state,
+                serial=binding.serial,
+                model=facts.model if facts is not None else candidate.model,
+                manufacturer=facts.manufacturer if facts is not None else None,
+                sdk=facts.sdk if facts is not None else None,
+                abi=facts.abi if facts is not None else None,
+                rooted=facts.rooted if facts is not None else None,
+                last_verified=entry.last_verified if entry is not None else None,
+            )
+        )
+    return statuses
 
 
 def estimate_cost(
