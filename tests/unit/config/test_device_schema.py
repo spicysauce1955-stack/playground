@@ -32,11 +32,13 @@ def test_unknown_field_is_rejected():
 
 
 def test_resolved_device_has_no_capabilities_field():
-    """Facts must not reach the resolved model -- the resolver runs with no
-    handset attached and cannot know them."""
+    """PROBED FACTS must not reach the resolved model -- the resolver runs
+    with no handset attached and cannot know them. `profile` is not a
+    probed fact; it is config-declared intent like `match`/`require`, so
+    it does belong here."""
     assert "capabilities" not in ResolvedDevice.model_fields
     assert set(ResolvedDevice.model_fields) == {
-        "name", "kind", "match", "require", "tags", "required",
+        "name", "kind", "profile", "match", "require", "tags", "required",
     }
 
 

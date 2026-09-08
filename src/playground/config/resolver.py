@@ -146,6 +146,7 @@ def _resolve_device(device: LabDevice, loaded: LoadedConfig) -> ResolvedDevice:
         return ResolvedDevice(
             name=device.name,
             kind=device.kind,
+            profile=None,
             match=device.match,
             require=device.require,
             tags=list(device.tags),
@@ -156,6 +157,7 @@ def _resolve_device(device: LabDevice, loaded: LoadedConfig) -> ResolvedDevice:
     return ResolvedDevice(
         name=device.name,
         kind=device.kind,
+        profile=device.profile,
         match=_layer_optional_model(device.match, profile_spec.match, DeviceMatch),
         require=_layer_optional_model(device.require, profile_spec.require, DeviceRequire),
         tags=[*profile_spec.tags, *device.tags],

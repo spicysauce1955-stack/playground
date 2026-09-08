@@ -81,19 +81,21 @@ def _lookup_note(
 ) -> str | None:
     """The operator's note for this handset, shared surface first.
 
-    Retrieval order: SHARED (keyed by profile name) first, then PRIVATE
-    (keyed by the bound serial). `ResolvedDevice` carries no `profile`
-    field -- only `name`, `kind`, `match`, `require`, `tags`, `required`
-    survive resolution -- so "the slot's profile if it has one, else its
-    name" degrades to always using `device.name` here; there is no
-    profile name left to prefer by the time a device is resolved. Both
-    scopes raise a plain `ValueError` when their required key is missing;
-    a missing note is normal, not an error, so that is caught rather than
-    left to escape as a traceback.
+    Retrieval order: SHARED (keyed by `device.profile`, falling back to
+    `device.name` for an inline slot with no profile) first, then PRIVATE
+    (keyed by the bound serial). The profile name matters: shared notes
+    live at `config/devices/<profile-name>.md`, so a slot named `pixel7`
+    that references profile `my-pixel` must resolve to `my-pixel.md`, not
+    `pixel7.md` -- using the slot's own name unconditionally would silently
+    miss the note in the common case where several labs share one
+    handset's profile. Both scopes raise a plain `ValueError` when their
+    required key is missing; a missing note is normal, not an error, so
+    that is caught rather than left to escape as a traceback.
     """
+    shared_name = device.profile or device.name
     try:
         shared = read_note(
-            "shared", config_dir=config_dir, state_dir=state_dir, name=device.name, serial=None
+            "shared", config_dir=config_dir, state_dir=state_dir, name=shared_name, serial=None
         )
     except ValueError:
         shared = None

@@ -146,6 +146,43 @@ def test_require_failure_on_a_connected_device_includes_the_shared_note(
     assert "Magisk" in require_diag.message
 
 
+def test_require_failure_uses_the_profiles_note_not_the_slots_own_name(
+    tmp_path, monkeypatch
+):
+    """A slot named `pixel7` referencing profile `my-pixel` must find the
+    note at `my-pixel.md`, not `pixel7.md` -- the case that was silently
+    broken before `ResolvedDevice.profile` existed."""
+    config_dir = tmp_path / "c"
+    write_note(
+        "root broken since the September OTA, needs Magisk re-flash",
+        scope="shared",
+        config_dir=config_dir,
+        state_dir=tmp_path / "s",
+        name="my-pixel",
+        serial=None,
+    )
+    # A decoy note under the slot's own name -- proves the profile name
+    # wins, not merely that *a* note was found.
+    write_note(
+        "unrelated note that must not be picked up",
+        scope="shared",
+        config_dir=config_dir,
+        state_dir=tmp_path / "s",
+        name="pixel7",
+        serial=None,
+    )
+    attached = [AttachedDevice(serial="S1", state="connected")]
+    facts = DeviceFacts(serial="S1", rooted=False, sdk=34)
+    monkeypatch.setattr("playground.devices.adopt.probe_facts", lambda serial: facts)
+
+    device = _device(profile="my-pixel", require=DeviceRequire(root=True))
+    _, diagnostics = adopt(tmp_path / "s", config_dir, "l", [device], attached)
+
+    require_diag = next(d for d in diagnostics if d.id == "device.require_unmet")
+    assert "Magisk" in require_diag.message
+    assert "unrelated" not in require_diag.message
+
+
 def test_require_failure_falls_back_to_the_private_note(tmp_path, monkeypatch):
     state_dir = tmp_path / "s"
     write_note(
