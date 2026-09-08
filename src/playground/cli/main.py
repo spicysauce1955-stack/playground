@@ -13,6 +13,7 @@ from typing import Annotated, NamedTuple, NoReturn
 
 import typer
 
+from playground.android.targets import device_status_diagnostic
 from playground.backend.dispatch import (
     SUPPORTED_BACKENDS,
     estimate_cost,
@@ -39,7 +40,7 @@ from playground.config.resolver import resolve_lab
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
-from playground.models.status import LabStatus
+from playground.models.status import DeviceStatus, LabStatus
 from playground.planner import Plan, PlanAction, render_plan
 from playground.preflight import run_all_checks as run_doctor_checks
 from playground.runs import OperationRun
@@ -1011,14 +1012,18 @@ ADB_REMOTE_PORT = 5555
 @app.command(
     "adb",
     help=(
-        "Open an SSH tunnel to a lab VM's Redroid ADB port and print the "
-        "`adb connect` line. Blocks until interrupted."
+        "For a VM: open an SSH tunnel to its Redroid ADB port and print the "
+        "`adb connect` line (blocks until interrupted). For a physical "
+        "device: print the `adb -s <serial>` line and exit -- adb already "
+        "reaches it directly, no tunnel needed."
     ),
 )
 def adb_command(
     on: Annotated[
         str,
-        typer.Option("--on", "--host", help="VM name within the lab (alias: --host)."),
+        typer.Option(
+            "--on", "--host", help="VM or device name within the lab (alias: --host)."
+        ),
     ],
     lab: Annotated[
         str | None,
@@ -1083,7 +1088,24 @@ def adb_command(
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, OutputFormat.human)
 
     vm_names = {vm.name for vm in resolved.vms}
-    if on not in vm_names:
+    device_names = {device.name for device in resolved.devices}
+    if on not in vm_names and on not in device_names:
+        if device_names:
+            _exit_with_diagnostic(
+                Diagnostic(
+                    id="config.device.unknown_device",
+                    severity="error",
+                    message=(
+                        f"{on!r} is not an Android VM or device in lab {lab!r} "
+                        f"(VMs: {sorted(vm_names) or '<none>'}, devices: "
+                        f"{sorted(device_names) or '<none>'})"
+                    ),
+                    source=SourceLocation(path=f"config/labs/{lab}.yaml"),
+                    key_path="spec.vms",
+                ),
+                OutputFormat.human,
+                json_errors=False,
+            )
         _exit_with_diagnostic(
             Diagnostic(
                 id="config.adb.unknown_vm",
@@ -1101,6 +1123,26 @@ def adb_command(
 
     status, query_diagnostics = query_status(resolved, tofu_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+
+    if on in device_names:
+        # A handset needs no ssh tunnel -- adb already reaches it directly
+        # over the operator's own USB bus. Print the connection line and
+        # exit instead of blocking on a forward that would never be used.
+        source = SourceLocation(path=f"config/labs/{lab}.yaml")
+        device_status = next((d for d in status.devices if d.name == on), None)
+        if device_status is None:
+            # Declared in the lab but never adopted/probed (no `apply` run
+            # yet, or discovery never saw it) -- reuse the same
+            # `device.not_connected` wording a `missing` slot gets.
+            device_status = DeviceStatus(name=on, state="missing")
+        if device_status.state != "connected" or not device_status.serial:
+            _exit_with_diagnostic(
+                device_status_diagnostic(on, device_status, source),
+                OutputFormat.human,
+                json_errors=False,
+            )
+        typer.echo(f"adb -s {device_status.serial}")
+        raise typer.Exit(code=0)
 
     vm_status = next((v for v in status.vms if v.name == on), None)
     ssh_host = vm_status.ssh_host if vm_status else None

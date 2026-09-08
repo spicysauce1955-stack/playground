@@ -112,13 +112,18 @@ LabOpt = Annotated[
         ),
     ),
 ]
-OnOpt = Annotated[str | None, typer.Option("--on", help="Target one VM by name.")]
+OnOpt = Annotated[
+    str | None, typer.Option("--on", help="Target one VM or device by name.")
+]
 RoleOpt = Annotated[
     str | None,
-    typer.Option("--role", help="Target every Android VM that has this role."),
+    typer.Option(
+        "--role",
+        help="Target every Android VM that has this role (VMs only; devices have no role).",
+    ),
 ]
 AllOpt = Annotated[
-    bool, typer.Option("--all", help="Target every Android VM in the lab.")
+    bool, typer.Option("--all", help="Target every Android VM and device in the lab.")
 ]
 UserOpt = Annotated[str, typer.Option("--user", help="SSH user (default: ubuntu).")]
 ConfigDirOpt = Annotated[

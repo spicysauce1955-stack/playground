@@ -83,7 +83,8 @@ def _two_device_config(tmp_path: Path) -> Path:
 
     Backend is `local-libvirt` (not `redroid-cloud`'s `cloud-digitalocean`)
     purely so this fixture doesn't need a second provider block; capture
-    supports both backends identically (see `_CAPTURE_BACKENDS`).
+    is a per-target capability check (`capture/targets.py`), not gated on
+    `spec.backend`, so either backend works identically here.
     `query_status` is monkeypatched regardless, so no real backend is ever
     touched. Two `redroid-host` VMs cost 8 vCPU / 16384 MB / 120 GB
     against the platform defaults of 12 / 24576 / 250 / 8 VMs

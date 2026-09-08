@@ -5,10 +5,21 @@ capabilities: a VM is capturable when its role chain declares
 `capture: true` (config/roles/redroid-host.yaml). Same mechanism
 `playground.android.targets` uses for `redroid`.
 
+Capturability is a property of the TARGET, not of `spec.backend` -- an
+earlier version of this module refused every target in a lab whose
+backend wasn't `local-libvirt`/`cloud-digitalocean`, which would also
+have wrongly refused a physical handset attached to a `local-vbox` lab
+(vbox only declares `redroid: false`; it says nothing about a handset
+plugged into the host running it). So backend plays no part here: each
+candidate is checked for its OWN capture capability instead. Physical
+devices are the one population that's still unconditionally excluded in
+this slice -- `config.capture.device_unsupported` says so plainly, so
+the verb fails honestly rather than silently capturing nothing.
+
 Returns `AndroidTarget` rather than a look-alike of its own so
 `playground.android.runner.run_on_targets` fans capture commands out
 unchanged -- that runner is typed `list[AndroidTarget]`, and in this
-slice every capturable VM is an Android device.
+slice every capturable target is a Redroid VM (`GuestAdb`).
 """
 
 from __future__ import annotations
@@ -19,15 +30,23 @@ from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
 
-_CAPTURE_BACKENDS = ("local-libvirt", "cloud-digitalocean")
-"""`local-vbox` declares `redroid: false` in its ProviderConfig -- Redroid
-is unverified there, so there is no device whose traffic could be
-captured."""
+__all__ = ["capture_target_names", "capture_vm_names", "resolve_capture_targets"]
 
 
 def capture_vm_names(resolved: ResolvedLab) -> list[str]:
     """VMs whose role declares the `capture` capability, in lab order."""
     return [vm.name for vm in resolved.vms if vm.capabilities.get("capture")]
+
+
+def capture_target_names(resolved: ResolvedLab) -> list[str]:
+    """Capturable VM names, then every device slot name, in lab order.
+
+    Device slots are listed here even though none of them are ever
+    capturable in this slice -- naming one with `--on` must produce
+    `config.capture.device_unsupported`, not `config.capture.unknown_vm`,
+    which means it has to be a recognized candidate first.
+    """
+    return capture_vm_names(resolved) + [device.name for device in resolved.devices]
 
 
 def resolve_capture_targets(
@@ -41,25 +60,6 @@ def resolve_capture_targets(
 ) -> tuple[list[AndroidTarget], list[Diagnostic]]:
     """Turn targeting flags into devices, or explain why none matched."""
     source = SourceLocation(path=f"config/labs/{resolved.lab_name}.yaml")
-
-    if resolved.backend not in _CAPTURE_BACKENDS:
-        return [], [
-            Diagnostic(
-                id="config.capture.backend_unsupported",
-                severity="error",
-                message=(
-                    f"lab {resolved.lab_name!r} uses backend "
-                    f"{resolved.backend!r}, which has no Redroid device to "
-                    "capture"
-                ),
-                source=source,
-                key_path="spec.backend",
-                suggestion=(
-                    "capture is available on local-libvirt and "
-                    "cloud-digitalocean; local-vbox declares redroid: false"
-                ),
-            )
-        ]
 
     if not resolved.capture.enabled:
         return [], [
@@ -80,6 +80,27 @@ def resolve_capture_targets(
         ]
 
     capturable = capture_vm_names(resolved)
+    device_names = [device.name for device in resolved.devices]
+
+    # An explicitly-named device gets its own diagnostic ahead of every
+    # other check -- it IS a recognized target, it is simply not a
+    # capturable one yet, and that is a different fact from "no capture
+    # VM exists in this lab" or "no VM by that name exists".
+    if on is not None and on in device_names:
+        return [], [
+            Diagnostic(
+                id="config.capture.device_unsupported",
+                severity="error",
+                message=(
+                    f"device {on!r} in lab {resolved.lab_name!r} cannot be "
+                    "captured -- capture from a physical handset ships in "
+                    "Plan 2"
+                ),
+                source=source,
+                key_path="spec.devices",
+            )
+        ]
+
     if not capturable:
         return [], [
             Diagnostic(
