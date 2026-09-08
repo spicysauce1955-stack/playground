@@ -1622,11 +1622,23 @@ def status_command(
     _exit_if_unsupported_backend(resolved, output)
     status, query_diagnostics = query_status(resolved, tofu_dir, state_dir)
     _exit_on_errors(query_diagnostics, output, json_errors=False)
+    # `_exit_on_errors` only ever raises on an ERROR; a WARNING (e.g. the
+    # downgraded `device.adb_unavailable` `_device_statuses` returns when
+    # adb is missing/hung) falls through here and must still reach the
+    # operator -- otherwise a device lab queried from a machine without
+    # adb renders `state=missing` with no visible cause, silently, which
+    # is exactly the "presents as no devices attached" confusion
+    # handoff (c) exists to eliminate.
 
     if output is OutputFormat.json:
-        _print_json(status.model_dump(mode="json", exclude_none=True))
+        payload = status.model_dump(mode="json", exclude_none=True)
+        if query_diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in query_diagnostics]
+        _print_json(payload)
         return
 
+    if query_diagnostics:
+        _print_diagnostics(query_diagnostics, err=True)
     _render_status_human(status)
 
 

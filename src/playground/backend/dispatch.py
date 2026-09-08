@@ -202,7 +202,11 @@ def execute_resume(
 
 
 def query_status(
-    resolved: ResolvedLab, tofu_dir: Path, state_dir: Path = Path(".playground"),
+    resolved: ResolvedLab,
+    tofu_dir: Path,
+    state_dir: Path = Path(".playground"),
+    *,
+    include_devices: bool = True,
 ) -> tuple[LabStatus, list[Diagnostic]]:
     """Backend-observed status, plus BACKEND-NEUTRAL device status.
 
@@ -214,6 +218,13 @@ def query_status(
     which backend the rest of the lab uses. ``state_dir`` defaults to
     the same ``.playground`` every other command defaults to, so callers
     that pass none still see live device state for the common case.
+
+    ``include_devices=False`` is the explicit opt-out for a caller that
+    never renders ``status.devices`` at all (the TUI's lab-highlight
+    panel is the one case today): it skips `_device_statuses` --
+    and so the `adb devices -l` + registry read it does -- entirely,
+    rather than paying for data nothing on screen shows. Every other
+    caller keeps the default and is unaffected.
     """
     if resolved.backend == VBOX:
         status, diagnostics = local_vbox.query_status(resolved)
@@ -222,7 +233,7 @@ def query_status(
     else:
         status, diagnostics = local_libvirt.query_status(resolved, tofu_dir)
 
-    if resolved.devices:
+    if include_devices and resolved.devices:
         device_statuses, device_diagnostics = _device_statuses(
             state_dir, resolved.lab_name, resolved.devices
         )

@@ -202,14 +202,20 @@ class PlaygroundTui(App[None]):
 
         warnings = [d for d in validation_diagnostics if d.severity == "warning"]
         plan = render_plan(resolved, warnings=warnings)
-        # `_render_lab` never displays `status.devices`, so this
-        # deliberately does NOT pass `self.state_dir` -- doing so would
-        # make every lab highlight in the list also shell out to `adb
+        # `_render_lab` never displays `status.devices`, so this passes
+        # `include_devices=False` -- the explicit opt-out -- rather than
+        # omitting `self.state_dir` (that gates nothing: `state_dir` is
+        # just a default-valued path, and `query_status` still probes
+        # devices whenever `resolved.devices` is non-empty regardless of
+        # which state_dir it's pointed at). Without the real opt-out,
+        # every lab highlight in the list would shell out to `adb
         # devices -l` plus a registry read on the UI thread, for data
-        # nothing on screen shows. A hung/slow adb would then freeze
-        # the TUI with no escape. Revisit if this screen ever grows a
-        # device section.
-        status, _ = query_status(resolved, self.tofu_dir)
+        # nothing on screen shows, and a hung/slow adb would freeze the
+        # TUI with no escape. Revisit if this screen ever grows a device
+        # section.
+        status, _ = query_status(
+            resolved, self.tofu_dir, self.state_dir, include_devices=False
+        )
 
         lines = [
             f"# {resolved.lab_name}",

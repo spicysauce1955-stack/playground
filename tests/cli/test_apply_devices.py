@@ -456,3 +456,88 @@ def test_status_json_output_includes_devices(tmp_path, monkeypatch):
     assert payload["devices"] == [
         {"name": "pixel7", "state": "connected", "serial": "S1"}
     ]
+
+
+def _stub_status_with_diagnostics(diagnostics: list):
+    def _stub(resolved, tofu_dir, state_dir=Path(".playground")):
+        return (
+            LabStatus(
+                lab=resolved.lab_name,
+                backend=resolved.backend,
+                expected_vms=len(resolved.vms),
+                provisioned_vms=len(resolved.vms),
+                vms=[
+                    VmStatus(name=vm.name, role=vm.role, state="provisioned")
+                    for vm in resolved.vms
+                ],
+                devices=[DeviceStatus(name="pixel7", state="missing")],
+            ),
+            diagnostics,
+        )
+
+    return _stub
+
+
+def test_status_single_lab_human_output_surfaces_a_warning_diagnostic(tmp_path, monkeypatch):
+    """Regression test for the fix-round-2 finding: the single-lab
+    `status <lab>` branch used to call `_exit_on_errors` (a no-op for a
+    WARNING) and then silently drop `query_diagnostics` -- so `adb`
+    missing/hung on the controller rendered as a bare `state=missing`
+    with no visible cause. It must now print the warning."""
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    warning = Diagnostic(
+        id="device.adb_unavailable",
+        severity="warning",
+        message="`adb devices -l` failed: adb not found on PATH",
+        source=SourceLocation(path="adb"),
+        suggestion="install android-platform-tools and re-run `playground doctor`",
+    )
+    monkeypatch.setattr(cli_main, "query_status", _stub_status_with_diagnostics([warning]))
+    config_dir = _device_lab_config(tmp_path, required=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "status", "device-lab",
+            "--config-dir", str(config_dir),
+            "--tofu-dir", str(tmp_path / "tofu"),
+            "--state-dir", str(tmp_path / ".playground"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert "device.adb_unavailable" in result.output + result.stderr
+    assert "adb not found on PATH" in result.output + result.stderr
+
+
+def test_status_single_lab_json_output_includes_the_warning_diagnostic(tmp_path, monkeypatch):
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    warning = Diagnostic(
+        id="device.adb_unavailable",
+        severity="warning",
+        message="`adb devices -l` failed: adb not found on PATH",
+        source=SourceLocation(path="adb"),
+    )
+    monkeypatch.setattr(cli_main, "query_status", _stub_status_with_diagnostics([warning]))
+    config_dir = _device_lab_config(tmp_path, required=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "status", "device-lab",
+            "--config-dir", str(config_dir),
+            "--tofu-dir", str(tmp_path / "tofu"),
+            "--state-dir", str(tmp_path / ".playground"),
+            "--output", "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload["diagnostics"]) == 1
+    diag = payload["diagnostics"][0]
+    assert diag["id"] == "device.adb_unavailable"
+    assert diag["severity"] == "warning"
+    assert diag["message"] == "`adb devices -l` failed: adb not found on PATH"
