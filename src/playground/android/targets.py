@@ -8,21 +8,12 @@ became load-bearing with the cloud-redroid work
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+from playground.android.transport import AndroidTarget, GuestAdb
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
 
-
-@dataclass(frozen=True)
-class AndroidTarget:
-    """One reachable Android device."""
-
-    vm_name: str
-    ssh_host: str
-    ssh_port: int
-    ssh_user: str
+__all__ = ["AndroidTarget", "android_vm_names", "resolve_targets"]
 
 
 def android_vm_names(resolved: ResolvedLab) -> list[str]:
@@ -131,10 +122,12 @@ def resolve_targets(
             continue
         targets.append(
             AndroidTarget(
-                vm_name=name,
-                ssh_host=vm_status.ssh_host,
-                ssh_port=vm_status.ssh_port or 22,
-                ssh_user=user,
+                name=name,
+                transport=GuestAdb(
+                    ssh_host=vm_status.ssh_host,
+                    ssh_port=vm_status.ssh_port or 22,
+                    ssh_user=user,
+                ),
             )
         )
     return targets, diagnostics

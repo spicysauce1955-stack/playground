@@ -53,10 +53,10 @@ def test_all_devices_resolves_every_android_vm(redroid_lab) -> None:
         redroid_lab, _status(["droid1"]),
         on=None, role=None, all_devices=True, user="ubuntu",
     )
-    assert [t.vm_name for t in targets] == ["droid1"]
+    assert [t.name for t in targets] == ["droid1"]
     assert diagnostics == []
-    assert targets[0].ssh_user == "ubuntu"
-    assert targets[0].ssh_port == 22
+    assert targets[0].transport.ssh_user == "ubuntu"
+    assert targets[0].transport.ssh_port == 22
 
 
 def test_single_android_vm_is_the_default_target(redroid_lab) -> None:
@@ -65,7 +65,7 @@ def test_single_android_vm_is_the_default_target(redroid_lab) -> None:
         redroid_lab, _status(["droid1"]),
         on=None, role=None, all_devices=False, user="ubuntu",
     )
-    assert [t.vm_name for t in targets] == ["droid1"]
+    assert [t.name for t in targets] == ["droid1"]
     assert diagnostics == []
 
 

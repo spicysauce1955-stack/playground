@@ -1,12 +1,13 @@
-"""Pure builders for the adb command strings run on a Redroid guest.
+"""Pure builders for adb invocations run against a Redroid guest or a
+USB-attached handset.
 
-Everything here returns a shell string to be handed to `ssh`. Keeping
-them pure means every command shape is unit-testable without a device,
-and the CLI layer stays a thin argument-parsing shell.
-
-Every builder starts with `adb connect` so a command never depends on an
-adb server already running on the guest; `|| true` because reconnecting
-an existing device exits non-zero.
+Each builder returns an `AdbInvocation` -- the adb arguments that follow
+`-s <serial>`, UNQUOTED. Keeping them pure means every command shape is
+unit-testable without a device, and the CLI layer stays a thin
+argument-parsing shell. Rendering an invocation for one transport or the
+other (shell string for a guest over ssh, bare argv for local adb) is
+`playground.android.transport`'s job, not this module's -- see that
+module's docstring for the outer/inner quoting split.
 
 Syntax follows docs/research/android-emulation/app-install-launch.md.
 """
@@ -15,52 +16,67 @@ from __future__ import annotations
 
 import shlex
 
-ADB_PORT = 5555
-"""Port the Redroid container publishes on the VM (ansible/roles/redroid)."""
+from playground.android.transport import ADB_PORT, AdbInvocation, guest_prefix
 
-_SERIAL = f"127.0.0.1:{ADB_PORT}"
+__all__ = [
+    "ADB_PORT",
+    "adb_prefix",
+    "adb_shell",
+    "clear_cmd",
+    "input_cmd",
+    "install_cmd",
+    "install_multiple_cmd",
+    "launch_cmd",
+    "list_packages_cmd",
+    "logcat_cmd",
+    "screenshot_cmd",
+    "stop_cmd",
+    "ui_dump_cmd",
+    "uninstall_cmd",
+    "wait_booted_cmd",
+]
 
 
 def adb_prefix() -> str:
-    return f"adb connect {_SERIAL} >/dev/null 2>&1 || true; adb -s {_SERIAL}"
+    """Deprecated alias for `transport.guest_prefix()`.
 
-
-def adb_shell(command: str) -> str:
-    """Run ``command`` on the device shell, immune to the guest/adb hop.
-
-    `adb shell` joins whatever argv it is given into a single string with
-    plain spaces and hands THAT to /system/bin/sh -c on the device for a
-    second, independent parse. If the guest's login shell (which runs the
-    string this function returns, via ssh) sees ``command`` as more than
-    one token, that structure is destroyed by the join: a multi-word
-    argument truncates, and metacharacters meant to be literal (a package
-    name, free-form input text, ...) get reinterpreted by the device's
-    shell -- both a correctness bug and a device-side injection bug.
-
-    Quoting ``command`` as ONE token here defeats the guest-side split so
-    exactly one string reaches the device. Callers are still responsible
-    for `shlex.quote`-ing any individual dynamic values (package names,
-    free text, ...) inside ``command`` -- that quoting is what makes the
-    DEVICE's own sh -c treat them as a single argument once this outer
-    layer is stripped away by the two hops in between.
+    Retained so the pre-refactor characterization suite passes unedited
+    through this refactor. Removed with `wait_booted_cmd` in the next task.
     """
-    return f"{adb_prefix()} shell {shlex.quote(command)}"
+    return guest_prefix()
 
 
-def install_cmd(remote_apk: str) -> str:
-    return f"{adb_prefix()} install -r {shlex.quote(remote_apk)}"
+def adb_shell(command: str) -> AdbInvocation:
+    """Run ``command`` on the device shell as exactly one adb argument.
+
+    `adb shell` joins its argv with plain spaces and hands the result to
+    /system/bin/sh -c on the device for a second, independent parse. The
+    whole script must therefore arrive as ONE argument, which is what
+    this returns.
+
+    Callers remain responsible for `shlex.quote`-ing dynamic values
+    (package names, free text) INSIDE ``command``: that inner quoting is
+    what makes the device's own sh treat them as single arguments, and it
+    is required on both transports. The OUTER quoting that used to live
+    here now belongs to `transport.render_guest_command`, because only
+    the guest path has a shell to defend against.
+    """
+    return AdbInvocation(("shell", command))
 
 
-def install_multiple_cmd(remote_apks: list[str]) -> str:
-    quoted = " ".join(shlex.quote(p) for p in remote_apks)
-    return f"{adb_prefix()} install-multiple -r {quoted}"
+def install_cmd(remote_apk: str) -> AdbInvocation:
+    return AdbInvocation(("install", "-r", remote_apk))
 
 
-def uninstall_cmd(package: str) -> str:
-    return f"{adb_prefix()} uninstall {shlex.quote(package)}"
+def install_multiple_cmd(remote_apks: list[str]) -> AdbInvocation:
+    return AdbInvocation(("install-multiple", "-r", *remote_apks))
 
 
-def launch_cmd(package: str, *, activity: str | None, url: str | None) -> str:
+def uninstall_cmd(package: str) -> AdbInvocation:
+    return AdbInvocation(("uninstall", package))
+
+
+def launch_cmd(package: str, *, activity: str | None, url: str | None) -> AdbInvocation:
     """Three launch forms, resolved in priority order.
 
     A deep link wins over an explicit activity, which wins over monkey.
@@ -110,7 +126,7 @@ def launch_cmd(package: str, *, activity: str | None, url: str | None) -> str:
     return adb_shell(script)
 
 
-def stop_cmd(package: str) -> str:
+def stop_cmd(package: str) -> AdbInvocation:
     """Force-stop ``package``, verifying it actually happened.
 
     `am force-stop` exits 0 unconditionally, including for a package that
@@ -128,11 +144,11 @@ def stop_cmd(package: str) -> str:
     return adb_shell(script)
 
 
-def clear_cmd(package: str) -> str:
+def clear_cmd(package: str) -> AdbInvocation:
     return adb_shell(f"pm clear {shlex.quote(package)}")
 
 
-def list_packages_cmd(*, pattern: str | None, third_party: bool) -> str:
+def list_packages_cmd(*, pattern: str | None, third_party: bool) -> AdbInvocation:
     parts = ["pm list packages"]
     if third_party:
         parts.append("-3")
@@ -141,11 +157,11 @@ def list_packages_cmd(*, pattern: str | None, third_party: bool) -> str:
     return adb_shell(" ".join(parts))
 
 
-def screenshot_cmd(remote_path: str) -> str:
+def screenshot_cmd(remote_path: str) -> AdbInvocation:
     return adb_shell(f"screencap -p {shlex.quote(remote_path)}")
 
 
-def ui_dump_cmd(remote_path: str) -> str:
+def ui_dump_cmd(remote_path: str) -> AdbInvocation:
     return adb_shell(f"uiautomator dump {shlex.quote(remote_path)}")
 
 
@@ -163,22 +179,25 @@ def _logcat_filterspec(*, tag: str | None, priority: str | None) -> list[str]:
     Uppercased here (not just at the CLI layer) because this builder is
     unit-tested directly and must produce the same shape regardless of
     the case the caller passed in.
+
+    UNQUOTED: these used to be `shlex.quote`d here so the guest shell
+    would not glob `*:W` against its working directory. That protection
+    now lives in `transport.render_guest_command`, which quotes every
+    outer argument; returning a quoted token here would ship literal `'`
+    characters to adb on the local transport (see
+    `test_local_argv_keeps_a_glob_intact`).
     """
     if tag is not None:
         level = (priority or "V").upper()
-        return ["-s", shlex.quote(f"{tag}:{level}")]
+        return ["-s", f"{tag}:{level}"]
     if priority is not None:
-        # Quote the `*`: for the plain `adb logcat` form this string is
-        # interpreted by the GUEST shell, which would glob it against the
-        # ssh working directory. A stray file matching `*:W` there would
-        # silently rewrite the filter.
-        return [shlex.quote(f"*:{priority.upper()}")]
+        return [f"*:{priority.upper()}"]
     return []
 
 
 def _logcat_package_cmd(
     package: str, *, follow: bool, lines: int | None, tag: str | None, priority: str | None
-) -> str:
+) -> AdbInvocation:
     """Filter logcat to one package by resolving its pid ON THE DEVICE.
 
     `adb logcat` (the plain protocol form `logcat_cmd` otherwise uses)
@@ -223,7 +242,7 @@ def logcat_cmd(
     tag: str | None = None,
     priority: str | None = None,
     clear: bool = False,
-) -> str:
+) -> AdbInvocation:
     """Dump/follow/filter/clear the device log.
 
     `clear` short-circuits everything else and maps straight to `adb
@@ -238,12 +257,12 @@ def logcat_cmd(
     directly as adb arguments with no device-shell re-parsing hazard.
     """
     if clear:
-        return f"{adb_prefix()} logcat -c"
+        return AdbInvocation(("logcat", "-c"))
     if package is not None:
         return _logcat_package_cmd(
             package, follow=follow, lines=lines, tag=tag, priority=priority
         )
-    parts = [adb_prefix(), "logcat"]
+    parts = ["logcat"]
     if not follow:
         parts.append("-d")
     filterspec = _logcat_filterspec(tag=tag, priority=priority)
@@ -254,12 +273,12 @@ def logcat_cmd(
         # the unfiltered buffer was full of Zygote lines). When a filter is
         # in play, `--lines` must mean the last N MATCHING lines, which
         # needs a device-side pipe rather than the bare protocol form.
-        device = " ".join(["logcat", "-d", *filterspec])
+        device = " ".join(["logcat", "-d", *(shlex.quote(f) for f in filterspec)])
         return adb_shell(f"{device} | tail -n {int(lines)}")
     if lines is not None:
-        parts.append(f"-t {int(lines)}")
+        parts.extend(("-t", str(int(lines))))
     parts.extend(filterspec)
-    return " ".join(parts)
+    return AdbInvocation(tuple(parts))
 
 
 _INPUT_SUBCOMMANDS = {"key": "keyevent"}
@@ -268,7 +287,7 @@ a caller passes in (`key` -> `keyevent`); everything else passes through
 unchanged (`text`, `tap`, `swipe`, ...)."""
 
 
-def input_cmd(kind: str, args: list[str]) -> str:
+def input_cmd(kind: str, args: list[str]) -> AdbInvocation:
     subcommand = _INPUT_SUBCOMMANDS.get(kind, kind)
     quoted = " ".join(shlex.quote(a) for a in args)
     return adb_shell(f"input {subcommand} {quoted}")
@@ -279,6 +298,11 @@ def wait_booted_cmd(timeout_seconds: int) -> str:
 
     Immediately after apply the container is up but Android is still
     booting, so an install would fail on a device that is merely slow.
+
+    Still returns a plain ``str`` (not `AdbInvocation`): it calls
+    `adb_prefix()` twice, once bare and once nested inside a command
+    substitution, which is not an adb-invocation shape at all. Task 3
+    deletes this builder along with `adb_prefix`.
     """
     return (
         f"{adb_prefix()} wait-for-device >/dev/null 2>&1; "

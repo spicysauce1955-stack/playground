@@ -71,8 +71,8 @@ def test_single_device_needs_no_targeting_flag(redroid_lab) -> None:
         on=None, role=None, all_devices=False, user="ubuntu",
     )
     assert diagnostics == []
-    assert [t.vm_name for t in targets] == ["droid1"]
-    assert targets[0].ssh_user == "ubuntu"
+    assert [t.name for t in targets] == ["droid1"]
+    assert targets[0].transport.ssh_user == "ubuntu"
 
 
 def test_unknown_vm_names_the_candidates(redroid_lab) -> None:

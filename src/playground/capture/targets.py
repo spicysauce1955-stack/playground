@@ -14,6 +14,7 @@ slice every capturable VM is an Android device.
 from __future__ import annotations
 
 from playground.android.targets import AndroidTarget
+from playground.android.transport import GuestAdb
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
@@ -165,10 +166,12 @@ def resolve_capture_targets(
             continue
         targets.append(
             AndroidTarget(
-                vm_name=name,
-                ssh_host=vm_status.ssh_host,
-                ssh_port=vm_status.ssh_port or 22,
-                ssh_user=user,
+                name=name,
+                transport=GuestAdb(
+                    ssh_host=vm_status.ssh_host,
+                    ssh_port=vm_status.ssh_port or 22,
+                    ssh_user=user,
+                ),
             )
         )
     return targets, diagnostics

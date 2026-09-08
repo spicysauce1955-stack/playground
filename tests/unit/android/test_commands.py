@@ -35,8 +35,13 @@ def _simulate_device_argv(cmd: str) -> list[str]:
     `adb shell` hands that token to /system/bin/sh -c on the device for a
     second, independent parse. `shlex.split` follows the same POSIX
     quoting rules as `shlex.quote`, so it is an adequate stand-in for both
-    hops in a unit test that has no real shell or device."""
-    guest_tokens = shlex.split(cmd)
+    hops in a unit test that has no real shell or device.
+
+    `str(cmd)` first: builders now return `AdbInvocation`, which renders
+    its own guest string on demand (see its `__str__`) rather than
+    actually being one -- `shlex.split` needs a real string to read from.
+    """
+    guest_tokens = shlex.split(str(cmd))
     device_script = guest_tokens[-1]
     return shlex.split(device_script)
 

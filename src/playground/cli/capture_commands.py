@@ -25,6 +25,7 @@ import typer
 
 from playground.android.runner import TargetResult, run_on_targets
 from playground.android.targets import AndroidTarget
+from playground.android.transport import GuestAdb
 from playground.backend.dispatch import query_status
 from playground.capture.commands import (
     clean_cmd,
@@ -176,8 +177,22 @@ def _resolve(
     return lab, resolved, targets
 
 
+def _require_guest(target: AndroidTarget) -> GuestAdb:
+    """`fetch`'s scp step reaches a device by scp-ing off a guest VM; a
+    USB-attached `LocalAdb` handset has no such guest. `_resolve` only
+    ever builds `GuestAdb` targets today, so this should never actually
+    raise -- see the identical helper in `app_commands.py`.
+    """
+    transport = target.transport
+    if not isinstance(transport, GuestAdb):
+        raise TypeError(
+            f"{target.name!r} has no guest ssh transport (got {transport!r})"
+        )
+    return transport
+
+
 def _echo(result: TargetResult) -> None:
-    prefix = f"[{result.target.vm_name}]"
+    prefix = f"[{result.target.name}]"
     for line in result.stdout.splitlines():
         typer.echo(f"{prefix} {line}")
     for line in result.stderr.splitlines():
@@ -223,7 +238,7 @@ def start_command(
     # fan-out verb in this CLI uses (see `install_command` in
     # app_commands.py).
     for target in targets:
-        if read_session(state_dir, lab_name, target.vm_name) is not None:
+        if read_session(state_dir, lab_name, target.name) is not None:
             _main()._print_diagnostics(
                 [
                     Diagnostic(
@@ -231,20 +246,20 @@ def start_command(
                         severity="error",
                         message=(
                             f"a capture session is already recorded for "
-                            f"{target.vm_name!r} in lab {lab_name!r}"
+                            f"{target.name!r} in lab {lab_name!r}"
                         ),
                         source=SourceLocation(
                             path=str(state_dir / "state" / "capture" / lab_name)
                         ),
                         suggestion=(
                             f"run `playground capture stop --lab {lab_name} --on "
-                            f"{target.vm_name}` first"
+                            f"{target.name}` first"
                         ),
                     )
                 ],
                 err=True,
             )
-            failed.append(target.vm_name)
+            failed.append(target.name)
             continue
         startable.append(target)
 
@@ -254,7 +269,7 @@ def start_command(
     # common case); with --all it serializes. A parallel variant belongs in
     # `android/runner.py`, and only once something needs it.
     results = [
-        run_on_targets([t], start_cmd(t.vm_name), timeout=_START_TIMEOUT)[0]
+        run_on_targets([t], start_cmd(t.name), timeout=_START_TIMEOUT)[0]
         for t in startable
     ]
     for result in results:
@@ -268,8 +283,8 @@ def start_command(
                     state_dir,
                     lab_name,
                     CaptureSession(
-                        vm=result.target.vm_name,
-                        unit=unit_name(result.target.vm_name),
+                        vm=result.target.name,
+                        unit=unit_name(result.target.name),
                         started_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
                         max_file_mb=resolved.capture.max_file_mb,
                         max_files=resolved.capture.max_files,
@@ -288,8 +303,8 @@ def start_command(
                             id="runtime.capture.session_write_failed",
                             severity="error",
                             message=(
-                                f"{result.target.vm_name!r} started capturing "
-                                f"({unit_name(result.target.vm_name)}) but the "
+                                f"{result.target.name!r} started capturing "
+                                f"({unit_name(result.target.name)}) but the "
                                 f"session record could not be written: {exc}"
                             ),
                             source=SourceLocation(
@@ -298,23 +313,23 @@ def start_command(
                             suggestion=(
                                 "the capture IS running -- stop it with "
                                 f"`playground capture stop --lab {lab_name} --on "
-                                f"{result.target.vm_name}`, or inspect it with "
+                                f"{result.target.name}`, or inspect it with "
                                 f"`playground capture status --lab {lab_name} --on "
-                                f"{result.target.vm_name}`"
+                                f"{result.target.name}`"
                             ),
                         )
                     ],
                     err=True,
                 )
-                failed.append(result.target.vm_name)
+                failed.append(result.target.name)
                 continue
             typer.echo(
-                f"[{result.target.vm_name}] capturing — "
+                f"[{result.target.name}] capturing — "
                 f"stop with `playground capture stop --lab {lab_name} "
-                f"--on {result.target.vm_name}`"
+                f"--on {result.target.name}`"
             )
         else:
-            failed.append(result.target.vm_name)
+            failed.append(result.target.name)
     _exit_for_failures(failed, len(targets))
 
 
@@ -342,14 +357,14 @@ def stop_command(
     # see FIX 2 above) prevent stopping a genuinely running capture
     # elsewhere in a --all/--role fan-out.
     for target in targets:
-        if read_session(state_dir, lab_name, target.vm_name) is None:
+        if read_session(state_dir, lab_name, target.name) is None:
             _main()._print_diagnostics(
                 [
                     Diagnostic(
                         id="runtime.capture.not_running",
                         severity="error",
                         message=(
-                            f"no capture session recorded for {target.vm_name!r} "
+                            f"no capture session recorded for {target.name!r} "
                             f"in lab {lab_name!r}"
                         ),
                         source=SourceLocation(
@@ -363,23 +378,23 @@ def stop_command(
                 ],
                 err=True,
             )
-            failed.append(target.vm_name)
+            failed.append(target.name)
             continue
         stoppable.append(target)
 
     for target in stoppable:
         result = run_on_targets(
-            [target], stop_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
+            [target], stop_cmd(target.name), timeout=_DEFAULT_TIMEOUT
         )[0]
         _echo(result)
         if result.ok:
             # Clear only on success: leaving the record in place after a
             # failed stop keeps `fetch` pointed at a session that may
             # still be writing.
-            clear_session(state_dir, lab_name, target.vm_name)
-            typer.echo(f"[{target.vm_name}] stopped")
+            clear_session(state_dir, lab_name, target.name)
+            typer.echo(f"[{target.name}] stopped")
         else:
-            failed.append(target.vm_name)
+            failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
 
@@ -407,17 +422,17 @@ def status_command(
     failed: list[str] = []
     for target in targets:
         result = run_on_targets(
-            [target], status_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
+            [target], status_cmd(target.name), timeout=_DEFAULT_TIMEOUT
         )[0]
         _echo(result)
-        recorded = read_session(state_dir, lab_name, target.vm_name)
+        recorded = read_session(state_dir, lab_name, target.name)
         if recorded is not None:
             typer.echo(
-                f"[{target.vm_name}] session recorded here since "
+                f"[{target.name}] session recorded here since "
                 f"{recorded.started_at}"
             )
         if not result.ok:
-            failed.append(target.vm_name)
+            failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
 
@@ -472,7 +487,7 @@ def fetch_command(
     clean_failed: list[str] = []
 
     for target in targets:
-        destination = artifacts / target.vm_name
+        destination = artifacts / target.name
         destination.mkdir(parents=True, exist_ok=True)
         started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
         # scp's `host:path` operand IS shell-interpreted on the remote
@@ -482,12 +497,13 @@ def fetch_command(
         # "ambiguous target" and one with a backtick or `$(...)` runs on
         # the guest. Only the path half is quoted -- the user@host half
         # must stay bare. Mirrors `_scp_one` in `app_commands.py`.
+        guest = _require_guest(target)
         source = (
-            f"{target.ssh_user}@{target.ssh_host}:"
-            f"{shlex.quote(f'{remote_capture_dir(target.vm_name)}/.')}"
+            f"{guest.ssh_user}@{guest.ssh_host}:"
+            f"{shlex.quote(f'{remote_capture_dir(target.name)}/.')}"
         )
         argv = build_scp_argv(
-            source, str(destination), port=target.ssh_port, recursive=True
+            source, str(destination), port=guest.ssh_port, recursive=True
         )
         try:
             completed = subprocess.run(  # noqa: S603
@@ -507,7 +523,7 @@ def fetch_command(
         # scp's stderr is exactly what `playground runs show` exists to
         # surface later. Written on failure too -- that is the case
         # someone will actually go looking for.
-        log_path = logs_dir / f"fetch-{target.vm_name}.log"
+        log_path = logs_dir / f"fetch-{target.name}.log"
         log_path.write_text(
             f"$ {' '.join(argv)}\n"
             f"exit {code}\n"
@@ -517,7 +533,7 @@ def fetch_command(
 
         steps.append(
             StepResult(
-                name=f"capture-fetch:{target.vm_name}",
+                name=f"capture-fetch:{target.name}",
                 command=list(argv),
                 exit_code=code,
                 log_path=str(log_path),
@@ -526,10 +542,10 @@ def fetch_command(
             )
         )
         if code != 0:
-            typer.echo(f"[{target.vm_name}] fetch failed: {stderr.strip()}", err=True)
-            fetch_failed.append(target.vm_name)
+            typer.echo(f"[{target.name}] fetch failed: {stderr.strip()}", err=True)
+            fetch_failed.append(target.name)
             continue
-        typer.echo(f"[{target.vm_name}] pcaps → {destination}")
+        typer.echo(f"[{target.name}] pcaps → {destination}")
         if clean:
             # Gate on the GUEST, not on the local session record: the
             # record can legitimately be absent while a capture is
@@ -544,7 +560,7 @@ def fetch_command(
             # has already succeeded either way, so the operator's data
             # is safe -- only the guest-side copy is at stake here.
             probe = run_on_targets(
-                [target], is_active_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
+                [target], is_active_cmd(target.name), timeout=_DEFAULT_TIMEOUT
             )[0]
             if probe.stdout.strip() == "active":
                 _main()._print_diagnostics(
@@ -553,36 +569,36 @@ def fetch_command(
                             id="runtime.capture.still_running",
                             severity="error",
                             message=(
-                                f"{target.vm_name!r} is still capturing -- the "
+                                f"{target.name!r} is still capturing -- the "
                                 f"pcaps WERE fetched, but the guest copy was "
                                 f"deliberately left in place rather than "
                                 f"deleted out from under a live tcpdump"
                             ),
                             source=SourceLocation(
-                                path=str(remote_capture_dir(target.vm_name))
+                                path=str(remote_capture_dir(target.name))
                             ),
                             suggestion=(
                                 f"run `playground capture stop --lab {lab_name} "
-                                f"--on {target.vm_name}` before cleaning"
+                                f"--on {target.name}` before cleaning"
                             ),
                         )
                     ],
                     err=True,
                 )
-                clean_failed.append(target.vm_name)
+                clean_failed.append(target.name)
                 continue
             removal = run_on_targets(
-                [target], clean_cmd(target.vm_name), timeout=_DEFAULT_TIMEOUT
+                [target], clean_cmd(target.name), timeout=_DEFAULT_TIMEOUT
             )[0]
             _echo(removal)
             if not removal.ok:
                 typer.echo(
-                    f"[{target.vm_name}] pcaps were fetched successfully, but the "
+                    f"[{target.name}] pcaps were fetched successfully, but the "
                     f"guest-side cleanup failed — the capture directory on the "
                     f"guest still holds them",
                     err=True,
                 )
-                clean_failed.append(target.vm_name)
+                clean_failed.append(target.name)
 
     failed = fetch_failed + clean_failed
     fetched = len(targets) - len(fetch_failed)

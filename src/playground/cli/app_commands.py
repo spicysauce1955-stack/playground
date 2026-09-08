@@ -46,6 +46,7 @@ from playground.android.commands import (
 from playground.android.runner import TargetResult, run_on_targets
 from playground.android.splits import find_base_apk
 from playground.android.targets import AndroidTarget, resolve_targets
+from playground.android.transport import AdbInvocation, GuestAdb, render_guest_command
 from playground.backend.dispatch import query_status
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.ssh.argv import build_scp_argv, build_ssh_argv
@@ -192,7 +193,7 @@ def _resolve(
 
 
 def _echo_target_output(result: TargetResult) -> None:
-    prefix = f"[{result.target.vm_name}]"
+    prefix = f"[{result.target.name}]"
     for line in result.stdout.splitlines():
         typer.echo(f"{prefix} {line}")
     for line in result.stderr.splitlines():
@@ -212,27 +213,48 @@ def _exit_for_failures(failed: list[str], total: int) -> None:
     raise typer.Exit(code=0)
 
 
+def _require_guest(target: AndroidTarget) -> GuestAdb:
+    """`_stream`/`_scp_one`/`_capture_to_local` reach a device by ssh-ing
+    into a guest VM; a USB-attached `LocalAdb` handset has no such guest.
+    `_resolve` only ever builds `GuestAdb` targets today (there is no
+    local-device targeting flag yet), so this should never actually
+    raise -- it exists so a future `LocalAdb` target fails loudly here
+    rather than crashing deep inside scp/ssh argv construction on a
+    missing `.ssh_host`.
+    """
+    transport = target.transport
+    if not isinstance(transport, GuestAdb):
+        raise TypeError(
+            f"{target.name!r} has no guest ssh transport (got {transport!r})"
+        )
+    return transport
+
+
 def _dispatch(
-    targets: list[AndroidTarget], command: str, *, timeout: float = _DEFAULT_TIMEOUT
+    targets: list[AndroidTarget], inv: AdbInvocation, *, timeout: float = _DEFAULT_TIMEOUT
 ) -> None:
-    """Run ``command`` on every target and exit according to the results."""
-    results = run_on_targets(targets, command, timeout=timeout)
+    """Run ``inv`` on every target and exit according to the results."""
+    results = run_on_targets(targets, inv, timeout=timeout)
     for result in results:
         _echo_target_output(result)
-    _exit_for_failures([r.target.vm_name for r in results if not r.ok], len(results))
+    _exit_for_failures([r.target.name for r in results if not r.ok], len(results))
 
 
-def _stream(target: AndroidTarget, command: str) -> None:
-    """Run ``command`` with inherited stdio for `logcat --follow`.
+def _stream(target: AndroidTarget, inv: AdbInvocation) -> None:
+    """Run ``inv`` with inherited stdio for `logcat --follow`.
 
     A single live device only — see `logcat_command`'s guard. Inherits
     stdio (rather than `run_on_targets`' capture) so output streams as it
     is produced instead of waiting for the process to exit.
     """
+    guest = _require_guest(target)
     argv = build_ssh_argv(
-        target.ssh_host, user=target.ssh_user, port=target.ssh_port, command=command
+        guest.ssh_host,
+        user=guest.ssh_user,
+        port=guest.ssh_port,
+        command=render_guest_command(inv),
     )
-    typer.echo(f"[{target.vm_name}] streaming — Ctrl-C to stop")
+    typer.echo(f"[{target.name}] streaming — Ctrl-C to stop")
     try:
         completed = subprocess.run(argv, check=False)  # noqa: S603
     except FileNotFoundError as exc:
@@ -260,24 +282,25 @@ def _scp_one(
     # quoting, a filename with a space is "ambiguous target" and one with
     # a backtick or `$(...)` runs on the guest. Only the path half is
     # quoted -- the user@host half must stay bare.
-    dst = f"{target.ssh_user}@{target.ssh_host}:{shlex.quote(remote_path)}"
-    argv = build_scp_argv(str(local), dst, port=target.ssh_port)
+    guest = _require_guest(target)
+    dst = f"{guest.ssh_user}@{guest.ssh_host}:{shlex.quote(remote_path)}"
+    argv = build_scp_argv(str(local), dst, port=guest.ssh_port)
     try:
         completed = subprocess.run(  # noqa: S603
             argv, capture_output=True, text=True, check=False, timeout=timeout
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        typer.echo(f"[{target.vm_name}] scp failed: {exc}", err=True)
+        typer.echo(f"[{target.name}] scp failed: {exc}", err=True)
         return False
     if completed.returncode != 0:
-        typer.echo(f"[{target.vm_name}] scp failed: {completed.stderr.strip()}", err=True)
+        typer.echo(f"[{target.name}] scp failed: {completed.stderr.strip()}", err=True)
         return False
     return True
 
 
 def _capture_to_local(
     target: AndroidTarget,
-    capture_cmd: str,
+    capture_cmd: AdbInvocation | str,
     device_path: str,
     local_path: Path,
     *,
@@ -343,10 +366,11 @@ def _capture_to_local(
         f"{chain} && [ -s {shlex.quote(guest_tmp)} ] && cat {shlex.quote(guest_tmp)}; "
         f"status=$?; rm -f {shlex.quote(guest_tmp)}; exit $status"
     )
+    guest = _require_guest(target)
     argv = build_ssh_argv(
-        target.ssh_host,
-        user=target.ssh_user,
-        port=target.ssh_port,
+        guest.ssh_host,
+        user=guest.ssh_user,
+        port=guest.ssh_port,
         command=remote_cmd,
         batch=True,
     )
@@ -355,34 +379,34 @@ def _capture_to_local(
             argv, capture_output=True, check=False, timeout=timeout
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        typer.echo(f"[{target.vm_name}] capture failed: {exc}", err=True)
+        typer.echo(f"[{target.name}] capture failed: {exc}", err=True)
         return False
     if completed.returncode != 0:
         stderr = completed.stderr.decode(errors="replace").strip()
-        typer.echo(f"[{target.vm_name}] capture failed: {stderr}", err=True)
+        typer.echo(f"[{target.name}] capture failed: {stderr}", err=True)
         return False
     if not completed.stdout:
         # Belt-and-suspenders on top of the remote `[ -s ... ]` check --
         # never write a zero-byte file and call it a screenshot/dump.
-        typer.echo(f"[{target.vm_name}] capture failed: no data received", err=True)
+        typer.echo(f"[{target.name}] capture failed: no data received", err=True)
         return False
     try:
         local_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        typer.echo(f"[{target.vm_name}] cannot create {local_path.parent}: {exc}", err=True)
+        typer.echo(f"[{target.name}] cannot create {local_path.parent}: {exc}", err=True)
         return False
     if local_path.is_dir():
         typer.echo(
-            f"[{target.vm_name}] {local_path} is a directory, expected a file path",
+            f"[{target.name}] {local_path} is a directory, expected a file path",
             err=True,
         )
         return False
     try:
         local_path.write_bytes(completed.stdout)
     except OSError as exc:
-        typer.echo(f"[{target.vm_name}] failed to write {local_path}: {exc}", err=True)
+        typer.echo(f"[{target.name}] failed to write {local_path}: {exc}", err=True)
         return False
-    typer.echo(f"[{target.vm_name}] wrote {local_path}")
+    typer.echo(f"[{target.name}] wrote {local_path}")
     return True
 
 
@@ -533,11 +557,11 @@ def install_command(
         )[0]
         if not boot.ok:
             typer.echo(
-                f"[{target.vm_name}] Android did not finish booting within "
+                f"[{target.name}] Android did not finish booting within "
                 f"{_BOOT_WAIT_SECONDS}s; not installing",
                 err=True,
             )
-            failed.append(target.vm_name)
+            failed.append(target.name)
             continue
 
         # Stage on the VM's own filesystem, NOT /data/local/tmp: that is an
@@ -554,7 +578,7 @@ def install_command(
         )[0]
         if not mkdir.ok:
             _echo_target_output(mkdir)
-            failed.append(target.vm_name)
+            failed.append(target.name)
             continue
         if not all(
             _scp_one(apk, target, remote_path)
@@ -566,7 +590,7 @@ def install_command(
             run_on_targets(
                 [target], f"rm -rf {shlex.quote(stage_dir)}", timeout=_DEFAULT_TIMEOUT
             )
-            failed.append(target.vm_name)
+            failed.append(target.name)
             continue
         install_command_str = (
             install_multiple_cmd(remote_paths)
@@ -584,7 +608,7 @@ def install_command(
         result = run_on_targets([target], full_command, timeout=_INSTALL_TIMEOUT)[0]
         _echo_target_output(result)
         if not result.ok:
-            failed.append(target.vm_name)
+            failed.append(target.name)
 
     _exit_for_failures(failed, len(targets))
 
@@ -722,9 +746,9 @@ def screenshot_command(
     for target in targets:
         # Fan-out writes <out>/<vm>-<timestamp>.png so concurrent devices
         # cannot collide on one filename.
-        local_path = out / f"{target.vm_name}-{_timestamp()}.png"
+        local_path = out / f"{target.name}-{_timestamp()}.png"
         if not _capture_to_local(target, screenshot_cmd(device_path), device_path, local_path):
-            failed.append(target.vm_name)
+            failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
 
@@ -757,9 +781,9 @@ def ui_dump_command(
         )
     failed: list[str] = []
     for target in targets:
-        local_path = out / f"{target.vm_name}-{_timestamp()}.xml" if multi else out
+        local_path = out / f"{target.name}-{_timestamp()}.xml" if multi else out
         if not _capture_to_local(target, ui_dump_cmd(device_path), device_path, local_path):
-            failed.append(target.vm_name)
+            failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
 
@@ -950,7 +974,7 @@ def push_command(
     for target in targets:
         guest_tmp = f"/tmp/playground-push-{uuid4().hex}-{src.name}"
         if not _scp_one(src, target, guest_tmp):
-            failed.append(target.vm_name)
+            failed.append(target.name)
             continue
         # BUG D: guest_tmp was never removed. Clean it up in the same ssh
         # round trip, after the push attempt, regardless of outcome
@@ -961,7 +985,7 @@ def push_command(
         result = run_on_targets([target], command, timeout=_PUSH_PULL_TIMEOUT)[0]
         _echo_target_output(result)
         if not result.ok:
-            failed.append(target.vm_name)
+            failed.append(target.name)
     _exit_for_failures(failed, len(targets))
 
 
