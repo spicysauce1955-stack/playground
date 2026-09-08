@@ -310,6 +310,20 @@ unchanged (`text`, `tap`, `swipe`, ...)."""
 
 
 def input_cmd(kind: str, args: list[str]) -> AdbInvocation:
+    """`input <kind> <args...>` on the device shell.
+
+    ``kind`` is `shlex.quote`d exactly like ``args``: it is a free-form
+    CLI argument (`playground app input <kind> ...`), it is NOT validated
+    against `_INPUT_SUBCOMMANDS` (an unknown kind passes straight
+    through, deliberately, so a device-side `input` subcommand this repo
+    has never heard of still works), and the string built here is
+    re-parsed by the device's own `sh -c`. Unquoted, `input 'text; id #'`
+    would run `id` on the handset -- the same injection shape
+    `_logcat_package_cmd` was fixed for, and now aimed at a real,
+    possibly-rooted phone rather than a throwaway container. Quoting a
+    well-formed kind (`text`, `keyevent`, `tap`) is a no-op, so the
+    rendered command for every legitimate call is unchanged.
+    """
     subcommand = _INPUT_SUBCOMMANDS.get(kind, kind)
     quoted = " ".join(shlex.quote(a) for a in args)
-    return adb_shell(f"input {subcommand} {quoted}")
+    return adb_shell(f"input {shlex.quote(subcommand)} {quoted}")

@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
 
 
-def _stub_status(resolved, tofu_dir):
+def _stub_status(resolved, tofu_dir, state_dir=None):
     return (
         LabStatus(
             lab=resolved.lab_name,

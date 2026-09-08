@@ -53,8 +53,9 @@ class Binding(StrictModel):
 def lab_devices_dir(state_dir: Path, lab: str) -> Path:
     """The per-lab directory holding one binding per slot.
 
-    A later task scrubs this whole directory, so it and `binding_path`
-    must both derive from here rather than each spelling the path out.
+    `binding_path` derives from here rather than spelling the path out a
+    second time, so anything that ever needs to sweep a lab's bindings
+    wholesale has one place to point at.
     """
     return state_dir / "state" / "devices" / lab
 

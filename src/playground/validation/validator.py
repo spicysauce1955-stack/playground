@@ -42,8 +42,8 @@ Diagnostic IDs:
 - ``config.device.duplicate_name`` (two devices in the same lab share a
   name)
 - ``config.device.name_collides_with_vm`` (a device name matches a VM
-  name in the same lab -- a later task resolves ``--on <name>`` against
-  VMs and devices in one namespace)
+  name in the same lab -- ``--on <name>`` resolves against VMs and
+  devices in ONE namespace, so a collision would target the wrong thing)
 - ``config.device.profile_not_found`` (a ``LabDevice.profile`` names a
   ``DeviceProfile`` that was not loaded)
 """
@@ -361,9 +361,11 @@ def _check_devices(lab: Lab, source: SourceLocation, loaded: LoadedConfig) -> li
     """Reject duplicate device names, device/VM name collisions, and
     devices referencing an undefined ``DeviceProfile``.
 
-    Duplicate/collision checks matter because a later task resolves
-    ``--on <name>`` against VMs and devices in one namespace -- a
-    collision there would silently target the wrong thing. The profile
+    Duplicate/collision checks matter because ``--on <name>`` resolves
+    against VMs and devices in ONE namespace
+    (``android.targets.resolve_targets``, and the same check in
+    ``cli.main.adb_command``) -- a collision there would silently target
+    the wrong thing. The profile
     check matters because the resolver (``config/resolver.py``) trusts
     that every ``LabDevice.profile`` it sees already resolves -- it
     indexes ``loaded.device_profiles`` directly and raises ``KeyError``

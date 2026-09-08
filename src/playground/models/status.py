@@ -39,6 +39,23 @@ class DeviceStatus(StrictModel):
     abi: str | None = None
     rooted: bool | None = None
     last_verified: str | None = None
+    rebind_candidates: list[str] | None = None
+    """Serials of attached handsets that match this slot's selector while
+    the slot's own bound serial is absent -- the cable-swap case.
+
+    Observed state, like ``serial``: it is what a live `adb devices -l`
+    saw, never anything config declared. ``None`` (not ``[]``) when the
+    question does not arise, so `model_dump(exclude_none=True)` leaves
+    every other slot's JSON byte-identical to what it was before this
+    field existed.
+
+    Carrying the fact HERE rather than as a diagnostic out of
+    `query_status` is what lets `status` report a swapped handset without
+    hard-failing (`_exit_on_errors` aborts on any error diagnostic) while
+    `app`/`adb` still refuse to act on the slot with
+    `device.rebind_required` rather than the misleading
+    `device.not_connected`. Nothing in this path ever rebinds: only
+    `apply --rebind` does."""
 
 
 class VmStatus(StrictModel):

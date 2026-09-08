@@ -541,3 +541,111 @@ def test_status_single_lab_json_output_includes_the_warning_diagnostic(tmp_path,
     assert diag["id"] == "device.adb_unavailable"
     assert diag["severity"] == "warning"
     assert diag["message"] == "`adb devices -l` failed: adb not found on PATH"
+
+
+# ---------------------------------------------------------------------------
+# apply --rebind
+# ---------------------------------------------------------------------------
+
+
+def test_apply_without_rebind_refuses_a_swapped_handset(tmp_path, monkeypatch):
+    """The safety property, end to end: the slot is bound to `S1`, `S1` is
+    gone, and a DIFFERENT handset matching the (empty) selector is
+    attached. `apply` must fail with `device.rebind_required` and leave
+    the binding alone -- installing an APK onto the wrong phone because a
+    cable was swapped is the failure this whole mechanism exists to
+    prevent."""
+    monkeypatch.setattr(
+        "playground.cli.main.list_attached",
+        lambda: ([AttachedDevice(serial="S2", state="connected", model="Pixel 7")], []),
+    )
+    monkeypatch.setattr(
+        "playground.devices.adopt.probe_facts",
+        lambda serial: DeviceFacts(serial=serial, model="Pixel 7"),
+    )
+    state_dir = tmp_path / ".playground"
+    write_binding(state_dir, "device-lab", "pixel7", "S1")
+
+    config_dir = _device_lab_config(tmp_path, required=True)
+    result = _invoke_apply(tmp_path, monkeypatch, config_dir)
+
+    assert result.exit_code != 0
+    assert "device.rebind_required" in result.output + result.stderr
+    binding = read_binding(state_dir, "device-lab", "pixel7")
+    assert binding is not None
+    assert binding.serial == "S1"
+
+
+def test_apply_rebind_flag_exists_and_retargets_the_slot(tmp_path, monkeypatch):
+    """`--rebind` is named by `resolve_binding`'s own refusal, so it has to
+    exist on `apply`: before this it was an undefined option and
+    `playground apply <lab> --rebind` failed with "No such option",
+    leaving an operator who swapped a cable permanently stuck."""
+    monkeypatch.setattr(
+        "playground.cli.main.list_attached",
+        lambda: ([AttachedDevice(serial="S2", state="connected", model="Pixel 7")], []),
+    )
+    monkeypatch.setattr(
+        "playground.devices.adopt.probe_facts",
+        lambda serial: DeviceFacts(serial=serial, model="Pixel 7"),
+    )
+    state_dir = tmp_path / ".playground"
+    write_binding(state_dir, "device-lab", "pixel7", "S1")
+
+    config_dir = _device_lab_config(tmp_path, required=True)
+    result = _invoke_apply(tmp_path, monkeypatch, config_dir, "--rebind")
+
+    assert result.exit_code == 0, result.output + result.stderr
+    binding = read_binding(state_dir, "device-lab", "pixel7")
+    assert binding is not None
+    assert binding.serial == "S2"
+
+
+def test_apply_defaults_to_rebind_false(tmp_path, monkeypatch):
+    """Nothing retargets a slot unless the operator asked for it."""
+    seen: list[bool] = []
+
+    def _record_adopt(*args, rebind=False, **kwargs):
+        seen.append(rebind)
+        return ([], [])
+
+    monkeypatch.setattr("playground.cli.main.adopt", _record_adopt)
+    monkeypatch.setattr("playground.cli.main.list_attached", lambda: ([], []))
+
+    config_dir = _device_lab_config(tmp_path, required=False)
+    assert _invoke_apply(tmp_path, monkeypatch, config_dir).exit_code == 0
+    assert _invoke_apply(tmp_path, monkeypatch, config_dir, "--rebind").exit_code == 0
+    assert seen == [False, True]
+
+
+def test_status_human_output_names_a_rebindable_handset(tmp_path, monkeypatch):
+    """`status` reports the swapped-cable case and names the flag, but is
+    itself read-only -- and must not exit non-zero over it, which is why
+    the fact rides on `DeviceStatus` rather than on an error diagnostic."""
+    monkeypatch.setattr(
+        cli_main,
+        "query_status",
+        _stub_status_with_devices(
+            [
+                DeviceStatus(
+                    name="pixel7", state="missing", serial="S1",
+                    rebind_candidates=["S2"],
+                )
+            ]
+        ),
+    )
+    config_dir = _device_lab_config(tmp_path, required=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "status", "device-lab",
+            "--config-dir", str(config_dir),
+            "--tofu-dir", str(tmp_path / "tofu"),
+            "--state-dir", str(tmp_path / ".playground"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output + result.stderr
+    assert "S2" in result.output
+    assert "--rebind" in result.output

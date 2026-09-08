@@ -135,10 +135,11 @@ def record_seen(state_dir: Path, facts: DeviceFacts) -> tuple[RegistryEntry, lis
 
 
 def mark_ignored(state_dir: Path, serial: str) -> None:
-    """Record that the operator declined this device, so a later task's
-    discovery prompt does not offer it again on every poll.
+    """Record that the operator declined this device, so the discovery
+    prompt does not offer it again on every poll.
 
-    No caller exists yet -- that later task is what wires one up. A
+    Called by ``devices.discovery.offer_unknown`` for every device the
+    operator declines (and for every unknown device under ``silent``). A
     serial not yet in the registry is a no-op: there is nothing to mark.
     """
     entries = read_registry(state_dir)

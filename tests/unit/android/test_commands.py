@@ -425,3 +425,30 @@ def test_follow_never_tails() -> None:
     cmd = render_guest_command(logcat_cmd(follow=True, lines=None, tag="X"))
     assert "tail -n" not in cmd
     assert "-d" not in cmd
+
+
+def test_input_kind_is_quoted_like_its_arguments() -> None:
+    """`kind` reaches `input_cmd` as a free-form CLI argument (`playground
+    app input <kind> ...`) and is NOT validated against a known-subcommand
+    list, so unquoted it is an injection point: `input 'text; id #' x`
+    would run `id` on the handset. Same bug class as the `_logcat_package_cmd`
+    injection fixed earlier -- and this path now points at a real,
+    possibly-rooted phone rather than a throwaway container."""
+    cmd = render_guest_command(input_cmd("text; id #", ["hello"]))
+    argv = _simulate_device_argv(cmd)
+    assert argv == ["input", "text; id #", "hello"], (
+        "the metacharacter-bearing kind must survive as ONE literal argument"
+    )
+    # Nothing on the device gets a second parse: no bare `;` or `#`
+    # escapes the quoting on either hop.
+    assert "; id #" not in cmd.replace(shlex.quote("input 'text; id #' hello"), "")
+
+
+def test_input_kind_quoting_leaves_well_formed_kinds_byte_identical() -> None:
+    """Quoting a legitimate kind is a no-op, so the rendered command for
+    every real call is unchanged -- which is why this fix could not have
+    moved a single characterization string."""
+    assert "input text hello" in render_guest_command(input_cmd("text", ["hello"]))
+    assert "input keyevent KEYCODE_HOME" in render_guest_command(
+        input_cmd("key", ["KEYCODE_HOME"])
+    )

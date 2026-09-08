@@ -7,16 +7,9 @@ handset exactly like a VM. Fixtures come from `conftest.py`.
 
 from __future__ import annotations
 
-from playground.android.targets import (
-    android_target_names,
-    resolve_targets,
-)
+from playground.android.targets import resolve_targets
 from playground.android.transport import GuestAdb, LocalAdb
 from playground.models.status import DeviceStatus, LabStatus, VmStatus
-
-
-def test_android_target_names_spans_vms_and_devices(resolved_mixed_lab) -> None:
-    assert android_target_names(resolved_mixed_lab) == ["droid1", "pixel7"]
 
 
 def test_a_connected_device_becomes_a_local_target(resolved_lab_with_device) -> None:
@@ -173,3 +166,43 @@ def test_unknown_on_stays_the_old_id_without_any_device(resolved_mixed_lab) -> N
     )
     assert targets == []
     assert [d.id for d in diagnostics] == ["config.app.unknown_vm"]
+
+
+def test_a_swapped_handset_refuses_with_rebind_required(resolved_lab_with_device) -> None:
+    """`device.not_connected` ("device is not attached") is flatly untrue
+    when a matching handset IS attached under a different serial. The slot
+    must refuse with `device.rebind_required` instead, and the refusal has
+    to name a flag that actually exists -- `--rebind` lives on `apply`,
+    the one verb allowed to retarget a slot."""
+    status = LabStatus(
+        lab="generic-infra", backend="local-libvirt", expected_vms=0, provisioned_vms=0,
+        devices=[
+            DeviceStatus(
+                name="pixel7", state="missing", serial="S1", rebind_candidates=["S2"]
+            )
+        ],
+    )
+    targets, diagnostics = resolve_targets(
+        resolved_lab_with_device, status, on="pixel7", role=None,
+        all_devices=False, user="ubuntu",
+    )
+    assert targets == []
+    assert [d.id for d in diagnostics] == ["device.rebind_required"]
+    assert "S2" in diagnostics[0].message
+    assert "apply generic-infra --rebind" in diagnostics[0].suggestion
+
+
+def test_rebind_required_outranks_the_plain_missing_wording(
+    resolved_lab_with_device,
+) -> None:
+    """A `missing` slot with no rebind candidate keeps the old, correct
+    `device.not_connected` -- the new branch must not swallow it."""
+    status = LabStatus(
+        lab="generic-infra", backend="local-libvirt", expected_vms=0, provisioned_vms=0,
+        devices=[DeviceStatus(name="pixel7", state="missing", serial="S1")],
+    )
+    _targets, diagnostics = resolve_targets(
+        resolved_lab_with_device, status, on="pixel7", role=None,
+        all_devices=False, user="ubuntu",
+    )
+    assert [d.id for d in diagnostics] == ["device.not_connected"]

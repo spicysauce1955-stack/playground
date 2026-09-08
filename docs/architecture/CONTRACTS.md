@@ -615,11 +615,23 @@ guest; fetched to `.playground/runs/<run-id>/artifacts/capture/<vm>/`.
   declares `capabilities.capture: true`, and `redroid-host`'s capture
   capability is meaningless without a Redroid container to attach
   to — `local-vbox`'s `ProviderConfig` declares `redroid: false`
-  because Redroid is unverified there. Targeting also short-circuits on
-  `resolved.backend` before ever asking about capabilities: any lab on
-  `local-vbox` (or any future non-Redroid backend) gets
-  `config.capture.backend_unsupported` naming the two backends that do
-  support it.
+  because Redroid is unverified there.
+- **Capturability is a property of the TARGET, not of `spec.backend`.**
+  An earlier version of `capture/targets.py` short-circuited on
+  `resolved.backend` before asking about capabilities at all and emitted
+  `config.capture.backend_unsupported`; that diagnostic no longer exists
+  anywhere in `src/`, and this doc described it long after it was
+  deleted. The reason it had to go is the physical-handset work: a phone
+  plugged into the machine running a `local-vbox` lab has nothing to do
+  with the backend that lab's VMs use, and a backend allowlist would
+  have refused it for a reason that is not about the target. Each
+  candidate is now checked for its OWN `capture` capability. Physical
+  device slots are still refused, but by name and for the honest reason:
+  naming one with `--on` gives `config.capture.device_unsupported`
+  ("capture from a physical handset ships in Plan 2"), which requires
+  device slots to be recognized candidates first — that is why
+  `resolve_capture_targets` checks `resolved.devices` ahead of every
+  other branch.
 
 ### Two Ubuntu tcpdump defaults that break a fresh guest
 
@@ -736,6 +748,123 @@ works because the pinned image is Android 11. **Android 14+ moved the
 trust store into the Conscrypt APEX**, so raising `redroid_image`'s tag
 past 13 would invalidate that approach entirely. This is a second
 constraint on `redroid_image`, alongside "must stay date-stamped".
+
+## Physical Android devices (`spec.devices`)
+
+A USB-attached handset is a lab target that NO backend provisions. That
+one fact drives every contract below; see
+`docs/superpowers/specs/2026-09-08-physical-android-devices-design.md`
+for the design.
+
+### The device phase in `execute_apply`'s caller, not in a backend
+
+`playground apply` runs adoption (`cli/main.py::_adopt_devices_or_exit`
+-> `devices/adopt.py::adopt`) **after** the backend's `execute_apply`
+returns success, in the CLI layer, for every backend alike. It is not a
+step inside `local_libvirt`/`local_vbox`/`cloud_digitalocean`, because
+none of them creates or destroys a phone — a `local-libvirt` lab may own
+a handset exactly as a `cloud-digitalocean` one may.
+
+Contract of that phase, in order:
+
+- **It only runs when `resolved.devices` is non-empty.** A device-less
+  lab must shell out to `adb` exactly as often as it did before devices
+  existed: never. Two tests pin this
+  (`test_a_device_less_lab_never_touches_adb`, and the apply-side
+  equivalent); treat them as a regression fence, not as coverage
+  padding.
+- Input is `list_attached()` (one `adb devices -l` on the CONTROLLER,
+  never inside a guest) plus the lab's `ResolvedDevice` slots — pure
+  intent, no probed facts, per "config declares intent, state holds
+  facts".
+- Output is a persisted binding per slot under
+  `<state_dir>/state/devices/<lab>/<slot>.json`, plus diagnostics. A
+  serial is never written into a committed lab file, for the same reason
+  a VM IP never is.
+- An absent OPTIONAL handset is a warning (`required: false` ->
+  `state="missing"`); an absent REQUIRED one, an unauthorized one, an
+  unmet `require:`, an ambiguous match, or a rebind-required slot is an
+  error that exits non-zero.
+- **`--rebind` is the only thing in the codebase that retargets a slot**,
+  and it lives on `apply`. Nothing else — not `status`, not `app`, not
+  `adb` — may rebind, and every `device.rebind_required` refusal names
+  `playground apply <lab> --rebind` rather than a bare flag, because
+  naming a flag the current verb does not accept is a dead end (it was
+  one, for a while: the diagnostics named `--rebind` before any command
+  defined it).
+- **Ordering caveat, deliberately unresolved:** adoption runs AFTER the
+  backend apply, so a missing REQUIRED handset fails only once the VMs
+  are already up. Moving it earlier is a real design decision (it would
+  make `apply` probe USB before provisioning anything), not a bug to fix
+  in passing.
+
+### `query_status`'s device half is backend-neutral, read-only, and never binds
+
+`backend/dispatch.py::query_status` routes the VM-shaped half to the
+matching adapter and then fills `LabStatus.devices` itself, via
+`_device_statuses`. Three properties are load-bearing:
+
+1. **Read-only.** It calls `read_binding`, NOT `resolve_binding` — the
+   latter auto-binds and persists an unbound slot with exactly one
+   matching candidate, which is precisely the mutation a status query
+   must never cause. It also does not re-`probe_facts`: facts come from
+   the registry as recorded at the last adoption, so status stays as
+   cheap as any other status query.
+2. **`state_dir` is an input to the ANSWER, not just a place to write.**
+   A slot's binding lives under it, so every device-targeting verb must
+   thread the operator's `--state-dir` through to `query_status`. `app`
+   and `adb` did not, and `playground apply L --state-dir /srv/pg`
+   followed by `playground adb --lab L --on pixel7` therefore reported a
+   plugged-in phone as `device.not_connected` while `status --state-dir
+   /srv/pg` called it connected. This is the recurring "library default
+   wrong for a non-default caller" shape below.
+3. **`device.adb_unavailable` is downgraded to a WARNING here, not
+   dropped.** `list_attached()` returns it as an error, but
+   `query_status` is shared by `status`, `exec`, `cp`, `app`, `adb` and
+   `capture`; propagating an error would hard-fail all of them over a
+   missing `adb` that most of them do not need. Downgrading means every
+   caller must PRINT surviving warnings after `_exit_on_errors` (which
+   only raises on errors) — otherwise a device lab reads as "nothing
+   attached" with no cause named anywhere.
+
+`DeviceStatus.rebind_candidates` is the swapped-cable channel: when the
+bound serial is absent and a DIFFERENT attached handset satisfies the
+slot's selector, `_device_statuses` records those serials (via the pure
+`match_candidates`) and `android/targets.py::device_status_diagnostic`
+turns them into `device.rebind_required`. Carrying the fact on the
+status object rather than as a diagnostic out of `query_status` is what
+lets `playground status` report a swapped cable without `_exit_on_errors`
+aborting the status command itself. Reporting is not binding: the
+persisted binding is untouched by any of this.
+
+### Only three paths ever write under `config/`, and one of them is a note
+
+`config/` is tracked by git; `.gitignore` excludes only `.playground/`.
+So anything that writes a `DeviceProfile` or a note into `config/` puts
+churn in someone's `git status`. Exactly three paths may do it, each an
+explicit human action: answering the discovery prompt, `playground
+device save`, and WRITING a shared note (`device note` creates the
+profile a shared note needs). Everything else — every adb poll, every
+`device list`, every `device note --show`/`--clear` — is read-only. That
+is a contract, not an implementation detail: `note_command` created the
+profile before it looked at which sub-verb was asked for, so a plain
+READ produced a committed file.
+
+**Notes default to the SHARED, committed surface**
+(`config/devices/<name>.md`); `--private` is the gitignored,
+serial-keyed one (`<state_dir>/state/devices/<serial>/notes.md`).
+Because the safe choice is the one behind a flag, the CLI has to say so
+in three places — the `device note` help, the group help, and the
+success line of every shared write — and this paragraph is the third
+place the design names: the docs. Neither surface encrypts anything;
+`--private` only keeps the file out of git and off a teammate's
+machine, and the credential heuristic in `devices/notes.py` is advisory
+(it warns, never refuses — the motivating use case is itself
+credential-shaped). The private surface is keyed by the REAL serial in
+every reader, so a `--private` write against a model-only profile must
+resolve the serial through the registry or refuse
+(`config.device.note_serial_required`): writing it under the profile
+name produced a note that was saved and then permanently invisible.
 
 ## Cross-layer pitfalls (things future-you will hit)
 

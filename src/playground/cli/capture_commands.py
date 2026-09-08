@@ -128,6 +128,7 @@ def _resolve(
     user: str,
     config_dir: Path,
     tofu_dir: Path,
+    state_dir: Path = Path(".playground"),
 ) -> tuple[str, ResolvedLab, list[AndroidTarget]]:
     """Load, validate, default the lab, and pick capturable devices.
 
@@ -164,10 +165,19 @@ def _resolve(
     resolved = cli_main._resolve_lab_or_exit(
         loaded, lab, config_dir, cli_main.OutputFormat.human
     )
-    status, query_diagnostics = query_status(resolved, tofu_dir)
+    # `state_dir` threaded rather than defaulted: `_device_statuses`
+    # reads a device slot's binding from under it, and every capture verb
+    # already takes a `--state-dir` for its own session records — the two
+    # must not silently disagree about which state tree this lab uses.
+    status, query_diagnostics = query_status(resolved, tofu_dir, state_dir)
     cli_main._exit_on_errors(
         query_diagnostics, cli_main.OutputFormat.human, json_errors=False
     )
+    # Warnings pass through `_exit_on_errors` untouched and still have to
+    # be shown -- `device.adb_unavailable`, downgraded by
+    # `_device_statuses`, names the real cause behind a lab whose devices
+    # all read `missing`.
+    cli_main._print_warnings(query_diagnostics)
     targets, target_diagnostics = resolve_capture_targets(
         resolved, status, on=on, role=role, all_devices=all_devices, user=user,
     )
@@ -210,7 +220,7 @@ def start_command(
 ) -> None:
     lab_name, resolved, targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
 
     failed: list[str] = []
@@ -332,7 +342,7 @@ def stop_command(
 ) -> None:
     lab_name, _resolved, targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
 
     failed: list[str] = []
@@ -403,7 +413,7 @@ def status_command(
     """
     lab_name, _resolved, targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     failed: list[str] = []
     for target in targets:
@@ -455,7 +465,7 @@ def fetch_command(
     """
     lab_name, _resolved, targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
 
     run, run_dir = start_run(state_dir / "runs", "capture", lab_name)

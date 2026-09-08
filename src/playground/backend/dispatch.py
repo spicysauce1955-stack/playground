@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 from playground.backend import cloud_digitalocean, local_libvirt, local_vbox
 from playground.devices.adb import list_attached
-from playground.devices.binding import read_binding
+from playground.devices.binding import match_candidates, read_binding
 from playground.devices.registry import read_registry
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
@@ -288,8 +288,22 @@ def _device_statuses(
             continue
         candidate = attached_by_serial.get(binding.serial)
         if candidate is None:
+            # The bound handset is gone. `match_candidates` is PURE (no
+            # filesystem, no adb of its own, and it never writes a
+            # binding), so asking it whether a DIFFERENT attached handset
+            # now satisfies the selector keeps this function read-only
+            # while still telling the truth: reporting `missing` alone
+            # would render a swapped cable as "not attached" while a
+            # matching phone sits on the bus. Only `apply --rebind` acts
+            # on this; every reader merely reports it.
+            rebind = [c.serial for c in match_candidates(device, attached)]
             statuses.append(
-                DeviceStatus(name=device.name, state="missing", serial=binding.serial)
+                DeviceStatus(
+                    name=device.name,
+                    state="missing",
+                    serial=binding.serial,
+                    rebind_candidates=rebind or None,
+                )
             )
             continue
         entry = registry.get(binding.serial)

@@ -77,7 +77,12 @@ def _fail(diagnostic: Diagnostic) -> NoReturn:
 
 device_app = typer.Typer(
     no_args_is_help=True,
-    help="Find, save, and annotate physical Android handsets.",
+    help=(
+        "Find, save, and annotate physical Android handsets. `device note` "
+        "writes to the SHARED surface by default (config/devices/<name>.md, "
+        "tracked by git and committed with the repo); pass --private to keep "
+        "a note under .playground/ on this machine only."
+    ),
 )
 
 ConfigDirOpt = Annotated[
@@ -507,17 +512,118 @@ def show_command(
 # ---------------------------------------------------------------------------
 
 
-def _serial_for_private(device: str, profiles: dict[str, DeviceProfile]) -> str:
-    """The private surface is keyed by serial. `device` may itself be a
-    profile name pinned to a serial -- if so, use that; otherwise `device`
-    is taken to be the serial itself, which is what lets `--private` work
-    with no profile at all."""
+def _serial_for_private(
+    device: str,
+    profiles: dict[str, DeviceProfile],
+    registry: dict[str, RegistryEntry],
+) -> str:
+    """The serial the private surface is keyed by.
+
+    Three cases, in order:
+
+    1. `device` is not a profile name at all -- it IS the serial. That is
+       what lets `--private` work with no profile in existence, which is
+       the whole point of that surface.
+    2. `device` is a profile whose selector pins a serial -- use it.
+    3. `device` is a profile selecting by model alone (or with no `match`
+       at all) -- resolve the serial through the registry, which is every
+       handset this machine has ever seen.
+
+    Case 3 previously fell through to returning the PROFILE NAME as if it
+    were a serial. That wrote `.playground/state/devices/<profile>/notes.md`,
+    a path no reader ever looks at: `adopt._lookup_note` and `_note_for`
+    both key the private surface on the real serial. The note was written
+    successfully and then permanently invisible -- worse than refusing.
+    So an unresolvable or ambiguous case raises `ValueError` (turned into
+    a diagnostic by the caller) rather than inventing a key.
+
+    The registry, not a live `adb`: no `device note` invocation shells
+    out to adb today, and adding a probe here would make writing a note
+    depend on the handset being plugged in.
+    """
     profile = profiles.get(device)
-    if profile is not None and profile.spec.match is not None:
-        serial = profile.spec.match.serial
-        if serial is not None:
-            return serial
-    return device
+    if profile is None:
+        return device
+    match = profile.spec.match
+    if match is not None and match.serial is not None:
+        return match.serial
+    candidates = [
+        serial
+        for serial, entry in registry.items()
+        if device_matches(
+            match,
+            AttachedDevice(serial=serial, state="missing", model=entry.facts.model),
+        )
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise ValueError(
+        f"profile {device!r} pins no serial and {len(candidates)} known "
+        "handsets match its selector, so there is no serial to key a "
+        "private note by"
+    )
+
+
+def _serial_diagnostic(exc: ValueError, state_dir: Path) -> Diagnostic:
+    """`_serial_for_private`'s refusal, as an operator-facing error."""
+    return Diagnostic(
+        id="config.device.note_serial_required",
+        severity="error",
+        message=str(exc),
+        source=SourceLocation(path=str(state_dir / "state" / "devices")),
+        suggestion=(
+            "pass the handset's serial directly (`playground device note "
+            "<serial> --private`); `playground device list` shows the serials "
+            "this machine knows"
+        ),
+    )
+
+
+def _name_required_diagnostic(device: str, config_dir: Path) -> Diagnostic:
+    return Diagnostic(
+        id="config.device.note_name_required",
+        severity="error",
+        message=(
+            f"{device!r} has no DeviceProfile, so there is no shared note to "
+            "read or write; name one with --as <name>"
+        ),
+        source=SourceLocation(path=str(config_dir / "devices")),
+        suggestion="or use --private, which keys on serial and needs no profile",
+    )
+
+
+def _updated_at(path: Path) -> str | None:
+    """The note file's mtime, ISO-8601 UTC, or `None` when there is no
+    file. This is the `updated_at` half of the documented `--json`
+    payload; a note that was never written has no timestamp to report,
+    and inventing "now" would be a lie."""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(mtime, tz=UTC).isoformat(timespec="seconds")
+
+
+def _note_payload(
+    *,
+    device: str,
+    serial: str | None,
+    scope: NoteScope,
+    path: Path,
+    markdown: str | None,
+) -> dict[str, object]:
+    """The `--json` shape the design doc specifies verbatim:
+    `{device, serial, scope, path, markdown, updated_at}`. The body key is
+    `markdown`, NOT `note` -- a consumer written against the spec reads
+    that name."""
+    return {
+        "device": device,
+        "serial": serial,
+        "scope": scope,
+        "path": str(path),
+        "markdown": markdown,
+        "updated_at": _updated_at(path),
+    }
 
 
 def _append_line(existing: str | None, line: str) -> str:
@@ -528,96 +634,198 @@ def _append_line(existing: str | None, line: str) -> str:
     return f"{body}{line}\n"
 
 
-@device_app.command("note", help="Read or write an operator note about a handset.")
+@device_app.command(
+    "note",
+    help=(
+        "Read or write an operator note about a handset. WRITES ARE SHARED "
+        "BY DEFAULT: the note goes to config/devices/<name>.md, which is "
+        "tracked by git and gets committed with the repo, so whoever clones "
+        "it sees the note too. Use --private for a note that stays on this "
+        "machine under .playground/ (gitignored). Neither surface encrypts "
+        "anything; neither is a secret store."
+    ),
+)
 def note_command(
     device: Annotated[str, typer.Argument(help="Profile name or raw serial.")],
-    append: Annotated[str | None, typer.Option("--append")] = None,
-    set_: Annotated[bool, typer.Option("--set", help="Read markdown from stdin.")] = False,
-    show: Annotated[bool, typer.Option("--show")] = False,
-    clear: Annotated[bool, typer.Option("--clear")] = False,
-    as_name: Annotated[str | None, typer.Option("--as", help="Profile to create.")] = None,
-    private: Annotated[bool, typer.Option("--private")] = False,
-    json_out: Annotated[bool, typer.Option("--json")] = False,
+    append: Annotated[
+        str | None,
+        typer.Option(
+            "--append",
+            help="Append one line, keeping whatever the note already says.",
+        ),
+    ] = None,
+    set_: Annotated[
+        bool,
+        typer.Option("--set", help="Replace the note with markdown read from stdin."),
+    ] = False,
+    show: Annotated[
+        bool,
+        typer.Option(
+            "--show", help="Print the note. Read-only: creates and writes nothing."
+        ),
+    ] = False,
+    clear: Annotated[
+        bool,
+        typer.Option("--clear", help="Delete the note file. Creates nothing."),
+    ] = False,
+    as_name: Annotated[
+        str | None,
+        typer.Option(
+            "--as",
+            help=(
+                "Profile name to create when <device> has no DeviceProfile "
+                "yet. Shared notes are keyed by profile name, so naming one "
+                "also writes a committed config/devices/<name>.yaml."
+            ),
+        ),
+    ] = None,
+    private: Annotated[
+        bool,
+        typer.Option(
+            "--private",
+            help=(
+                "Use the private surface instead: "
+                ".playground/state/devices/<serial>/notes.md -- keyed by "
+                "serial, NOT committed to git. Anything sensitive belongs "
+                "here rather than in the shared default."
+            ),
+        ),
+    ] = False,
+    json_out: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help=(
+                "Emit {device, serial, scope, path, markdown, updated_at} as "
+                "JSON instead of human text."
+            ),
+        ),
+    ] = False,
     config_dir: ConfigDirOpt = Path("config"),
     state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
+    """Read or write one handset's note.
+
+    ORDER MATTERS HERE. Every read-only branch (`--show`, `--clear`, and
+    the bare no-flag display) runs BEFORE anything may create a profile:
+    the spec allows exactly three paths to write under `config/` -- the
+    discovery prompt, `device save`, and WRITING a shared note -- so that
+    polling adb or reading a note never puts churn in `git status`. An
+    earlier version created `config/devices/<name>.yaml` before it had
+    even looked at which sub-verb was asked for, so `--show` and
+    `--clear` both created a committed file.
+    """
     scope: NoteScope = "private" if private else "shared"
     profiles = _device_profiles(config_dir)
+    registry = read_registry(state_dir)
 
-    name: str | None
-    serial: str | None
+    if as_name is not None and not as_name.strip():
+        # `--as ""` used to reach `_write_profile` and create files
+        # literally named `.yaml` and `.md`.
+        _fail(
+            Diagnostic(
+                id="config.device.note_name_required",
+                severity="error",
+                message="--as needs a non-empty profile name",
+                source=SourceLocation(path=str(config_dir / "devices")),
+                suggestion="pass --as <name>, e.g. --as my-pixel",
+            )
+        )
+    as_name = as_name.strip() if as_name is not None else None
+
+    writes_body = set_ or append is not None
+
+    name: str | None = None
+    serial: str | None = None
+    display_serial: str | None
     if scope == "private":
-        name = None
-        serial = _serial_for_private(device, profiles)
+        try:
+            serial = _serial_for_private(device, profiles, registry)
+        except ValueError as exc:
+            _fail(_serial_diagnostic(exc, state_dir))
+        display_serial = serial
     else:
         name = device if device in profiles else as_name
-        if name is None:
-            if _is_interactive():
-                name = typer.prompt("No DeviceProfile named that -- name one to create")
-            else:
-                _fail(
-                    Diagnostic(
-                        id="config.device.note_name_required",
-                        severity="error",
-                        message=(
-                            f"{device!r} has no DeviceProfile, so there is no shared "
-                            "note to write; name one with --as <name>"
-                        ),
-                        source=SourceLocation(path=str(config_dir / "devices")),
-                        suggestion=(
-                            "or use --private, which keys on serial and needs no profile"
-                        ),
-                    )
-                )
-        if name not in profiles:
-            # Writing a note is the explicit human action that authorises
-            # this `config/` write -- the third and last path allowed to
-            # create a profile, alongside the discovery prompt and
-            # `device save`. See the module + `_write_profile` docstrings.
-            _write_profile(config_dir, name, device)
-        serial = None
+        if name is None and writes_body and _is_interactive():
+            # Only a WRITE may prompt: the prompt exists to name a profile
+            # that is about to be created, and a read has nothing to
+            # create. Whitespace is stripped so the answer cannot become
+            # a `.yaml`-named file either.
+            name = typer.prompt(
+                "No DeviceProfile named that -- name one to create"
+            ).strip()
+        if not name:
+            _fail(_name_required_diagnostic(device, config_dir))
+        _, display_serial = _resolve_identity(device, profiles, registry)
 
-    if clear:
+    def _path() -> Path:
         try:
-            path = note_path(
+            return note_path(
                 scope, config_dir=config_dir, state_dir=state_dir, name=name, serial=serial
             )
         except ValueError as exc:
             _fail(_scope_key_diagnostic(exc, config_dir))
-        if path.is_file():
+
+    def _read() -> str | None:
+        try:
+            return read_note(
+                scope, config_dir=config_dir, state_dir=state_dir, name=name, serial=serial
+            )
+        except ValueError as exc:
+            _fail(_scope_key_diagnostic(exc, config_dir))
+
+    if clear:
+        path = _path()
+        existed = path.is_file()
+        if existed:
             path.unlink()
+        if json_out:
+            _main()._print_json(
+                _note_payload(
+                    device=device,
+                    serial=display_serial,
+                    scope=scope,
+                    path=path,
+                    markdown=None,
+                )
+            )
+        elif existed:
             typer.echo(f"note cleared: {path}")
         else:
             typer.echo(f"no note to clear at {path}")
         return
 
-    if set_:
-        body = sys.stdin.read()
-    elif append is not None:
-        try:
-            existing = read_note(
-                scope, config_dir=config_dir, state_dir=state_dir, name=name, serial=serial
-            )
-        except ValueError as exc:
-            _fail(_scope_key_diagnostic(exc, config_dir))
-        body = _append_line(existing, append)
-    else:
+    if not writes_body:
         # --show, or no action flag at all: read-only display. This is an
         # intended note-body display path, same as `device show` -- never
-        # echoed as part of a diagnostic or log line.
-        try:
-            current = read_note(
-                scope, config_dir=config_dir, state_dir=state_dir, name=name, serial=serial
-            )
-        except ValueError as exc:
-            _fail(_scope_key_diagnostic(exc, config_dir))
+        # echoed as part of a diagnostic or log line. Nothing on this
+        # branch touches the filesystem.
+        current = _read()
         if json_out:
-            _main()._print_json({"scope": scope, "note": current})
+            _main()._print_json(
+                _note_payload(
+                    device=device,
+                    serial=display_serial,
+                    scope=scope,
+                    path=_path(),
+                    markdown=current,
+                )
+            )
         elif current:
             typer.echo(current)
         else:
             typer.echo("(no note recorded yet)")
         return
+
+    if scope == "shared" and name not in profiles:
+        # Writing a note is the explicit human action that authorises this
+        # `config/` write -- the third and last path allowed to create a
+        # profile, alongside the discovery prompt and `device save`. See
+        # the module + `_write_profile` docstrings. It happens HERE, after
+        # every read-only branch has already returned.
+        _write_profile(config_dir, name, device)
+
+    body = sys.stdin.read() if set_ else _append_line(_read(), append or "")
 
     try:
         path, note_diagnostics = write_note(
@@ -633,9 +841,29 @@ def note_command(
     if note_diagnostics:
         _main()._print_diagnostics(note_diagnostics)
     if json_out:
-        _main()._print_json({"scope": scope, "path": str(path)})
+        _main()._print_json(
+            _note_payload(
+                device=device,
+                serial=display_serial,
+                scope=scope,
+                path=path,
+                markdown=body,
+            )
+        )
+    elif scope == "shared":
+        # Said on every successful write, not only in --help: with shared
+        # as the default, the safe choice is the one behind a flag, and
+        # the operator has to know which one they just took.
+        typer.echo(f"note written to {path}")
+        typer.echo(
+            "  this file is SHARED: tracked by git and committed with the "
+            "repo -- use --private to keep a note on this machine only"
+        )
     else:
         typer.echo(f"note written to {path}")
+        typer.echo(
+            "  private: stays under .playground/ (gitignored), never committed"
+        )
 
 
 def _scope_key_diagnostic(exc: ValueError, config_dir: Path) -> Diagnostic:

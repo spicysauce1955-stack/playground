@@ -62,7 +62,7 @@ def _simulate_device_argv(cmd: str) -> list[str]:
     return shlex.split(device_script)
 
 
-def _stub_status(resolved, tofu_dir):
+def _stub_status(resolved, tofu_dir, state_dir=None):
     return (
         LabStatus(
             lab=resolved.lab_name,
@@ -1104,3 +1104,110 @@ def test_ensure_out_directory_creates_a_missing_directory(tmp_path) -> None:
     out_dir = tmp_path / "fresh" / "nested"
     app_commands._ensure_out_directory(out_dir, why="screenshot")
     assert out_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# --state-dir threading and status warnings (device-aware plumbing)
+# ---------------------------------------------------------------------------
+
+
+def test_app_threads_state_dir_into_query_status(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """`query_status`'s device half reads a slot's binding from
+    `state_dir`, so an `app` verb that never passed one reported an
+    attached handset as `device.not_connected` for a lab applied with
+    `--state-dir /srv/pg`, while `status --state-dir /srv/pg` called the
+    same handset connected."""
+    seen: list[object] = []
+
+    def _recording_status(resolved, tofu_dir, state_dir=None):
+        seen.append(state_dir)
+        return _stub_status(resolved, tofu_dir, state_dir)
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _recording_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["app", "list", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / "srv-pg")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [tmp_path / "srv-pg"]
+
+
+def test_app_state_dir_defaults_to_dot_playground(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """Same default every other command uses, so the common case is
+    unchanged."""
+    seen: list[object] = []
+
+    def _recording_status(resolved, tofu_dir, state_dir=None):
+        seen.append(state_dir)
+        return _stub_status(resolved, tofu_dir, state_dir)
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _recording_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["app", "list", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [Path(".playground")]
+
+
+def test_app_prints_the_downgraded_adb_unavailable_warning(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """`_device_statuses` downgrades `device.adb_unavailable` to a warning
+    so one missing `adb` cannot hard-fail every `query_status` caller;
+    `app` then dropped it, so `app list` on an adb-less machine said only
+    "device 'pixel7' is not attached" and never mentioned the real
+    cause."""
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    warning = Diagnostic(
+        id="device.adb_unavailable",
+        severity="warning",
+        message="`adb devices -l` failed: adb not found on PATH",
+        source=SourceLocation(path="adb"),
+    )
+
+    def _warning_status(resolved, tofu_dir, state_dir=None):
+        status, _ = _stub_status(resolved, tofu_dir, state_dir)
+        return status, [warning]
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _warning_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["app", "list", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    output = result.output + result.stderr
+    assert "device.adb_unavailable" in output
+    assert "not found on PATH" in output

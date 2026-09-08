@@ -23,7 +23,6 @@ from playground.models.status import DeviceStatus, LabStatus
 
 __all__ = [
     "AndroidTarget",
-    "android_target_names",
     "android_vm_names",
     "device_status_diagnostic",
     "resolve_targets",
@@ -35,29 +34,49 @@ def android_vm_names(resolved: ResolvedLab) -> list[str]:
     return [vm.name for vm in resolved.vms if vm.capabilities.get("redroid")]
 
 
-def android_target_names(resolved: ResolvedLab) -> list[str]:
-    """Redroid VM names, then device slot names, both in lab order.
-
-    The two populations are simply concatenated: a device slot has no
-    `redroid` capability to check, and is always an Android target by
-    virtue of `kind: android` (the only kind `ResolvedDevice` supports
-    today).
-    """
-    return android_vm_names(resolved) + [device.name for device in resolved.devices]
-
-
 def device_status_diagnostic(
-    name: str, device_status: DeviceStatus, source: SourceLocation
+    name: str,
+    device_status: DeviceStatus,
+    source: SourceLocation,
+    *,
+    lab: str | None = None,
 ) -> Diagnostic:
     """Explain why an attached-but-unusable device slot isn't a target.
 
     `unauthorized` gets its own id naming the RSA-prompt remedy -- it is
     the most common real-world failure and "not reachable" would send an
-    operator hunting for a network problem that doesn't exist. Every
-    other non-`connected` state (and a `connected` state missing its
-    serial, which should not happen but is not trusted blindly) falls
+    operator hunting for a network problem that doesn't exist.
+
+    `rebind_candidates` (a bound serial that is gone while a DIFFERENT
+    attached handset matches the slot's selector -- the swapped-cable
+    case) gets `device.rebind_required`, because "device is not attached"
+    would be flatly untrue with a matching phone on the bus. The
+    suggestion names `playground apply --rebind` rather than a bare
+    `--rebind`: that flag lives on `apply`, which is the one verb allowed
+    to retarget a slot, and naming a flag the current verb does not
+    accept is exactly the dead-end this diagnostic exists to avoid.
+
+    Every other non-`connected` state (and a `connected` state missing
+    its serial, which should not happen but is not trusted blindly) falls
     back to the generic `device.not_connected`.
     """
+    if device_status.rebind_candidates:
+        found = ", ".join(device_status.rebind_candidates)
+        lab_name = lab or "<lab>"
+        return Diagnostic(
+            id="device.rebind_required",
+            severity="error",
+            message=(
+                f"device {name!r} is bound to serial {device_status.serial!r}, "
+                f"which is not attached, but a different handset matching its "
+                f"selector is ({found})"
+            ),
+            source=source,
+            suggestion=(
+                f"run `playground apply {lab_name} --rebind` to point this slot "
+                "at the attached handset; playground never retargets silently"
+            ),
+        )
     if device_status.state == "unauthorized":
         return Diagnostic(
             id="device.unauthorized",
@@ -193,7 +212,11 @@ def resolve_targets(
                 name=name, state="missing"
             )
             if device_status.state != "connected" or not device_status.serial:
-                diagnostics.append(device_status_diagnostic(name, device_status, source))
+                diagnostics.append(
+                    device_status_diagnostic(
+                        name, device_status, source, lab=resolved.lab_name
+                    )
+                )
                 continue
             targets.append(
                 AndroidTarget(name=name, transport=LocalAdb(device_status.serial))

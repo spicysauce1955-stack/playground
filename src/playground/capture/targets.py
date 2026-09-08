@@ -30,23 +30,12 @@ from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
 from playground.models.status import LabStatus
 
-__all__ = ["capture_target_names", "capture_vm_names", "resolve_capture_targets"]
+__all__ = ["capture_vm_names", "resolve_capture_targets"]
 
 
 def capture_vm_names(resolved: ResolvedLab) -> list[str]:
     """VMs whose role declares the `capture` capability, in lab order."""
     return [vm.name for vm in resolved.vms if vm.capabilities.get("capture")]
-
-
-def capture_target_names(resolved: ResolvedLab) -> list[str]:
-    """Capturable VM names, then every device slot name, in lab order.
-
-    Device slots are listed here even though none of them are ever
-    capturable in this slice -- naming one with `--on` must produce
-    `config.capture.device_unsupported`, not `config.capture.unknown_vm`,
-    which means it has to be a recognized candidate first.
-    """
-    return capture_vm_names(resolved) + [device.name for device in resolved.devices]
 
 
 def resolve_capture_targets(

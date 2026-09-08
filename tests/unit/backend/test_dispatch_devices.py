@@ -282,3 +282,104 @@ def test_registry_none_model_does_not_beat_a_live_reported_model(
     status, _diagnostics = dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
 
     assert status.devices[0].model == "Pixel 7"
+
+
+def test_a_swapped_handset_is_reported_as_rebindable_not_merely_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """The cable-swap case: the bound serial is gone, but a DIFFERENT
+    attached handset satisfies the slot's selector.
+
+    Reporting plain `missing` here is what made `app`/`adb` say "device
+    'pixel7' is not attached" while a matching phone sat on the USB bus.
+    `rebind_candidates` carries the fact so the device-targeting verbs can
+    raise `device.rebind_required` instead.
+    """
+    write_binding(tmp_path, "device-lab", "pixel7", "S1")
+    monkeypatch.setattr(
+        dispatch,
+        "list_attached",
+        lambda: ([AttachedDevice(serial="S2", state="connected", model="Pixel 7")], []),
+    )
+    monkeypatch.setattr(dispatch.local_libvirt, "query_status", _stub_vm_status)
+
+    resolved = _resolved_device_lab(tmp_path)
+    status, diagnostics = dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
+
+    assert status.devices == [
+        DeviceStatus(
+            name="pixel7", state="missing", serial="S1", rebind_candidates=["S2"]
+        )
+    ]
+    # Status stays clean of ERROR diagnostics: `_exit_on_errors` would
+    # otherwise abort `playground status` itself over a swapped cable.
+    assert [d for d in diagnostics if d.severity == "error"] == []
+
+
+def test_reporting_a_rebind_candidate_never_rebinds(tmp_path, monkeypatch) -> None:
+    """The safety property: report, do not bind. The persisted binding
+    must still name the ORIGINAL serial after a status query saw a
+    different matching handset."""
+    write_binding(tmp_path, "device-lab", "pixel7", "S1")
+    monkeypatch.setattr(
+        dispatch,
+        "list_attached",
+        lambda: ([AttachedDevice(serial="S2", state="connected", model="Pixel 7")], []),
+    )
+    monkeypatch.setattr(dispatch.local_libvirt, "query_status", _stub_vm_status)
+
+    resolved = _resolved_device_lab(tmp_path)
+    dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
+
+    binding = read_binding(tmp_path, "device-lab", "pixel7")
+    assert binding is not None
+    assert binding.serial == "S1"
+
+
+def test_a_non_matching_attached_handset_is_not_a_rebind_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    """A slot whose selector pins a serial is not rebindable to some
+    unrelated phone that happens to be plugged in."""
+    config_dir = tmp_path / "config"
+    shutil.copytree(CONFIG_DIR, config_dir)
+    (config_dir / "labs" / "pinned-lab.yaml").write_text(
+        dedent(
+            """
+            apiVersion: playground/v1
+            kind: Lab
+            metadata:
+              name: pinned-lab
+            spec:
+              backend: local-libvirt
+              networks:
+                - name: lab-net
+                  profile: nat
+                  cidr: 10.89.0.0/24
+              vms:
+                - name: node1
+                  role: generic-node
+                  networks: [lab-net]
+              devices:
+                - name: pixel7
+                  kind: android
+                  match:
+                    serial: S1
+            """
+        ).lstrip("\n")
+    )
+    loaded, diagnostics = load_config(config_dir)
+    assert diagnostics == []
+    resolved = resolve_lab(loaded, "pinned-lab")
+
+    write_binding(tmp_path, "pinned-lab", "pixel7", "S1")
+    monkeypatch.setattr(
+        dispatch,
+        "list_attached",
+        lambda: ([AttachedDevice(serial="S9", state="connected", model="Pixel 7")], []),
+    )
+    monkeypatch.setattr(dispatch.local_libvirt, "query_status", _stub_vm_status)
+
+    status, _diagnostics = dispatch.query_status(resolved, tmp_path / "tofu", tmp_path)
+
+    assert status.devices[0].rebind_candidates is None

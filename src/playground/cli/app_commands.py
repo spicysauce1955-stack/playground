@@ -132,6 +132,18 @@ ConfigDirOpt = Annotated[
 TofuDirOpt = Annotated[
     Path, typer.Option("--tofu-dir", help="OpenTofu working directory.")
 ]
+StateDirOpt = Annotated[
+    Path,
+    typer.Option(
+        "--state-dir",
+        help=(
+            "Where generated state lives. Defaults to `.playground/`. Must "
+            "match the `apply` that adopted a device — a handset's binding "
+            "is read from here, so a mismatched state dir reports a "
+            "plugged-in device as not connected."
+        ),
+    ),
+]
 
 
 def _resolve(
@@ -143,6 +155,7 @@ def _resolve(
     user: str,
     config_dir: Path,
     tofu_dir: Path,
+    state_dir: Path = Path(".playground"),
 ) -> list[AndroidTarget]:
     """Shared preamble: load, validate, default the lab, and pick devices.
 
@@ -185,10 +198,22 @@ def _resolve(
     # Backend-neutral live status, same call `exec`/`adb`/`cp` use — vbox is
     # a 127.0.0.1 NAT port-forward, cloud a public IP, libvirt a guest IP,
     # all uniform via VmStatus.ssh_host / ssh_port.
-    status, query_diagnostics = query_status(resolved, tofu_dir)
+    #
+    # `state_dir` is threaded rather than left to `query_status`'s own
+    # default: a device slot's binding is read from under it, so an
+    # `apply --state-dir /srv/pg` followed by a default-state-dir `app`
+    # verb would report an attached handset as `device.not_connected`.
+    status, query_diagnostics = query_status(resolved, tofu_dir, state_dir)
     cli_main._exit_on_errors(
         query_diagnostics, cli_main.OutputFormat.human, json_errors=False
     )
+    # `_exit_on_errors` only raises on errors; the WARNINGS it lets
+    # through are the whole point here. `_device_statuses` downgrades
+    # `device.adb_unavailable` to a warning so one missing `adb` cannot
+    # hard-fail every verb that queries status — dropping it instead
+    # would make `app list` say "device 'pixel7' is not attached" on a
+    # machine that simply has no adb installed.
+    cli_main._print_warnings(query_diagnostics)
 
     targets, target_diagnostics = resolve_targets(
         resolved, status, on=on, role=role, all_devices=all_devices, user=user,
@@ -403,7 +428,7 @@ def _capture_to_local(
     capture_group = f"{{ {capture_cmd_str}; }}"
     # `render_guest_command(pull_cmd(...))`, not a hand-built `{prefix}
     # pull ...` string -- every adb invocation in this module goes
-    # through a real builder now (Task 4). Byte-identical to the old
+    # through a real builder now. Byte-identical to the old
     # string: neither `device_path` nor `guest_tmp` has shell
     # metacharacters in practice, but even if one did, this is the exact
     # quoting `render_guest_command` already applies everywhere else.
@@ -615,6 +640,7 @@ def install_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     if not path.exists():
         _fail(
@@ -690,7 +716,7 @@ def install_command(
 
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
 
     failed: list[str] = []
@@ -760,10 +786,11 @@ def uninstall_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, uninstall_cmd(package))
 
@@ -786,6 +813,7 @@ def launch_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     if url is not None and activity is not None:
         _fail(
@@ -798,7 +826,7 @@ def launch_command(
         )
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, launch_cmd(package, activity=activity, url=url))
 
@@ -813,10 +841,11 @@ def stop_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, stop_cmd(package))
 
@@ -831,10 +860,11 @@ def clear_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, clear_cmd(package))
 
@@ -854,10 +884,11 @@ def list_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, list_packages_cmd(pattern=pattern, third_party=third_party))
 
@@ -872,10 +903,11 @@ def screenshot_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _ensure_out_directory(out, why="screenshot (one PNG per matched device)")
     device_path = "/sdcard/playground-screenshot.png"
@@ -905,10 +937,11 @@ def ui_dump_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     device_path = "/sdcard/playground-ui-dump.xml"
     multi = len(targets) > 1
@@ -980,6 +1013,7 @@ def logcat_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     # `--clear` is a distinct operation (wipe, don't read) that ignores
     # every other logcat flag by construction (`logcat_cmd` short-circuits
@@ -1037,7 +1071,7 @@ def logcat_command(
         )
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     if follow and len(targets) > 1:
         _fail(
@@ -1074,10 +1108,11 @@ def input_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, input_cmd(kind, args or []))
 
@@ -1093,6 +1128,7 @@ def push_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     if not src.is_file():
         _fail(
@@ -1105,7 +1141,7 @@ def push_command(
         )
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     failed: list[str] = []
     for target in targets:
@@ -1141,10 +1177,11 @@ def pull_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     if len(targets) > 1:
         _fail(
@@ -1192,6 +1229,7 @@ def shell_command(
     user: UserOpt = "ubuntu",
     config_dir: ConfigDirOpt = Path("config"),
     tofu_dir: TofuDirOpt = Path("tofu"),
+    state_dir: StateDirOpt = Path(".playground"),
 ) -> None:
     command_args = list(ctx.args)
     if not command_args:
@@ -1206,6 +1244,6 @@ def shell_command(
     remote_command = " ".join(shlex.quote(arg) for arg in command_args)
     targets = _resolve(
         lab=lab, on=on, role=role, all_devices=all_devices, user=user,
-        config_dir=config_dir, tofu_dir=tofu_dir,
+        config_dir=config_dir, tofu_dir=tofu_dir, state_dir=state_dir,
     )
     _dispatch(targets, adb_shell(remote_command))

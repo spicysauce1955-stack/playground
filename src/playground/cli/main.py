@@ -610,6 +610,7 @@ def _adopt_devices_or_exit(
     config_dir: Path,
     loaded: LoadedConfig,
     output: OutputFormat,
+    rebind: bool = False,
 ) -> list[Diagnostic]:
     """Adopt every device slot ``resolved`` declares, then offer to save a
     profile for any other attached-but-unknown handset.
@@ -623,9 +624,17 @@ def _adopt_devices_or_exit(
     own list otherwise, so success-path warnings (an absent OPTIONAL
     handset) are printed once, together with everything else, at the
     end of `apply_command` rather than here.
+
+    ``rebind`` is `apply --rebind`, and it is the ONLY way a slot ever
+    retargets: `adopt` refuses a slot whose bound serial has been
+    replaced by a different matching handset unless the operator passes
+    it explicitly. Every `device.rebind_required` diagnostic in the
+    codebase names this flag, so it has to exist on the verb they name.
     """
     attached, adb_diagnostics = list_attached()
-    _, adopt_diagnostics = adopt(state_dir, config_dir, lab, resolved.devices, attached)
+    _, adopt_diagnostics = adopt(
+        state_dir, config_dir, lab, resolved.devices, attached, rebind=rebind
+    )
     device_diagnostics = [*adb_diagnostics, *adopt_diagnostics]
     _exit_on_errors(device_diagnostics, output, json_errors=False)
 
@@ -689,6 +698,18 @@ def apply_command(
             ),
         ),
     ] = False,
+    rebind: Annotated[
+        bool,
+        typer.Option(
+            "--rebind",
+            help=(
+                "Re-point a device slot at a different attached handset that "
+                "matches its selector. Playground never retargets a slot "
+                "silently — without this flag a swapped handset fails with "
+                "`device.rebind_required`."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Apply ``lab``: render inputs, run tofu apply, render inventory, run Ansible."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
@@ -735,6 +756,7 @@ def apply_command(
             _adopt_devices_or_exit(
                 resolved=resolved, lab=lab, state_dir=state_dir,
                 config_dir=config_dir, loaded=loaded, output=output,
+                rebind=rebind,
             )
         )
 
@@ -1070,6 +1092,12 @@ def exec_command(
     # ssh_port are uniform across all three backends.
     status, query_diagnostics = query_status(resolved, tofu_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+    # A warning survives `_exit_on_errors` and must still reach the
+    # operator: with no `adb` on this machine `_device_statuses`
+    # downgrades `device.adb_unavailable` to one, and dropping it here
+    # is what makes a device lab read as "nothing attached" for a
+    # reason nothing on screen names.
+    _print_warnings(query_diagnostics)
 
     vm_status = next((v for v in status.vms if v.name == on), None)
     ssh_host = vm_status.ssh_host if vm_status else None
@@ -1168,6 +1196,17 @@ def adb_command(
         Path,
         typer.Option("--tofu-dir", help="OpenTofu working directory."),
     ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help=(
+                "Where generated state lives. Defaults to `.playground/`. "
+                "Must match the `apply` that adopted the device — the "
+                "slot's binding is read from here."
+            ),
+        ),
+    ] = Path(".playground"),
 ) -> None:
     # ADB has NO authentication, which is why this is a tunnel and not a
     # firewall rule: the cloud backend deliberately opens port 22 only.
@@ -1232,8 +1271,17 @@ def adb_command(
             json_errors=False,
         )
 
-    status, query_diagnostics = query_status(resolved, tofu_dir)
+    # `state_dir` is threaded (rather than left to `query_status`'s own
+    # default) because a device slot's binding lives under it: an `apply
+    # --state-dir /srv/pg` followed by a default-state-dir `adb` would
+    # otherwise report a plugged-in handset as not connected.
+    status, query_diagnostics = query_status(resolved, tofu_dir, state_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+    # Warnings survive `_exit_on_errors` (it only raises on errors) and
+    # must still be shown: `device.adb_unavailable`, downgraded by
+    # `_device_statuses`, is the difference between "the handset is
+    # unplugged" and "this machine has no adb at all".
+    _print_warnings(query_diagnostics)
 
     if on in device_names:
         # A handset needs no ssh tunnel -- adb already reaches it directly
@@ -1248,7 +1296,7 @@ def adb_command(
             device_status = DeviceStatus(name=on, state="missing")
         if device_status.state != "connected" or not device_status.serial:
             _exit_with_diagnostic(
-                device_status_diagnostic(on, device_status, source),
+                device_status_diagnostic(on, device_status, source, lab=lab),
                 OutputFormat.human,
                 json_errors=False,
             )
@@ -1501,6 +1549,12 @@ def cp_command(
     # all uniform via VmStatus.ssh_host / ssh_port.
     status, query_diagnostics = query_status(resolved, tofu_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+    # A warning survives `_exit_on_errors` and must still reach the
+    # operator: with no `adb` on this machine `_device_statuses`
+    # downgrades `device.adb_unavailable` to one, and dropping it here
+    # is what makes a device lab read as "nothing attached" for a
+    # reason nothing on screen names.
+    _print_warnings(query_diagnostics)
 
     vm_status = next((v for v in status.vms if v.name == remote.host), None)
     ssh_host = vm_status.ssh_host if vm_status else None
@@ -1670,6 +1724,15 @@ def _render_status_human(status: LabStatus) -> None:
                 f"  {marker} {device.name}  state={device.state}  "
                 f"serial={serial}  model={model}"
             )
+            if device.rebind_candidates:
+                # Reported, never acted on: `status` is read-only and
+                # nothing here rebinds. Naming `apply --rebind` is what
+                # keeps a swapped cable from reading as "phone missing".
+                found = ", ".join(device.rebind_candidates)
+                typer.echo(
+                    f"      a different matching handset is attached ({found}) — "
+                    f"re-run `playground apply {status.lab} --rebind` to use it"
+                )
 
 
 @app.command("destroy")
