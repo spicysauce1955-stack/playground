@@ -72,3 +72,29 @@ def test_credential_heuristic_hits_and_misses():
     assert looks_like_credentials("password: hunter2")
     assert looks_like_credentials("API_TOKEN=abc")
     assert not looks_like_credentials("bootloader unlocked in March")
+
+
+def test_credential_heuristic_catches_plurals():
+    """Fix round 1: the lookahead that correctly rejects `tokenizer` also
+    rejected every plural ("passwords for the test accounts"), and
+    `shared` being the default scope makes this warning the only guard
+    between a credential and a commit -- so plurals must hit too."""
+    assert looks_like_credentials("passwords for the test accounts")
+    assert looks_like_credentials("tokens for the api")
+    assert looks_like_credentials("my secrets")
+    assert looks_like_credentials("credentials for bob")
+    # Accepted false positive: "credentials" is a genuine plural of a
+    # listed term, so this warns even though the sentence isn't secret
+    # material. The detector only ever warns, never blocks.
+    assert looks_like_credentials("this phone is for the credentials team")
+
+
+def test_credential_heuristic_does_not_match_unrelated_words():
+    """Plural support must not reopen the false positives the original
+    fix (`\\b` -> lookaround) was checked against."""
+    assert not looks_like_credentials("screen replaced")
+    assert not looks_like_credentials("tokenizer test app installed")
+    assert not looks_like_credentials("passport photo app")
+    assert not looks_like_credentials("secretive settings menu disabled")
+    assert not looks_like_credentials("passwordless login enabled")
+    assert not looks_like_credentials("the api-keyboard app crashed")

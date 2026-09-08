@@ -39,14 +39,23 @@ __all__ = [
 NoteScope = Literal["shared", "private"]
 
 _CREDENTIAL_HINTS = re.compile(
-    r"(?<![A-Za-z0-9])(pass(word|phrase)|secret|token|api[_-]?key|credential)"
+    r"(?<![A-Za-z0-9])(pass(word|phrase)|secret|token|api[_-]?key|credential)s?"
     r"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 """Lookaround rather than `\\b`: `\\b` treats `_` as a word character, so
 it would miss `API_TOKEN` (no boundary between `_` and `T`) -- a real
 example from this module's own tests. Still advisory; see the module
-docstring."""
+docstring.
+
+The trailing `s?` catches the plural ("passwords for the test
+accounts", "tokens for the api") -- without it, the same lookahead that
+correctly rejects `tokenizer` also rejected every plural, and `shared`
+being the default scope means this warning is the only guard between a
+credential and a commit. This does mean a sentence like "this phone is
+for the credentials team" now warns too; that is an accepted false
+positive in exchange for catching real plural credentials, and the
+detector only ever warns, never blocks."""
 
 
 def looks_like_credentials(text: str) -> bool:
