@@ -20,6 +20,14 @@ from playground.models.base import ResourceEnvelope, StrictModel
 # Common value objects
 # ---------------------------------------------------------------------------
 
+DiscoveryMode = Literal["prompt", "silent"]
+"""Whether an unknown attached handset raises a question or is filed
+silently. Lives on `DefaultsSpec.device_discovery` / `LabSpec.device_discovery`
+-- deliberately NOT nested under `spec.devices`, because `LabSpec.devices`
+is a list and a same-named mapping on `Defaults` would make two config
+kinds disagree about one key's shape. See `playground.devices.discovery`
+for the resolution policy and the operator-facing prompt."""
+
 
 class Resources(StrictModel):
     vcpu: int = Field(ge=1)
@@ -152,6 +160,10 @@ class DefaultsSpec(StrictModel):
     network: DefaultsNetwork
     retention: RetentionPolicy
     capture: CaptureOptions = Field(default_factory=CaptureOptions)
+    device_discovery: DiscoveryMode = "prompt"
+    """Whether an unknown attached handset is offered a saved profile.
+    See `DiscoveryMode` above for why this key is not nested under
+    `spec.devices`."""
 
 
 class Defaults(ResourceEnvelope):
@@ -455,6 +467,74 @@ class LabVm(BaseModel):
         return value
 
 
+class DeviceMatch(StrictModel):
+    """Selector, not a description. Every field is optional; the fields that
+    ARE set must all match for a device to be a candidate.
+
+    No ``manufacturer`` field: the only listing source is
+    ``adb devices -l``, which emits ``model:`` but never a manufacturer, so
+    a manufacturer selector could never match anything. A later slice can
+    add it together with the per-device ``getprop`` probe needed to
+    populate it.
+    """
+
+    serial: str | None = None
+    model: str | None = None
+
+
+class DeviceRequire(StrictModel):
+    """Assertions checked at adopt time against the live handset.
+
+    This is the honest direction of the dependency: config cannot know a
+    phone is rooted, but it can say this lab needs one that is.
+    """
+
+    root: bool | None = None
+    min_sdk: int | None = Field(default=None, ge=1)
+
+
+class LabDevice(StrictModel):
+    """One physical-device slot in a lab.
+
+    Deliberately NOT a `LabVm`: a handset has no image, no vcpu/memory
+    sizing and no Ansible provisioners, and bending the VM schema to fit
+    would make role resolution answer questions it cannot answer.
+    """
+
+    name: str = Field(min_length=1)
+    kind: Literal["android"] = "android"
+    profile: str | None = None
+    match: DeviceMatch | None = None
+    require: DeviceRequire | None = None
+    tags: list[str] = Field(default_factory=list)
+    required: bool = True
+
+
+# ---------------------------------------------------------------------------
+# DeviceProfile — reusable, committable handset profile
+# ---------------------------------------------------------------------------
+
+
+class DeviceProfileSpec(StrictModel):
+    """A reusable selector plus assertions for one physical handset.
+
+    Sits alongside VmRole / NetworkProfile / CommandPreset so it inherits
+    the existing envelope, loader and validator machinery. Deliberately
+    NOT a `DeviceRole`: the VM role system carries an image, resource
+    sizing and Ansible provisioners, none of which mean anything for a
+    handset.
+    """
+
+    match: DeviceMatch | None = None
+    require: DeviceRequire | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class DeviceProfile(ResourceEnvelope):
+    kind: Literal["DeviceProfile"]
+    spec: DeviceProfileSpec
+
+
 class LabCommands(StrictModel):
     enabled: list[str] = Field(default_factory=list)
 
@@ -479,12 +559,20 @@ class LabSpec(BaseModel):
     works without ``extra_hosts``."""
     networks: list[LabNetwork] = Field(default_factory=list)
     vms: list[LabVm] = Field(default_factory=list)
+    devices: list[LabDevice] = Field(default_factory=list)
+    """Physical device slots. Backend-independent -- a handset is never
+    provisioned, so it is not gated on `spec.backend` and consumes no
+    host vcpu/memory/disk (excluded from budget accounting)."""
     workloads: list[LabWorkload] = Field(default_factory=list)
     commands: LabCommands = Field(default_factory=LabCommands)
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     capture: CaptureOptions | None = None
     """Per-lab capture bounds. When unset the resolver falls back to
     ``Defaults.spec.capture``."""
+    device_discovery: DiscoveryMode | None = None
+    """Per-lab override of `Defaults.spec.device_discovery`. When unset
+    the resolver falls back to the default. Not nested under
+    `spec.devices` -- see `DiscoveryMode`."""
 
     @field_validator("networks", "vms", "workloads")
     @classmethod
@@ -512,6 +600,7 @@ AnyResource = (
     | NetworkProfile
     | VmRole
     | CommandPreset
+    | DeviceProfile
     | Lab
 )
 """Discriminated union by ``kind`` field. Use ``parse_resource`` to dispatch."""
@@ -524,6 +613,7 @@ _KIND_MODELS: dict[str, type[ResourceEnvelope]] = {
     "NetworkProfile": NetworkProfile,
     "VmRole": VmRole,
     "CommandPreset": CommandPreset,
+    "DeviceProfile": DeviceProfile,
     "Lab": Lab,
 }
 
@@ -565,9 +655,15 @@ __all__ = [
     "DefaultsNetwork",
     "DefaultsSpec",
     "DefaultsVm",
+    "DeviceMatch",
+    "DeviceProfile",
+    "DeviceProfileSpec",
+    "DeviceRequire",
+    "DiscoveryMode",
     "DockerImageSource",
     "Lab",
     "LabCommands",
+    "LabDevice",
     "LabNetwork",
     "LabSpec",
     "LabVm",

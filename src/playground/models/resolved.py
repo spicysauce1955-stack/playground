@@ -11,6 +11,9 @@ from playground.models.kinds import (
     AndroidAppOptions,
     Budget,
     CaptureOptions,
+    DeviceMatch,
+    DeviceRequire,
+    DiscoveryMode,
     NetworkProfileSpec,
     RetentionPolicy,
     SshConfig,
@@ -57,6 +60,30 @@ class ResolvedVm(StrictModel):
     """Raw ``/etc/hosts`` lines to append on this VM at provision time.
     Workaround for missing lab-scoped DNS (roadmap backlog)."""
     provider_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResolvedDevice(StrictModel):
+    """A device slot, fully resolved -- and intent ONLY.
+
+    The resolver runs from configuration with no handset attached, so it
+    cannot hold a PROBED FACT. Bound serial, model, SDK, ABI and root live
+    in `DeviceStatus` and the registry. Do not add a `capabilities` field
+    here; an earlier draft of the design did, and it was wrong.
+
+    `profile` is not a probed fact -- it is config-declared intent, the
+    same as `match`/`require`, so it belongs here. Carrying it through
+    matters: shared notes live at `config/devices/<profile-name>.md`, so
+    a slot named `pixel7` that references profile `my-pixel` must still
+    resolve its note to `my-pixel.md`, not `pixel7.md`.
+    """
+
+    name: str
+    kind: Literal["android"]
+    profile: str | None = None
+    match: DeviceMatch | None = None
+    require: DeviceRequire | None = None
+    tags: list[str] = Field(default_factory=list)
+    required: bool = True
 
 
 class ResolvedWorkload(StrictModel):
@@ -129,10 +156,14 @@ class ResolvedLab(StrictModel):
     dns_domain: str
     """Per-lab DNS domain. Always populated — defaults to
     ``<lab_name>.lab`` when the lab YAML omits ``spec.dns_domain``."""
+    device_discovery: DiscoveryMode
+    """Always populated -- resolved lab-value-then-defaults from
+    ``LabSpec.device_discovery`` / ``DefaultsSpec.device_discovery``."""
     defaults: ResolvedDefaults
     providers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     networks: list[ResolvedNetwork]
     vms: list[ResolvedVm]
+    devices: list[ResolvedDevice] = Field(default_factory=list)
     workloads: list[ResolvedWorkload] = Field(default_factory=list)
     commands: list[ResolvedCommand] = Field(default_factory=list)
     artifacts: ResolvedArtifacts
@@ -146,6 +177,7 @@ __all__ = [
     "ResolvedArtifacts",
     "ResolvedCommand",
     "ResolvedDefaults",
+    "ResolvedDevice",
     "ResolvedLab",
     "ResolvedNetwork",
     "ResolvedVm",

@@ -315,3 +315,72 @@ def test_resolver_capture_respects_lab_override(tmp_path) -> None:
     assert resolved.capture.max_file_mb == 25
     assert resolved.capture.max_files == 4
     assert resolved.capture.snaplen == 96
+
+
+def test_resolver_defaults_devices_to_empty_list(resolved_generic_infra) -> None:
+    assert resolved_generic_infra.devices == []
+
+
+def test_resolver_maps_devices_carrying_match_and_require_unchanged(tmp_path) -> None:
+    from textwrap import dedent
+
+    config_dir = tmp_path / "config"
+    for sub in ("artifacts", "commands", "labs", "networks", "providers", "roles"):
+        (config_dir / sub).mkdir(parents=True, exist_ok=True)
+    import shutil as _shutil
+    for sub in ("artifacts", "commands", "networks", "providers", "roles"):
+        for f in (CONFIG_DIR / sub).iterdir():
+            _shutil.copy(f, config_dir / sub / f.name)
+    _shutil.copy(CONFIG_DIR / "defaults.yaml", config_dir / "defaults.yaml")
+    (config_dir / "labs" / "with-devices.yaml").write_text(
+        dedent(
+            """
+            apiVersion: playground/v1
+            kind: Lab
+            metadata:
+              name: with-devices
+            spec:
+              backend: local-libvirt
+              networks:
+                - name: net-a
+                  profile: isolated
+                  cidr: 10.20.40.0/24
+              vms:
+                - name: vm-a
+                  role: generic-node
+                  networks: [net-a]
+              devices:
+                - name: pixel7
+                  match:
+                    serial: "1A2B"
+                  require:
+                    root: true
+                    min_sdk: 30
+                  tags: [flaky]
+                - name: optional-phone
+                  required: false
+            """
+        ).lstrip("\n")
+    )
+
+    loaded, diagnostics = load_config(config_dir)
+    assert diagnostics == []
+    resolved = resolve_lab(loaded, "with-devices")
+
+    by_name = {d.name: d for d in resolved.devices}
+    assert set(by_name) == {"pixel7", "optional-phone"}
+
+    pixel = by_name["pixel7"]
+    assert pixel.kind == "android"
+    assert pixel.required is True
+    assert pixel.match is not None
+    assert pixel.match.serial == "1A2B"
+    assert pixel.require is not None
+    assert pixel.require.root is True
+    assert pixel.require.min_sdk == 30
+    assert pixel.tags == ["flaky"]
+
+    optional = by_name["optional-phone"]
+    assert optional.required is False
+    assert optional.match is None
+    assert optional.require is None

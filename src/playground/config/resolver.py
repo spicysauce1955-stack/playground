@@ -20,12 +20,22 @@ from __future__ import annotations
 from typing import Any
 
 from playground.config.loader import LoadedConfig
-from playground.models.kinds import Defaults, Lab, LabVm, VmRoleSpec
+from playground.models.base import StrictModel
+from playground.models.kinds import (
+    Defaults,
+    DeviceMatch,
+    DeviceRequire,
+    Lab,
+    LabDevice,
+    LabVm,
+    VmRoleSpec,
+)
 from playground.models.resolved import (
     ResolvedArtifactImage,
     ResolvedArtifacts,
     ResolvedCommand,
     ResolvedDefaults,
+    ResolvedDevice,
     ResolvedLab,
     ResolvedNetwork,
     ResolvedVm,
@@ -58,6 +68,7 @@ def resolve_lab(
 
     networks = [_resolve_network(net, lab, loaded) for net in lab.spec.networks]
     vms = [_resolve_vm(vm, lab, loaded, defaults) for vm in lab.spec.vms]
+    devices = [_resolve_device(device, loaded) for device in lab.spec.devices]
     workloads = [_resolve_workload(wl) for wl in lab.spec.workloads]
     commands = [_resolve_command(name, loaded) for name in lab.spec.commands.enabled]
     artifacts = _resolve_artifacts(loaded)
@@ -79,10 +90,12 @@ def resolve_lab(
         # doesn't override; tofu's libvirt_network resources serve this
         # via dnsmasq so cross-VM resolution works without /etc/hosts.
         dns_domain=lab.spec.dns_domain or f"{lab.metadata.name}.lab",
+        device_discovery=lab.spec.device_discovery or defaults.spec.device_discovery,
         defaults=resolved_defaults,
         providers={name: dict(overrides) for name, overrides in lab.spec.providers.items()},
         networks=networks,
         vms=vms,
+        devices=devices,
         workloads=workloads,
         commands=commands,
         artifacts=artifacts,
@@ -105,6 +118,73 @@ def _resolve_network(net: Any, lab: Lab, loaded: LoadedConfig) -> ResolvedNetwor
         internet_access=profile_spec.internet_access,
         dns_enabled=profile_spec.dns.enabled,
     )
+
+
+def _resolve_device(device: LabDevice, loaded: LoadedConfig) -> ResolvedDevice:
+    """Map a `LabDevice` to a `ResolvedDevice`, layering its profile in.
+
+    `match`/`require` carry unchanged from the lab device when no
+    profile is set -- no handset is attached at resolve time, so there
+    is nothing to layer against.
+
+    When `device.profile` is set, the profile is the base and the lab
+    device layers on top of it, field by field: a field the lab device
+    sets wins; a field it omits (``None``) falls back to the profile's.
+    This is a field-by-field merge WITHIN each of `match`/`require`, not
+    a wholesale replacement -- a lab device can pin `require.min_sdk`
+    while still inheriting `require.root` from the profile, and vice
+    versa. `tags` concatenate, profile first, then the lab device's own.
+
+    An unknown `device.profile` indexes `loaded.device_profiles` and
+    raises `KeyError`, matching this resolver's documented contract for
+    every other cross-reference (role/network/command/image): resolution
+    trusts the validator's invariants rather than re-checking them. The
+    validator surfaces the unresolvable case up front as
+    `config.device.profile_not_found`.
+    """
+    if device.profile is None:
+        return ResolvedDevice(
+            name=device.name,
+            kind=device.kind,
+            profile=None,
+            match=device.match,
+            require=device.require,
+            tags=list(device.tags),
+            required=device.required,
+        )
+
+    profile_spec = loaded.device_profiles[device.profile].spec
+    return ResolvedDevice(
+        name=device.name,
+        kind=device.kind,
+        profile=device.profile,
+        match=_layer_optional_model(device.match, profile_spec.match, DeviceMatch),
+        require=_layer_optional_model(device.require, profile_spec.require, DeviceRequire),
+        tags=[*profile_spec.tags, *device.tags],
+        required=device.required,
+    )
+
+
+def _layer_optional_model[M: StrictModel](
+    lab_value: M | None,
+    profile_value: M | None,
+    cls: type[M],
+) -> M | None:
+    """Field-by-field merge of an optional lab-level model over a profile's.
+
+    A field set (non-``None``) on `lab_value` wins; a field it omits
+    falls back to `profile_value`'s. Returns ``None`` only when both
+    inputs are ``None``; returns the other input unchanged when only one
+    is set.
+    """
+    if lab_value is None:
+        return profile_value
+    if profile_value is None:
+        return lab_value
+
+    merged = profile_value.model_dump()
+    merged.update({k: v for k, v in lab_value.model_dump().items() if v is not None})
+    return cls(**merged)
 
 
 def _resolve_workload(wl: Any) -> ResolvedWorkload:

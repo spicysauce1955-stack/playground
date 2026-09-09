@@ -62,7 +62,7 @@ def _simulate_device_argv(cmd: str) -> list[str]:
     return shlex.split(device_script)
 
 
-def _stub_status(resolved, tofu_dir):
+def _stub_status(resolved, tofu_dir, state_dir=None):
     return (
         LabStatus(
             lab=resolved.lab_name,
@@ -210,6 +210,32 @@ def test_install_rejects_a_missing_apk(
 # Coverage added below for verbs the original 8 tests above did not exercise:
 # uninstall, list, screenshot, input, push, pull, shell.
 # --------------------------------------------------------------------------- #
+
+
+def _write_appending_ssh_shim(
+    tmp_path: Path, *, exit_code: int = 0, stdout: str = ""
+) -> Path:
+    """Like `write_ssh_shim`, but APPENDS each invocation's argv to
+    `ssh.log` instead of overwriting it.
+
+    Needed wherever a single verb now makes more than one ssh round trip
+    (an adb command, then a separate best-effort `_guest_cleanup` call) --
+    `write_ssh_shim`'s plain `>` would let the later cleanup call's log
+    line silently clobber the one this test actually wants to inspect.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log_path = tmp_path / "ssh.log"
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$@" >> {shlex.quote(str(log_path))}\n'
+        f'printf -- "-----\\n" >> {shlex.quote(str(log_path))}\n'
+        + (f'echo {shlex.quote(stdout)}\n' if stdout else "")
+        + f"exit {exit_code}\n"
+    )
+    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bin_dir
 
 
 def _run_with_ssh_stdout(
@@ -369,12 +395,12 @@ def test_input_text_quotes_shell_metacharacters(
 
 
 def test_push_uploads_via_scp_then_adb_push(
-    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+    tmp_path, monkeypatch, write_apply_shims, write_scp_shim
 ) -> None:
     src = tmp_path / "payload.bin"
     src.write_bytes(b"local file contents")
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    ssh_bin = _write_appending_ssh_shim(tmp_path, exit_code=0)
     write_scp_shim(tmp_path, exit_code=0)  # shares tmp_path/bin with the ssh shim
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
@@ -392,17 +418,20 @@ def test_push_uploads_via_scp_then_adb_push(
 
     scp_log = (tmp_path / "scp.log").read_text()
     assert str(src) in scp_log
-    assert "ubuntu@127.0.0.1:/tmp/playground-push-" in scp_log
+    assert "ubuntu@127.0.0.1:/tmp/playground-stage-" in scp_log
     # scp operand order: local source first, then the remote destination.
-    assert scp_log.index(str(src)) < scp_log.index("ubuntu@127.0.0.1:/tmp/playground-push-")
+    assert scp_log.index(str(src)) < scp_log.index("ubuntu@127.0.0.1:/tmp/playground-stage-")
 
     ssh_log = (tmp_path / "ssh.log").read_text()
     # shlex.quote only adds quotes when a value needs them; these paths
     # have no shell metacharacters, so they appear bare in the command.
-    assert "push /tmp/playground-push-" in ssh_log
+    assert "push /tmp/playground-stage-" in ssh_log
     assert "/sdcard/dest.bin" in ssh_log
-    # adb push operand order: guest-local tmp file first, device dest second.
-    assert ssh_log.index("/tmp/playground-push-") < ssh_log.index("/sdcard/dest.bin")
+    # adb push operand order: guest-local staged file first, device dest second.
+    assert ssh_log.index("/tmp/playground-stage-") < ssh_log.index("/sdcard/dest.bin")
+    # BUG D: the staged file must be cleaned up in a follow-up round trip.
+    assert "rm -f /tmp/playground-stage-" in ssh_log
+    assert ssh_log.index("/sdcard/dest.bin") < ssh_log.index("rm -f /tmp/playground-stage-")
 
 
 def test_pull_downloads_file_and_writes_it_locally(
@@ -646,7 +675,11 @@ def test_scp_quotes_a_remote_path_containing_a_space(
     apk.write_bytes(b"fake apk bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    # stdout="1": `install` now gates on `wait_booted`, a Python-side poll
+    # of `getprop sys.boot_completed` (android/runner.py) rather than a
+    # single guest-shell round trip -- the shim's exit code alone no
+    # longer signals "booted", so it must also answer the getprop check.
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="1")
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
@@ -665,32 +698,103 @@ def test_scp_quotes_a_remote_path_containing_a_space(
     scp_log = (tmp_path / "scp.log").read_text()
     # the destination operand's PATH half must be quoted as one shell
     # token (the user@host half must stay bare, unquoted).
-    assert "ubuntu@127.0.0.1:'/tmp/playground-apk-" in scp_log
+    assert "ubuntu@127.0.0.1:'/tmp/playground-stage-" in scp_log
     assert "My App.apk'" in scp_log
     # never emit the bare, unquoted operand -- that is what "ambiguous
     # target" / device-side injection came from.
-    assert "ubuntu@127.0.0.1:/tmp/playground-apk-" not in scp_log
+    assert "ubuntu@127.0.0.1:/tmp/playground-stage-" not in scp_log
+
+
+def test_install_skips_the_install_when_staging_fails(
+    tmp_path, monkeypatch, write_apply_shims, write_scp_shim
+) -> None:
+    """`stage_for` now raises `_StagingFailed` on a failed scp instead of
+    silently handing back a path as though staging had succeeded --
+    `install_command` must catch that, report the target as failed, and
+    never proceed to `adb install` for it (there is nothing on the guest
+    to install)."""
+    apk = tmp_path / "app.apk"
+    apk.write_bytes(b"fake apk bytes")
+
+    bin_dir = write_apply_shims(tmp_path)
+    # stdout="1": satisfies the `wait_booted` getprop poll so the boot
+    # gate passes on its first attempt and staging is what fails next.
+    ssh_bin = _write_appending_ssh_shim(tmp_path, exit_code=0, stdout="1")
+    write_scp_shim(tmp_path, exit_code=1)  # scp fails
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["app", "install", str(apk), "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 1
+    assert "failed on 1/1 device(s)" in result.output + str(result.stderr)
+    ssh_log = (tmp_path / "ssh.log").read_text()
+    assert "install -r" not in ssh_log
+
+
+def test_push_skips_the_push_when_staging_fails(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+) -> None:
+    """Same guard as `install`, for `push_command`'s single-file staging."""
+    src = tmp_path / "payload.bin"
+    src.write_bytes(b"local file contents")
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    write_scp_shim(tmp_path, exit_code=1)  # scp fails
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["app", "push", str(src), "/sdcard/dest.bin", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 1
+    # no adb push (or cleanup) round trip ever happened -- ssh was never invoked.
+    assert not (tmp_path / "ssh.log").exists()
 
 
 def test_install_waits_for_android_to_finish_booting(
     tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
 ) -> None:
-    """BUG C regression test: `install` must gate on `wait_booted_cmd`
-    before staging/installing anything. `write_ssh_shim` overwrites its
-    log on every call, so this drives the failure path (the very first
-    ssh call -- the boot gate -- fails) and asserts install never reaches
-    scp, rather than trying to observe an intermediate successful call
-    that a later call would overwrite in the log."""
+    """BUG C regression test: `install` must gate on `wait_booted` before
+    staging/installing anything.
+
+    The boot gate is now a Python-side poll (`android/runner.py:wait_booted`)
+    rather than a single guest-shell round trip, so a fixed-exit-code ssh
+    shim can no longer stand in for "boot never completes" -- it would
+    make `wait_booted` retry for real, `time.sleep`-ing between every one
+    of its `_BOOT_WAIT_SECONDS` attempts. `wait_booted` itself is unit
+    tested directly in `tests/unit/android/test_runner_wait.py`; this
+    test only needs to prove `install` gates on it and reports plainly,
+    so it monkeypatches `wait_booted` to fail immediately instead.
+    """
     apk = tmp_path / "app.apk"
     apk.write_bytes(b"fake apk bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=1)  # boot-wait never succeeds
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
     )
     monkeypatch.setattr(app_commands, "query_status", _stub_status)
+    monkeypatch.setattr(
+        app_commands, "wait_booted", lambda targets, **_: [t.name for t in targets]
+    )
     tofu_dir = tmp_path / "tofu"
     tofu_dir.mkdir(exist_ok=True)
 
@@ -708,18 +812,23 @@ def test_install_waits_for_android_to_finish_booting(
 
 
 def test_install_command_includes_stage_dir_cleanup(
-    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim, write_scp_shim
+    tmp_path, monkeypatch, write_apply_shims, write_scp_shim
 ) -> None:
-    """BUG D regression test: the staged APK directory on the guest is
-    never removed anywhere else in this verb -- a screenshot loop or
-    repeated large-APK installs fill the guest disk. The boot-wait and
-    mkdir calls each overwrite `ssh.log` before the install call, so the
-    install call itself (the last one made) is what is inspected."""
+    """BUG D regression test: a staged APK on the guest is never removed
+    anywhere else in this verb -- a screenshot loop or repeated large-APK
+    installs fill the guest disk. Cleanup is now a separate, best-effort
+    `_guest_cleanup` round trip AFTER the install attempt (Task 4 moved it
+    out of the folded `install; rm -rf ...` shell chain and into Python,
+    the same move made for the boot loop), so this needs the APPENDING
+    ssh shim to see both round trips rather than only the last one made.
+    """
     apk = tmp_path / "app.apk"
     apk.write_bytes(b"fake apk bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    # stdout="1": satisfies the `wait_booted` getprop poll (see the BUG C
+    # test above) so the boot gate passes on its first attempt.
+    ssh_bin = _write_appending_ssh_shim(tmp_path, exit_code=0, stdout="1")
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
@@ -734,9 +843,11 @@ def test_install_command_includes_stage_dir_cleanup(
          "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
     )
     assert result.exit_code == 0, result.output
-    log = _remote_command_line((tmp_path / "ssh.log").read_text())
+    log = (tmp_path / "ssh.log").read_text()
     assert "install -r" in log
-    assert "rm -rf /tmp/playground-apk-" in log
+    assert "rm -f /tmp/playground-stage-" in log
+    # cleanup only makes sense AFTER the install attempt.
+    assert log.index("install -r") < log.index("rm -f /tmp/playground-stage-")
 
 
 def test_pull_creates_a_missing_parent_directory(
@@ -921,7 +1032,9 @@ def test_install_still_accepts_apkm_and_xapk_single_files(
     f.write_bytes(b"fake zip bytes")
 
     bin_dir = write_apply_shims(tmp_path)
-    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    # stdout="1": satisfies the `wait_booted` getprop poll (see the BUG C
+    # test above) so the boot gate passes on its first attempt.
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0, stdout="1")
     write_scp_shim(tmp_path, exit_code=0)
     monkeypatch.setenv(
         "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
@@ -991,3 +1104,110 @@ def test_ensure_out_directory_creates_a_missing_directory(tmp_path) -> None:
     out_dir = tmp_path / "fresh" / "nested"
     app_commands._ensure_out_directory(out_dir, why="screenshot")
     assert out_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# --state-dir threading and status warnings (device-aware plumbing)
+# ---------------------------------------------------------------------------
+
+
+def test_app_threads_state_dir_into_query_status(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """`query_status`'s device half reads a slot's binding from
+    `state_dir`, so an `app` verb that never passed one reported an
+    attached handset as `device.not_connected` for a lab applied with
+    `--state-dir /srv/pg`, while `status --state-dir /srv/pg` called the
+    same handset connected."""
+    seen: list[object] = []
+
+    def _recording_status(resolved, tofu_dir, state_dir=None):
+        seen.append(state_dir)
+        return _stub_status(resolved, tofu_dir, state_dir)
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _recording_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["app", "list", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir),
+         "--state-dir", str(tmp_path / "srv-pg")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [tmp_path / "srv-pg"]
+
+
+def test_app_state_dir_defaults_to_dot_playground(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """Same default every other command uses, so the common case is
+    unchanged."""
+    seen: list[object] = []
+
+    def _recording_status(resolved, tofu_dir, state_dir=None):
+        seen.append(state_dir)
+        return _stub_status(resolved, tofu_dir, state_dir)
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _recording_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["app", "list", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [Path(".playground")]
+
+
+def test_app_prints_the_downgraded_adb_unavailable_warning(
+    tmp_path, monkeypatch, write_apply_shims, write_ssh_shim
+) -> None:
+    """`_device_statuses` downgrades `device.adb_unavailable` to a warning
+    so one missing `adb` cannot hard-fail every `query_status` caller;
+    `app` then dropped it, so `app list` on an adb-less machine said only
+    "device 'pixel7' is not attached" and never mentioned the real
+    cause."""
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    warning = Diagnostic(
+        id="device.adb_unavailable",
+        severity="warning",
+        message="`adb devices -l` failed: adb not found on PATH",
+        source=SourceLocation(path="adb"),
+    )
+
+    def _warning_status(resolved, tofu_dir, state_dir=None):
+        status, _ = _stub_status(resolved, tofu_dir, state_dir)
+        return status, [warning]
+
+    bin_dir = write_apply_shims(tmp_path)
+    ssh_bin = write_ssh_shim(tmp_path, exit_code=0)
+    monkeypatch.setenv(
+        "PATH", f"{ssh_bin}{os.pathsep}{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(app_commands, "query_status", _warning_status)
+    tofu_dir = tmp_path / "tofu"
+    tofu_dir.mkdir(exist_ok=True)
+    result = CliRunner().invoke(
+        app,
+        ["app", "list", "--lab", "redroid-cloud",
+         "--config-dir", str(CONFIG_DIR), "--tofu-dir", str(tofu_dir)],
+    )
+
+    output = result.output + result.stderr
+    assert "device.adb_unavailable" in output
+    assert "not found on PATH" in output

@@ -13,6 +13,7 @@ import pytest
 from playground.capture.targets import capture_vm_names, resolve_capture_targets
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
+from playground.models.resolved import ResolvedDevice
 from playground.models.status import LabStatus, VmStatus
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -71,8 +72,8 @@ def test_single_device_needs_no_targeting_flag(redroid_lab) -> None:
         on=None, role=None, all_devices=False, user="ubuntu",
     )
     assert diagnostics == []
-    assert [t.vm_name for t in targets] == ["droid1"]
-    assert targets[0].ssh_user == "ubuntu"
+    assert [t.name for t in targets] == ["droid1"]
+    assert targets[0].transport.ssh_user == "ubuntu"
 
 
 def test_unknown_vm_names_the_candidates(redroid_lab) -> None:
@@ -99,18 +100,50 @@ def test_capture_disabled_in_the_lab_is_refused(redroid_lab) -> None:
     assert [d.id for d in diagnostics] == ["config.capture.disabled"]
 
 
-def test_vbox_is_refused_with_capture_specific_wording(redroid_lab) -> None:
-    """Redroid is unverified on local-vbox, so there is no device to
-    capture. The message must not talk about idle-compute billing, which
-    is what the shared verb_not_supported helper says."""
+def test_capturability_is_per_target_not_per_backend(redroid_lab) -> None:
+    """Capturability comes from the VM's OWN `capture` capability, not
+    `spec.backend` -- an earlier version refused every target in a
+    non-libvirt/DO lab outright, which would also have wrongly refused a
+    physical handset attached to a `local-vbox` lab. A VM that declares
+    `capture: true` in its role is capturable regardless of backend."""
     vbox = redroid_lab.model_copy(update={"backend": "local-vbox"})
     targets, diagnostics = resolve_capture_targets(
         vbox, _status(vbox),
         on=None, role=None, all_devices=False, user="ubuntu",
     )
+    assert diagnostics == []
+    assert [t.name for t in targets] == ["droid1"]
+
+
+def test_a_named_device_is_refused_as_capture_unsupported(redroid_lab) -> None:
+    """A physical handset is a recognized target -- it just cannot be
+    captured yet. That is a different, more specific fact than "unknown
+    VM", and must not be confused with the backend-level refusal either."""
+    mixed = redroid_lab.model_copy(
+        update={"devices": [ResolvedDevice(name="pixel7", kind="android")]}
+    )
+    targets, diagnostics = resolve_capture_targets(
+        mixed, _status(mixed),
+        on="pixel7", role=None, all_devices=False, user="ubuntu",
+    )
     assert targets == []
-    assert [d.id for d in diagnostics] == ["config.capture.backend_unsupported"]
-    assert "billing" not in diagnostics[0].message.lower()
+    assert [d.id for d in diagnostics] == ["config.capture.device_unsupported"]
+    assert "Plan 2" in diagnostics[0].message
+
+
+def test_all_devices_excludes_the_physical_handset(redroid_lab) -> None:
+    """`--all` fans out over capturable VMs only -- a device was never
+    capturable to begin with, so it is excluded the same way it always
+    was, without needing its own diagnostic."""
+    mixed = redroid_lab.model_copy(
+        update={"devices": [ResolvedDevice(name="pixel7", kind="android")]}
+    )
+    targets, diagnostics = resolve_capture_targets(
+        mixed, _status(mixed),
+        on=None, role=None, all_devices=True, user="ubuntu",
+    )
+    assert diagnostics == []
+    assert [t.name for t in targets] == ["droid1"]
 
 
 def test_unreachable_vm_says_apply_first(redroid_lab) -> None:

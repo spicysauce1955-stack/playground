@@ -25,10 +25,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from playground.backend import cloud_digitalocean, local_libvirt, local_vbox
+from playground.devices.adb import list_attached
+from playground.devices.binding import match_candidates, read_binding
+from playground.devices.registry import read_registry
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
-from playground.models.resolved import ResolvedLab
-from playground.models.status import LabStatus
+from playground.models.resolved import ResolvedDevice, ResolvedLab
+from playground.models.status import DeviceStatus, LabStatus
 from playground.planner.plan import CostEstimate
 from playground.runs import OperationRun
 
@@ -199,13 +202,126 @@ def execute_resume(
 
 
 def query_status(
-    resolved: ResolvedLab, tofu_dir: Path,
+    resolved: ResolvedLab,
+    tofu_dir: Path,
+    state_dir: Path = Path(".playground"),
+    *,
+    include_devices: bool = True,
 ) -> tuple[LabStatus, list[Diagnostic]]:
+    """Backend-observed status, plus BACKEND-NEUTRAL device status.
+
+    No backend provisions a physical handset -- `local-libvirt`,
+    `local-vbox` and `cloud-digitalocean` all delegate their VM-shaped
+    status to the matching adapter below, then this function alone fills
+    in ``LabStatus.devices`` from the same device machinery every other
+    device-aware verb uses, so a handset works identically regardless of
+    which backend the rest of the lab uses. ``state_dir`` defaults to
+    the same ``.playground`` every other command defaults to, so callers
+    that pass none still see live device state for the common case.
+
+    ``include_devices=False`` is the explicit opt-out for a caller that
+    never renders ``status.devices`` at all (the TUI's lab-highlight
+    panel is the one case today): it skips `_device_statuses` --
+    and so the `adb devices -l` + registry read it does -- entirely,
+    rather than paying for data nothing on screen shows. Every other
+    caller keeps the default and is unaffected.
+    """
     if resolved.backend == VBOX:
-        return local_vbox.query_status(resolved)
-    if resolved.backend == DIGITALOCEAN:
-        return cloud_digitalocean.query_status(resolved)
-    return local_libvirt.query_status(resolved, tofu_dir)
+        status, diagnostics = local_vbox.query_status(resolved)
+    elif resolved.backend == DIGITALOCEAN:
+        status, diagnostics = cloud_digitalocean.query_status(resolved)
+    else:
+        status, diagnostics = local_libvirt.query_status(resolved, tofu_dir)
+
+    if include_devices and resolved.devices:
+        device_statuses, device_diagnostics = _device_statuses(
+            state_dir, resolved.lab_name, resolved.devices
+        )
+        status = status.model_copy(update={"devices": device_statuses})
+        diagnostics = [*diagnostics, *device_diagnostics]
+    return status, diagnostics
+
+
+def _device_statuses(
+    state_dir: Path, lab: str, devices: list[ResolvedDevice]
+) -> tuple[list[DeviceStatus], list[Diagnostic]]:
+    """Read-only ``DeviceStatus`` for every declared slot, plus any
+    diagnostic explaining why a slot reads as ``missing``.
+
+    Deliberately does NOT call ``resolve_binding`` -- that function can
+    auto-bind (and persist) an unbound slot with exactly one matching
+    candidate, which is exactly the mutation a `status` query must never
+    cause as a side effect. Instead it reads the already-persisted
+    binding (`read_binding`) and cross-checks it against a live `adb
+    devices -l` (`list_attached`) for the slot's CURRENT connectivity, and
+    the registry (`read_registry`) for the facts recorded at the slot's
+    last adoption -- no `probe_facts` re-probe, so this stays as cheap as
+    any other status query. A slot with no persisted binding, or whose
+    bound serial is not currently attached, reads as ``missing``: an
+    un-adopted device is not a live target yet, matching the same
+    "never adopted/probed" semantics `android.targets.resolve_targets`
+    already applies to a slot absent from `status.devices` entirely.
+
+    `list_attached`'s own diagnostics (e.g. `device.adb_unavailable` for
+    a missing or hung `adb`) are severity=error, but propagating that
+    unchanged into `query_status`'s return would make `_exit_on_errors`
+    hard-fail every caller of `query_status` -- `status`, `exec`, `cp`,
+    `app`, `adb`, `capture` -- for a reason that has nothing to do with
+    what any of them are actually doing. So they are downgraded to a
+    warning and returned rather than dropped: every device then reads
+    `state=missing` exactly as it would if genuinely unplugged, but the
+    warning names the real cause (no adb / adb timed out) instead of
+    leaving the operator to conclude "no devices attached" -- the same
+    confusion handoff (c) exists to eliminate on `doctor`, reintroduced
+    here if this were silently swallowed instead.
+    """
+    attached, adb_diagnostics = list_attached()
+    diagnostics = [d.model_copy(update={"severity": "warning"}) for d in adb_diagnostics]
+    attached_by_serial = {candidate.serial: candidate for candidate in attached}
+    registry = read_registry(state_dir)
+
+    statuses: list[DeviceStatus] = []
+    for device in devices:
+        binding = read_binding(state_dir, lab, device.name)
+        if binding is None:
+            statuses.append(DeviceStatus(name=device.name, state="missing"))
+            continue
+        candidate = attached_by_serial.get(binding.serial)
+        if candidate is None:
+            # The bound handset is gone. `match_candidates` is PURE (no
+            # filesystem, no adb of its own, and it never writes a
+            # binding), so asking it whether a DIFFERENT attached handset
+            # now satisfies the selector keeps this function read-only
+            # while still telling the truth: reporting `missing` alone
+            # would render a swapped cable as "not attached" while a
+            # matching phone sits on the bus. Only `apply --rebind` acts
+            # on this; every reader merely reports it.
+            rebind = [c.serial for c in match_candidates(device, attached)]
+            statuses.append(
+                DeviceStatus(
+                    name=device.name,
+                    state="missing",
+                    serial=binding.serial,
+                    rebind_candidates=rebind or None,
+                )
+            )
+            continue
+        entry = registry.get(binding.serial)
+        facts = entry.facts if entry is not None else None
+        statuses.append(
+            DeviceStatus(
+                name=device.name,
+                state=candidate.state,
+                serial=binding.serial,
+                model=(facts.model if facts is not None else None) or candidate.model,
+                manufacturer=facts.manufacturer if facts is not None else None,
+                sdk=facts.sdk if facts is not None else None,
+                abi=facts.abi if facts is not None else None,
+                rooted=facts.rooted if facts is not None else None,
+                last_verified=entry.last_verified if entry is not None else None,
+            )
+        )
+    return statuses, diagnostics
 
 
 def estimate_cost(

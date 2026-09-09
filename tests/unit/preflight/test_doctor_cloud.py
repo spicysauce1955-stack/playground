@@ -320,6 +320,11 @@ def test_run_all_checks_cloud_backend_no_libvirt_ids(
     """Cloud backend run must not produce any libvirt-only diagnostic IDs."""
     # Ensure token is unset so cloud_token_missing fires
     monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    # Devices are backend-independent, so run_all_checks probes adb even
+    # on the cloud branch -- mock it like every other host-shelling probe
+    # in this module so the test stays host-independent.
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
     diags = doctor.run_all_checks(
         backend="cloud-digitalocean",
         config_dir=_REPO_CONFIG_DIR,
@@ -335,6 +340,8 @@ def test_run_all_checks_cloud_backend_token_missing(
 ) -> None:
     """Token unset → cloud_token_missing appears in cloud backend run."""
     monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
     diags = doctor.run_all_checks(
         backend="cloud-digitalocean",
         config_dir=_REPO_CONFIG_DIR,
@@ -352,6 +359,8 @@ def test_run_all_checks_default_backend_unchanged(
     # the function does NOT raise and does NOT include cloud-specific ids
     # when those checks would pass (token present, no git repo with token).
     monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_" + "x" * 64)
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
     diags = doctor.run_all_checks()
     ids = {d.id for d in diags}
     # cloud_token_missing must NOT fire in the default run
@@ -375,6 +384,8 @@ def test_cli_doctor_cloud_backend_json(
     for key in list(os.environ):
         if "TOKEN" in key and "DIGITALOCEAN" in key:
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
 
     result = CliRunner().invoke(
         app,
@@ -420,6 +431,8 @@ def test_cli_doctor_cloud_backend_includes_ssh_open_warning(
     from playground.cli.main import app
 
     monkeypatch.delenv("DIGITALOCEAN_TOKEN", raising=False)
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
     result = CliRunner().invoke(
         app,
         [
@@ -575,6 +588,8 @@ def test_run_all_checks_cloud_includes_auth_check(
     monkeypatch.setenv("DIGITALOCEAN_TOKEN", "dop_v1_" + "a" * 64)
     import playground.backend.cloud_digitalocean.do as do_mod
     monkeypatch.setattr(do_mod, "verify_token", lambda token: 401)
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
     diags = doctor.run_all_checks(
         backend="cloud-digitalocean",
         config_dir=_REPO_CONFIG_DIR,

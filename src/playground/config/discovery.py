@@ -30,6 +30,7 @@ _DIRECTORY_KIND_MAP: dict[str, str] = {
     "networks": "NetworkProfile",
     "roles": "VmRole",
     "commands": "CommandPreset",
+    "devices": "DeviceProfile",
     "labs": "Lab",
 }
 

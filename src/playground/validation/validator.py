@@ -39,6 +39,13 @@ Diagnostic IDs:
 - ``config.workload.android_target_not_capable`` (warning; an
   ``android_app`` workload's placement matches no VM with the ``redroid``
   capability)
+- ``config.device.duplicate_name`` (two devices in the same lab share a
+  name)
+- ``config.device.name_collides_with_vm`` (a device name matches a VM
+  name in the same lab -- ``--on <name>`` resolves against VMs and
+  devices in ONE namespace, so a collision would target the wrong thing)
+- ``config.device.profile_not_found`` (a ``LabDevice.profile`` names a
+  ``DeviceProfile`` that was not loaded)
 """
 
 from __future__ import annotations
@@ -345,6 +352,77 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
     diagnostics.extend(_check_dns_domain(lab, source))
+    diagnostics.extend(_check_devices(lab, source, loaded))
+
+    return diagnostics
+
+
+def _check_devices(lab: Lab, source: SourceLocation, loaded: LoadedConfig) -> list[Diagnostic]:
+    """Reject duplicate device names, device/VM name collisions, and
+    devices referencing an undefined ``DeviceProfile``.
+
+    Duplicate/collision checks matter because ``--on <name>`` resolves
+    against VMs and devices in ONE namespace
+    (``android.targets.resolve_targets``, and the same check in
+    ``cli.main.adb_command``) -- a collision there would silently target
+    the wrong thing. The profile
+    check matters because the resolver (``config/resolver.py``) trusts
+    that every ``LabDevice.profile`` it sees already resolves -- it
+    indexes ``loaded.device_profiles`` directly and raises ``KeyError``
+    rather than re-checking, per this module's cross-reference contract.
+    """
+    diagnostics: list[Diagnostic] = []
+    vm_names = {vm.name for vm in lab.spec.vms}
+    seen: set[str] = set()
+
+    for idx, device in enumerate(lab.spec.devices):
+        if device.profile is not None and device.profile not in loaded.device_profiles:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.device.profile_not_found",
+                    severity="error",
+                    message=(
+                        f"device {device.name!r} in lab {lab.metadata.name!r} "
+                        f"references unknown profile {device.profile!r}"
+                    ),
+                    source=source,
+                    key_path=f"spec.devices[{idx}].profile",
+                    suggestion=(
+                        f"add config/devices/{device.profile}.yaml or fix the "
+                        "profile name"
+                    ),
+                )
+            )
+        if device.name in vm_names:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.device.name_collides_with_vm",
+                    severity="error",
+                    message=(
+                        f"device {device.name!r} in lab {lab.metadata.name!r} "
+                        "has the same name as a VM in the same lab"
+                    ),
+                    source=source,
+                    key_path=f"spec.devices[{idx}].name",
+                    suggestion="rename the device or the VM so names are unique",
+                )
+            )
+        if device.name in seen:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.device.duplicate_name",
+                    severity="error",
+                    message=(
+                        f"duplicate device name {device.name!r} in lab "
+                        f"{lab.metadata.name!r}"
+                    ),
+                    source=source,
+                    key_path=f"spec.devices[{idx}].name",
+                    suggestion="give each device slot a unique name",
+                )
+            )
+        else:
+            seen.add(device.name)
 
     return diagnostics
 

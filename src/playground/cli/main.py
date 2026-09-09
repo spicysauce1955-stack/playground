@@ -7,12 +7,14 @@ import re
 import shlex
 import socket
 import subprocess
+import sys
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NamedTuple, NoReturn
 
 import typer
 
+from playground.android.targets import device_status_diagnostic
 from playground.backend.dispatch import (
     SUPPORTED_BACKENDS,
     estimate_cost,
@@ -33,12 +35,18 @@ from playground.backend.local_libvirt import (
 )
 from playground.cli.app_commands import app_app
 from playground.cli.capture_commands import capture_app
+from playground.cli.device_commands import _write_profile, device_app
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
+from playground.devices.adb import AttachedDevice, list_attached
+from playground.devices.adopt import adopt, release
+from playground.devices.binding import device_matches
+from playground.devices.discovery import effective_mode, offer_unknown
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
+from playground.models.kinds import DeviceProfile
 from playground.models.resolved import ResolvedLab
-from playground.models.status import LabStatus
+from playground.models.status import DeviceStatus, LabStatus
 from playground.planner import Plan, PlanAction, render_plan
 from playground.preflight import run_all_checks as run_doctor_checks
 from playground.runs import OperationRun
@@ -68,6 +76,7 @@ app.add_typer(tofu_app, name="tofu")
 app.add_typer(runs_app, name="runs")
 app.add_typer(app_app, name="app")
 app.add_typer(capture_app, name="capture")
+app.add_typer(device_app, name="device")
 
 
 @app.command("validate")
@@ -549,6 +558,109 @@ def render_tfvars_command(
     )
 
 
+def _is_interactive() -> bool:
+    """Whether this session can be prompted, rather than calling
+    `sys.stdin.isatty()` inline -- mirrors the monkeypatchable seam
+    `device_commands._is_interactive` uses, so a test can drive (or
+    refuse to drive) the discovery prompt without a real terminal.
+    `CliRunner`'s piped stdin is never a tty, so `effective_mode` always
+    resolves to `silent` under test regardless of the lab's configured
+    `device_discovery` -- exactly the "never block on stdin" guarantee
+    this seam exists to make checkable."""
+    return sys.stdin.isatty()
+
+
+def _ask_device_profile_name(device: AttachedDevice) -> str | None:
+    """The `ask` callback `offer_unknown` calls once per unclaimed
+    attached handset. Blank input (bare Enter) declines -- `offer_unknown`
+    then marks the device ignored so it is not re-offered next apply."""
+    model = device.model or "unknown model"
+    typer.echo(f"new handset attached: serial={device.serial} model={model}")
+    name = typer.prompt(
+        "Name a profile for it (config/devices/<name>.yaml), or press Enter to skip",
+        default="",
+        show_default=False,
+    )
+    return name.strip() or None
+
+
+def _unclaimed_devices(
+    attached: list[AttachedDevice], profiles: dict[str, DeviceProfile]
+) -> list[AttachedDevice]:
+    """Attached devices that no configured `DeviceProfile` already selects.
+
+    `offer_unknown` only tracks the registry's `ignored` flag; it has no
+    notion of a config-declared profile, deliberately -- that is a
+    config-layer concept `playground.devices.discovery` does not import.
+    Filtering here is what keeps an already-profiled handset from being
+    re-asked about on every apply.
+    """
+    return [
+        device
+        for device in attached
+        if not any(device_matches(p.spec.match, device) for p in profiles.values())
+    ]
+
+
+def _adopt_devices_or_exit(
+    *,
+    resolved: ResolvedLab,
+    lab: str,
+    state_dir: Path,
+    config_dir: Path,
+    loaded: LoadedConfig,
+    output: OutputFormat,
+    rebind: bool = False,
+) -> list[Diagnostic]:
+    """Adopt every device slot ``resolved`` declares, then offer to save a
+    profile for any other attached-but-unknown handset.
+
+    Only called when ``resolved.devices`` is non-empty -- a device-less
+    lab's apply must shell out to `adb` exactly as often as it did before
+    this existed: never. Exits non-zero (printing every diagnostic, same
+    gate the rest of `apply_command` uses) when adoption reports any
+    error -- an absent REQUIRED handset, an unauthorized one, or an unmet
+    `require` assertion. Returns the diagnostics to fold into the apply's
+    own list otherwise, so success-path warnings (an absent OPTIONAL
+    handset) are printed once, together with everything else, at the
+    end of `apply_command` rather than here.
+
+    ``rebind`` is `apply --rebind`, and it is the ONLY way a slot ever
+    retargets: `adopt` refuses a slot whose bound serial has been
+    replaced by a different matching handset unless the operator passes
+    it explicitly. Every `device.rebind_required` diagnostic in the
+    codebase names this flag, so it has to exist on the verb they name.
+    """
+    attached, adb_diagnostics = list_attached()
+    _, adopt_diagnostics = adopt(
+        state_dir, config_dir, lab, resolved.devices, attached, rebind=rebind
+    )
+    device_diagnostics = [*adb_diagnostics, *adopt_diagnostics]
+    _exit_on_errors(device_diagnostics, output, json_errors=False)
+
+    # Discovery prompt: offer to save a profile for any attached handset
+    # this lab did not declare and no DeviceProfile already claims.
+    # `effective_mode` forces `silent` off a TTY (or when the lab opts
+    # out via `spec.device_discovery: silent`), so this never blocks a
+    # non-interactive apply on stdin. `--output json` also forces silent
+    # (via `no_prompt`) -- a scripted/automation caller must get clean
+    # JSON on stdout, never an interleaved prompt or a bare `saved
+    # device profile ...` line, even when it happens to run on a TTY.
+    mode = effective_mode(
+        resolved.device_discovery,
+        is_tty=_is_interactive(),
+        no_prompt=output is OutputFormat.json,
+        yes=False,
+    )
+    unclaimed = _unclaimed_devices(attached, loaded.device_profiles)
+    chosen = offer_unknown(state_dir, unclaimed, mode=mode, ask=_ask_device_profile_name)
+    for serial, name in chosen.items():
+        written = _write_profile(config_dir, name, serial)
+        typer.echo(f"saved device profile {name!r} -> {written}")
+
+    return device_diagnostics
+
+
 @app.command("apply")
 def apply_command(
     lab: Annotated[str, typer.Argument(help="Lab name to apply.")],
@@ -583,6 +695,18 @@ def apply_command(
                 "Run apply twice; fail if any role reports `changed` on "
                 "the second pass. Catches roles that mutate state on every "
                 "run. Default off — only opt in for CI / pre-release."
+            ),
+        ),
+    ] = False,
+    rebind: Annotated[
+        bool,
+        typer.Option(
+            "--rebind",
+            help=(
+                "Re-point a device slot at a different attached handset that "
+                "matches its selector. Playground never retargets a slot "
+                "silently — without this flag a swapped handset fails with "
+                "`device.rebind_required`."
             ),
         ),
     ] = False,
@@ -623,6 +747,18 @@ def apply_command(
     if finished.status == "failed":
         _present_apply_failure(output, finished, diagnostics, state_dir)
         raise typer.Exit(code=1)
+
+    # Physical devices are backend-independent: no backend provisions
+    # them, so adoption runs here regardless of which backend just
+    # applied. Only touches `adb` when the lab actually declares a slot.
+    if resolved.devices:
+        diagnostics.extend(
+            _adopt_devices_or_exit(
+                resolved=resolved, lab=lab, state_dir=state_dir,
+                config_dir=config_dir, loaded=loaded, output=output,
+                rebind=rebind,
+            )
+        )
 
     # `--check-idempotent`: run apply again and parse the second
     # ansible.log for the PLAY RECAP. Every host must report
@@ -956,6 +1092,12 @@ def exec_command(
     # ssh_port are uniform across all three backends.
     status, query_diagnostics = query_status(resolved, tofu_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+    # A warning survives `_exit_on_errors` and must still reach the
+    # operator: with no `adb` on this machine `_device_statuses`
+    # downgrades `device.adb_unavailable` to one, and dropping it here
+    # is what makes a device lab read as "nothing attached" for a
+    # reason nothing on screen names.
+    _print_warnings(query_diagnostics)
 
     vm_status = next((v for v in status.vms if v.name == on), None)
     ssh_host = vm_status.ssh_host if vm_status else None
@@ -1009,14 +1151,18 @@ ADB_REMOTE_PORT = 5555
 @app.command(
     "adb",
     help=(
-        "Open an SSH tunnel to a lab VM's Redroid ADB port and print the "
-        "`adb connect` line. Blocks until interrupted."
+        "For a VM: open an SSH tunnel to its Redroid ADB port and print the "
+        "`adb connect` line (blocks until interrupted). For a physical "
+        "device: print the `adb -s <serial>` line and exit -- adb already "
+        "reaches it directly, no tunnel needed."
     ),
 )
 def adb_command(
     on: Annotated[
         str,
-        typer.Option("--on", "--host", help="VM name within the lab (alias: --host)."),
+        typer.Option(
+            "--on", "--host", help="VM or device name within the lab (alias: --host)."
+        ),
     ],
     lab: Annotated[
         str | None,
@@ -1050,6 +1196,17 @@ def adb_command(
         Path,
         typer.Option("--tofu-dir", help="OpenTofu working directory."),
     ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help=(
+                "Where generated state lives. Defaults to `.playground/`. "
+                "Must match the `apply` that adopted the device — the "
+                "slot's binding is read from here."
+            ),
+        ),
+    ] = Path(".playground"),
 ) -> None:
     # ADB has NO authentication, which is why this is a tunnel and not a
     # firewall rule: the cloud backend deliberately opens port 22 only.
@@ -1081,7 +1238,24 @@ def adb_command(
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, OutputFormat.human)
 
     vm_names = {vm.name for vm in resolved.vms}
-    if on not in vm_names:
+    device_names = {device.name for device in resolved.devices}
+    if on not in vm_names and on not in device_names:
+        if device_names:
+            _exit_with_diagnostic(
+                Diagnostic(
+                    id="config.device.unknown_device",
+                    severity="error",
+                    message=(
+                        f"{on!r} is not an Android VM or device in lab {lab!r} "
+                        f"(VMs: {sorted(vm_names) or '<none>'}, devices: "
+                        f"{sorted(device_names) or '<none>'})"
+                    ),
+                    source=SourceLocation(path=f"config/labs/{lab}.yaml"),
+                    key_path="spec.vms",
+                ),
+                OutputFormat.human,
+                json_errors=False,
+            )
         _exit_with_diagnostic(
             Diagnostic(
                 id="config.adb.unknown_vm",
@@ -1097,8 +1271,37 @@ def adb_command(
             json_errors=False,
         )
 
-    status, query_diagnostics = query_status(resolved, tofu_dir)
+    # `state_dir` is threaded (rather than left to `query_status`'s own
+    # default) because a device slot's binding lives under it: an `apply
+    # --state-dir /srv/pg` followed by a default-state-dir `adb` would
+    # otherwise report a plugged-in handset as not connected.
+    status, query_diagnostics = query_status(resolved, tofu_dir, state_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+    # Warnings survive `_exit_on_errors` (it only raises on errors) and
+    # must still be shown: `device.adb_unavailable`, downgraded by
+    # `_device_statuses`, is the difference between "the handset is
+    # unplugged" and "this machine has no adb at all".
+    _print_warnings(query_diagnostics)
+
+    if on in device_names:
+        # A handset needs no ssh tunnel -- adb already reaches it directly
+        # over the operator's own USB bus. Print the connection line and
+        # exit instead of blocking on a forward that would never be used.
+        source = SourceLocation(path=f"config/labs/{lab}.yaml")
+        device_status = next((d for d in status.devices if d.name == on), None)
+        if device_status is None:
+            # Declared in the lab but never adopted/probed (no `apply` run
+            # yet, or discovery never saw it) -- reuse the same
+            # `device.not_connected` wording a `missing` slot gets.
+            device_status = DeviceStatus(name=on, state="missing")
+        if device_status.state != "connected" or not device_status.serial:
+            _exit_with_diagnostic(
+                device_status_diagnostic(on, device_status, source, lab=lab),
+                OutputFormat.human,
+                json_errors=False,
+            )
+        typer.echo(f"adb -s {device_status.serial}")
+        raise typer.Exit(code=0)
 
     vm_status = next((v for v in status.vms if v.name == on), None)
     ssh_host = vm_status.ssh_host if vm_status else None
@@ -1346,6 +1549,12 @@ def cp_command(
     # all uniform via VmStatus.ssh_host / ssh_port.
     status, query_diagnostics = query_status(resolved, tofu_dir)
     _exit_on_errors(query_diagnostics, OutputFormat.human, json_errors=False)
+    # A warning survives `_exit_on_errors` and must still reach the
+    # operator: with no `adb` on this machine `_device_statuses`
+    # downgrades `device.adb_unavailable` to one, and dropping it here
+    # is what makes a device lab read as "nothing attached" for a
+    # reason nothing on screen names.
+    _print_warnings(query_diagnostics)
 
     vm_status = next((v for v in status.vms if v.name == remote.host), None)
     ssh_host = vm_status.ssh_host if vm_status else None
@@ -1413,6 +1622,13 @@ def status_command(
         Path,
         typer.Option("--tofu-dir", help="OpenTofu working directory."),
     ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
     output: Annotated[
         OutputFormat,
         typer.Option("--output", "-o", help="Output format."),
@@ -1439,7 +1655,7 @@ def status_command(
                 # warning rather than blocking the whole listing.
                 any_diags.append(unsupported_backend_diagnostic(resolved.backend))
                 continue
-            lab_status, lab_diags = query_status(resolved, tofu_dir)
+            lab_status, lab_diags = query_status(resolved, tofu_dir, state_dir)
             entries.append(lab_status)
             any_diags.extend(lab_diags)
         if output is OutputFormat.json:
@@ -1458,13 +1674,25 @@ def status_command(
 
     resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
     _exit_if_unsupported_backend(resolved, output)
-    status, query_diagnostics = query_status(resolved, tofu_dir)
+    status, query_diagnostics = query_status(resolved, tofu_dir, state_dir)
     _exit_on_errors(query_diagnostics, output, json_errors=False)
+    # `_exit_on_errors` only ever raises on an ERROR; a WARNING (e.g. the
+    # downgraded `device.adb_unavailable` `_device_statuses` returns when
+    # adb is missing/hung) falls through here and must still reach the
+    # operator -- otherwise a device lab queried from a machine without
+    # adb renders `state=missing` with no visible cause, silently, which
+    # is exactly the "presents as no devices attached" confusion
+    # handoff (c) exists to eliminate.
 
     if output is OutputFormat.json:
-        _print_json(status.model_dump(mode="json", exclude_none=True))
+        payload = status.model_dump(mode="json", exclude_none=True)
+        if query_diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in query_diagnostics]
+        _print_json(payload)
         return
 
+    if query_diagnostics:
+        _print_diagnostics(query_diagnostics, err=True)
     _render_status_human(status)
 
 
@@ -1484,6 +1712,27 @@ def _render_status_human(status: LabStatus) -> None:
             f"  unknown VMs in observed state (not in lab): "
             f"{', '.join(status.unknown_vms)}"
         )
+    if status.devices:
+        typer.echo("")
+        connected = sum(1 for d in status.devices if d.state == "connected")
+        typer.echo(f"  {connected} of {len(status.devices)} devices connected")
+        for device in status.devices:
+            marker = "+" if device.state == "connected" else "-"
+            serial = device.serial or "—"
+            model = device.model or "—"
+            typer.echo(
+                f"  {marker} {device.name}  state={device.state}  "
+                f"serial={serial}  model={model}"
+            )
+            if device.rebind_candidates:
+                # Reported, never acted on: `status` is read-only and
+                # nothing here rebinds. Naming `apply --rebind` is what
+                # keeps a swapped cable from reading as "phone missing".
+                found = ", ".join(device.rebind_candidates)
+                typer.echo(
+                    f"      a different matching handset is attached ({found}) — "
+                    f"re-run `playground apply {status.lab} --rebind` to use it"
+                )
 
 
 @app.command("destroy")
@@ -1531,6 +1780,19 @@ def destroy_command(
     if finished.status == "failed":
         _present_apply_failure(output, finished, diagnostics, state_dir)
         raise typer.Exit(code=1)
+
+    # Physical devices are never destroyed -- only their lab-slot bindings
+    # are forgotten. Backend-independent, so this runs after every
+    # backend's destroy succeeds, not just libvirt's.
+    if resolved.devices:
+        release_diagnostics = release(state_dir, lab, resolved.devices)
+        if release_diagnostics:
+            # err=True (not the per-diagnostic-severity default `None`):
+            # `release` returns `[]` today, but the moment it grows the
+            # uninstall bookkeeping its own docstring promises, a warning
+            # printed to stdout here would pollute `--output json`'s
+            # otherwise-clean stdout. Free to fix now, before that lands.
+            _print_diagnostics(release_diagnostics, err=True)
 
     if output is OutputFormat.json:
         _print_json(finished.model_dump(mode="json", exclude_none=True))

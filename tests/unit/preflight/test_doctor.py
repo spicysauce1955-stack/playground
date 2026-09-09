@@ -1167,6 +1167,13 @@ def test_run_all_checks_concatenates_in_order(monkeypatch: pytest.MonkeyPatch) -
         "check_running_inside_hypervisor",
         _make("virt-host", "runtime.doctor.host_is_virtualized"),
     )
+    # Physical-device probes also get mocked -- `check_attached_devices`
+    # shells out to a real `adb devices -l` (twice, pre-fix-round-1) and
+    # must not run unmocked in a unit test; `check_adb_available` is a
+    # plain `shutil.which` so it's host-independent already, but mocking
+    # both keeps this orchestrator test's list of probes exhaustive.
+    monkeypatch.setattr(doctor, "check_adb_available", lambda: None)
+    monkeypatch.setattr(doctor, "check_attached_devices", lambda: [])
 
     diagnostics = doctor.run_all_checks()
     # Filter out vbox/qemu_img diagnostics — those probes still run
