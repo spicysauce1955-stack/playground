@@ -447,8 +447,12 @@ declared resources).
 (`runtime.apply.pre_vpc_lab`): run `playground destroy <lab>` then
 `playground apply <lab>` deliberately. The new validator errors
 (`do_single_network`, `do_vpc_cidr_invalid`, `do_vm_size_invalid`) are
-downgraded to warnings for destroy / reset / suspend, so an old lab can
-always be torn down.
+errors only for commands that provision or render (`validate`, `plan`,
+`apply`, `resume`, `tofu render`, `inventory render`); every other command
+(status, exec, cp, adb, app, capture, isolate, connect, destroy, reset,
+suspend, the TUI) downgrades them to warnings via
+`cli/tolerant_validation.py`, so an old lab can always be inspected,
+un-isolated and torn down.
 Until re-applied, their firewall keeps the account-wide tags and makes
 `isolate` on any other lab fail with `runtime.isolate.foreign_firewall`.
 
@@ -1026,8 +1030,10 @@ connections therefore time out instead of failing fast. The CLI says so.
 
 ### Backend: local-libvirt (isolation)
 
-- Mechanism: a libvirt nwfilter `playground-isolate-<lab>` (name
-  sanitised), chain `root`, ebtables layer only, every rule
+- Mechanism: a libvirt nwfilter `playground-isolate-<lab>` (when the
+  lab name is not already `[A-Za-z0-9_.-]`, it is sanitised and suffixed
+  with `-<sha256(lab)[:8]>` so distinct labs never share a filter), chain
+  `root`, ebtables layer only, every rule
   `direction='out'` (traffic sent BY the guest), referenced through a
   `<filterref>` from every interface on a lab network. libvirtd enforces
   it on the host (no sudo, no host nftables) and it is persisted in the
