@@ -31,8 +31,10 @@ from typing import Any
 
 from playground.backend.cloud_digitalocean.do import (
     CONSOLE_URL,
+    _fetch_all_sizes,
     check_size_region_availability,
     check_vpc_conflicts,
+    check_vpc_would_be_default,
     delete_droplet,
     delete_vpc,
     droplet_summary,
@@ -332,6 +334,12 @@ def _provision(
     per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
     source_root = tofu_dir / "cloud_digitalocean"
     var_file = (per_lab_dir / f"{lab}.tfvars.json").resolve()
+
+    # Defense in depth for a lost isolation record: the per-lab tfvars written
+    # by the last apply/isolate is the source of truth, so refuse on it before
+    # any run or tofu step (a re-render would silently reopen egress).
+    if _tfvars_say_isolated(var_file):
+        return None, [_tfvars_isolated_diagnostic(operation, lab, var_file)]
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
 
     runs_dir = state_dir / "runs"
@@ -353,6 +361,7 @@ def _provision(
         )
 
     steps: list[StepResult] = []
+    preflight_warnings: list[Diagnostic] = []
 
     # ---- Step 0: cloud-preflight (credential check before any tofu run) ----
     bus.publish(run.run_id, "step_started", {"step": "cloud-preflight"})
@@ -489,6 +498,8 @@ def _provision(
             # API blip never breaks an otherwise-valid apply.
             # Per-VM sizing: every DISTINCT size in use is checked.
             size_diags: list[Diagnostic] = []
+            # One paginated catalogue fetch serves every distinct slug.
+            catalogue = _fetch_all_sizes(preflight_token) if plan.distinct_sizes else None
             for distinct_size in plan.distinct_sizes:
                 size_diags.extend(
                     check_size_region_availability(
@@ -496,6 +507,7 @@ def _provision(
                         lab_name=lab,
                         size=distinct_size,
                         region=plan.region,
+                        catalogue=catalogue,
                     )
                 )
             size_errors = [d for d in size_diags if d.severity == "error"]
@@ -538,12 +550,26 @@ def _provision(
             if not net_errors:
                 vpcs, vpc_list_diags, vpc_list_ok = list_vpcs(preflight_token)
                 if vpc_list_ok:
+                    state_file = per_lab_dir / "terraform.tfstate"
+                    own_vpc_ids = tfstate_instance_ids(state_file, "digitalocean_vpc")
                     net_errors = check_vpc_conflicts(
                         vpcs,
                         lab_name=lab,
                         vpc_name=f"{plan.name_prefix}-vpc",
                         vpc_cidr=plan.vpc_cidr,
+                        own_vpc_id=own_vpc_ids[0] if own_vpc_ids else None,
                     )
+                    for d in check_vpc_would_be_default(
+                        vpcs, lab_name=lab, region=plan.region,
+                    ):
+                        preflight_warnings.append(d)
+                        bus.publish(
+                            run.run_id, "log_line",
+                            {
+                                "step": "cloud-preflight",
+                                "line": f"WARNING: {d.message}",
+                            },
+                        )
                 else:
                     # Like the size check: an API blip must not block apply.
                     for d in vpc_list_diags:
@@ -763,7 +789,7 @@ def _provision(
         ),
     )
     bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
-    return finished, downgraded_verify
+    return finished, [*preflight_warnings, *downgraded_verify]
 
 
 # ---------------------------------------------------------------------------
@@ -1206,13 +1232,19 @@ def _vpc_sweep(
         if attempt < _VPC_DELETE_ATTEMPTS:
             time.sleep(_VPC_RETRY_SECONDS)
     diagnostics.extend(last)
+    default_note = (
+        "; it may be the region's default VPC, which DigitalOcean does not "
+        "allow deleting"
+        if vpc.get("default") is True
+        else ""
+    )
     diagnostics.append(
         Diagnostic(
             id=f"runtime.{operation}.orphaned_vpc",
             severity="warning",
             message=(
                 f"VPC {name!r} (id={vpc_id}) could not be deleted; it is free "
-                "but blocks re-creating this lab's network"
+                f"but blocks re-creating this lab's network{default_note}"
             ),
             source=SourceLocation(path=f"vpc/{vpc_id}"),
             suggestion="delete it at https://cloud.digitalocean.com/networking/vpc",
@@ -1300,6 +1332,74 @@ def _noop_step(name: str, log_path: Path) -> StepResult:
     )
 
 
+def tfstate_resources(state_path: Path, rtype: str) -> list[dict[str, Any]]:
+    """Managed resources of type ``rtype`` in a tfstate file.
+
+    The one tfstate parser: an absent, unreadable or malformed file yields
+    ``[]`` (callers must treat that as "not recorded", never as an error).
+    """
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    resources = state.get("resources") if isinstance(state, dict) else None
+    return [
+        r for r in (resources if isinstance(resources, list) else [])
+        if isinstance(r, dict)
+        and r.get("type") == rtype
+        and r.get("mode", "managed") == "managed"
+    ]
+
+
+def tfstate_instance_ids(
+    state_path: Path, rtype: str, *, name: str | None = None,
+) -> list[str]:
+    """Instance ``id`` attributes (as strings) of ``rtype`` resources in a tfstate.
+
+    ``name`` restricts to the resource of that tofu name (e.g. ``"lab"``).
+    """
+    ids: list[str] = []
+    for res in tfstate_resources(state_path, rtype):
+        if name is not None and res.get("name") != name:
+            continue
+        for inst in res.get("instances") or []:
+            attrs = inst.get("attributes") if isinstance(inst, dict) else None
+            rid = attrs.get("id") if isinstance(attrs, dict) else None
+            if rid not in (None, ""):
+                ids.append(str(rid))
+    return ids
+
+
+def _tfvars_say_isolated(var_file: Path) -> bool:
+    """True when the per-lab tfvars record ``egress_isolated: true``."""
+    try:
+        loaded = json.loads(var_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(loaded, dict) and loaded.get("egress_isolated") is True
+
+
+def _tfvars_isolated_diagnostic(operation: str, lab: str, var_file: Path) -> Diagnostic:
+    """``runtime.apply.lab_isolated`` (the id dispatch uses) from the tfvars signal.
+
+    Built here, not imported from dispatch: dispatch imports this package.
+    """
+    return Diagnostic(
+        id="runtime.apply.lab_isolated",
+        severity="error",
+        message=(
+            f"lab {lab!r}: its per-lab tfvars say egress_isolated=true; refusing to "
+            f"{operation}: provisioning needs internet access and a re-render must "
+            "not silently reopen egress"
+        ),
+        source=SourceLocation(path=str(var_file)),
+        suggestion=(
+            f"run `playground connect {lab}` first, then `playground {operation} "
+            f"{lab}`, then `playground isolate {lab}` again"
+        ),
+    )
+
+
 def _pre_vpc_lab_diagnostics(
     per_lab_dir: Path, lab: str, operation: str,
 ) -> list[Diagnostic]:
@@ -1311,15 +1411,9 @@ def _pre_vpc_lab_diagnostics(
     state file is not a pre-VPC lab.
     """
     state_file = per_lab_dir / "terraform.tfstate"
-    try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    resources = state.get("resources") if isinstance(state, dict) else None
-    if not isinstance(resources, list):
-        return []
-    types = {r.get("type") for r in resources if isinstance(r, dict)}
-    if "digitalocean_droplet" not in types or "digitalocean_vpc" in types:
+    if not tfstate_resources(state_file, "digitalocean_droplet") or tfstate_resources(
+        state_file, "digitalocean_vpc"
+    ):
         return []
     return [
         Diagnostic(

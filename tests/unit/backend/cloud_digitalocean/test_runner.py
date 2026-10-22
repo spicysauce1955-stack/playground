@@ -225,13 +225,18 @@ def _install_shims(
     def fake_verify_token(token: str) -> int:
         return verify_token_status
 
+    def fake_fetch_all_sizes(token):
+        steps_called.append("fetch-all-sizes")
+        return [], True, None, 200
+
     def fake_check_size_region_availability(
-        token, *, lab_name, size, region
+        token, *, lab_name, size, region, catalogue=None
     ) -> list[Diagnostic]:
         steps_called.append("cloud-preflight-size-check")
         return list(size_region_diagnostics or [])
 
     monkeypatch.setattr(f"{MOD}.verify_token", fake_verify_token)
+    monkeypatch.setattr(f"{MOD}._fetch_all_sizes", fake_fetch_all_sizes)
     monkeypatch.setattr(
         f"{MOD}.check_size_region_availability",
         fake_check_size_region_availability,
@@ -1469,17 +1474,139 @@ def test_resume_vpc_conflict_fails_before_tofu(
     assert "tofu-init" not in steps_called
 
 
+def _write_vpc_state(tmp_path: Path, vpc_id: str | None) -> None:
+    d = tmp_path / ".playground" / "state" / "cloud-digitalocean" / "cloud-smoke"
+    d.mkdir(parents=True, exist_ok=True)
+    resources = (
+        []
+        if vpc_id is None
+        else [{
+            "mode": "managed", "type": "digitalocean_vpc", "name": "lab",
+            "instances": [{"attributes": {"id": vpc_id}}],
+        }]
+    )
+    (d / "terraform.tfstate").write_text(json.dumps({"resources": resources}))
+
+
 def test_apply_own_vpc_is_not_a_conflict(
     tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
 ) -> None:
     monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
     steps_called = _install_shims(monkeypatch)
+    _write_vpc_state(tmp_path, "id-cloud-smoke-vpc")  # matches _vpc()'s id
     monkeypatch.setattr(
         f"{_MOD}.list_vpcs",
         lambda token: ([_vpc("cloud-smoke-vpc", "10.60.0.0/24")], [], True),
     )
     run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
     assert "runtime.cloud.vpc_conflict" not in [d.id for d in diags]
+    assert "tofu-init" in steps_called
+
+
+@pytest.mark.parametrize("state_id", [None, "some-other-id"])
+def test_apply_same_name_vpc_not_in_state_is_an_orphan_conflict(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir, state_id,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    _write_vpc_state(tmp_path, state_id)
+    monkeypatch.setattr(
+        f"{_MOD}.list_vpcs",
+        lambda token: ([_vpc("cloud-smoke-vpc", "10.60.0.0/24")], [], True),
+    )
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert run is not None and run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.cloud.vpc_conflict"]
+    assert "orphan" in diags[0].message and "id-cloud-smoke-vpc" in diags[0].message
+    assert "https://cloud.digitalocean.com/networking/vpc" in (diags[0].suggestion or "")
+    assert "tofu-init" not in steps_called
+
+
+def test_apply_warns_when_lab_vpc_would_be_the_regions_default(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    # Only a VPC in another region: none in the lab's region (nyc3).
+    monkeypatch.setattr(
+        f"{_MOD}.list_vpcs",
+        lambda token: ([_vpc("elsewhere", "10.70.0.0/24", region="ams3")], [], True),
+    )
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert run is not None and run.status == "succeeded"
+    warn = [d for d in diags if d.id == "runtime.cloud.vpc_would_be_default"]
+    assert len(warn) == 1 and warn[0].severity == "warning"
+    assert "nyc3" in warn[0].message
+    assert "tofu-init" in steps_called
+
+
+def test_apply_no_default_vpc_warning_when_region_has_a_vpc(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    _install_shims(monkeypatch)
+    monkeypatch.setattr(
+        f"{_MOD}.list_vpcs",
+        lambda token: ([_vpc("default-nyc3", "10.70.0.0/24", region="nyc3")], [], True),
+    )
+    _, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert "runtime.cloud.vpc_would_be_default" not in [d.id for d in diags]
+
+
+def test_size_catalogue_is_fetched_once_for_all_slugs(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    seen: list[Any] = []
+    monkeypatch.setattr(
+        f"{_MOD}._fetch_all_sizes", lambda token: (seen.append(1), [], True, None, 200)[1:]
+    )
+    resolved = resolved_cloud_smoke
+    vms = [
+        resolved.vms[0].model_copy(update={
+            "name": n, "provider_overrides": {"cloud-digitalocean": {"size": sz}},
+        })
+        for n, sz in (("a", "s-1vcpu-1gb"), ("b", "s-2vcpu-4gb"), ("c", "s-2vcpu-4gb"))
+    ]
+    resolved = resolved.model_copy(update={"vms": vms})
+    _apply(tmp_path, resolved, source_root, ansible_dir)
+    assert len(seen) == 1
+    assert steps_called.count("cloud-preflight-size-check") == 2  # distinct slugs
+
+
+@pytest.mark.parametrize("which", ["apply", "resume"])
+def test_isolated_tfvars_refuse_apply_before_anything(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir, which,
+) -> None:
+    from playground.backend.cloud_digitalocean import runner as r
+
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    d = tmp_path / ".playground" / "state" / "cloud-digitalocean" / "cloud-smoke"
+    d.mkdir(parents=True)
+    (d / "cloud-smoke.tfvars.json").write_text(json.dumps({"egress_isolated": True}))
+    fn = r.execute_apply if which == "apply" else r.execute_resume
+
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir, fn=fn)
+
+    assert run is None
+    assert [x.id for x in diags] == ["runtime.apply.lab_isolated"]
+    assert "playground connect cloud-smoke" in (diags[0].suggestion or "")
+    assert steps_called == []
+    assert not (tmp_path / ".playground" / "runs").exists()
+
+
+def test_non_isolated_tfvars_do_not_block_apply(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    d = tmp_path / ".playground" / "state" / "cloud-digitalocean" / "cloud-smoke"
+    d.mkdir(parents=True)
+    (d / "cloud-smoke.tfvars.json").write_text(json.dumps({"egress_isolated": False}))
+    run, _ = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert run is not None and run.status == "succeeded"
     assert "tofu-init" in steps_called
 
 

@@ -68,6 +68,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     timeout: float = 15,
+    json: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one HTTP request against the DigitalOcean API.
 
@@ -88,6 +89,7 @@ def _request(
                 method,
                 path,
                 params=params,
+                json=json,
                 headers={"Authorization": f"Bearer {token}"},
             )
             try:
@@ -303,34 +305,34 @@ def get_firewall(
     return fw, [], True
 
 
-def find_firewall(
-    token: str, name: str,
-) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
-    """Find the Cloud Firewall called ``name`` via ``GET /v2/firewalls``.
+def put_firewall(
+    token: str, firewall_id: str, body: dict[str, Any],
+) -> tuple[bool, list[Diagnostic]]:
+    """``PUT /v2/firewalls/<id>``: replace a firewall BY ID.
 
-    Returns ``(firewall_or_None, diagnostics, ok)``.  ``ok`` False means the
-    listing failed, so ``None`` does not mean "absent".
+    DigitalOcean's PUT needs the FULL body (``name``, ``inbound_rules``,
+    ``outbound_rules``, ``droplet_ids``, ``tags``).  Returns ``(ok, diags)``.
     """
-    items, ok = _list_paged(token, "/v2/firewalls", "firewalls")
-    if not ok:
-        return None, [
+    status, resp = _request("PUT", f"/v2/firewalls/{firewall_id}", token, json=body)
+    if status == 0 or status >= 300 or not isinstance(resp.get("firewall"), dict):
+        return False, [
             _api_error(
-                f"listing firewalls (looking for {name!r})",
+                f"updating firewall {firewall_id} (status {status})",
                 "check the token and retry; inspect "
                 "https://cloud.digitalocean.com/networking/firewalls",
             )
-        ], False
-    for fw in items:
-        if fw.get("name") == name:
-            return fw, [], True
-    return None, [], True
+        ]
+    return True, []
 
 
 def find_vpc(
     token: str, name: str,
 ) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
-    """Find the VPC called ``name`` via ``GET /v2/vpcs`` (same contract as
-    :func:`find_firewall`)."""
+    """Find the VPC called ``name`` via ``GET /v2/vpcs``.
+
+    Returns ``(vpc_or_None, diagnostics, ok)``.  ``ok`` False means the
+    listing failed, so ``None`` does not mean "absent".
+    """
     items, ok = _list_paged(token, "/v2/vpcs", "vpcs")
     if not ok:
         return None, [
@@ -364,16 +366,27 @@ def list_vpcs(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]
     return items, [], True
 
 
+VPC_CONSOLE_URL = "https://cloud.digitalocean.com/networking/vpc"
+
+
 def check_vpc_conflicts(
-    vpcs: list[dict[str, Any]], *, lab_name: str, vpc_name: str, vpc_cidr: str,
+    vpcs: list[dict[str, Any]],
+    *,
+    lab_name: str,
+    vpc_name: str,
+    vpc_cidr: str,
+    own_vpc_id: str | None = None,
 ) -> list[Diagnostic]:
     """Error diagnostics for VPCs that would make the lab's VPC create fail.
 
     A VPC (any region) conflicts when it has the same name as ``vpc_name`` or
     an ``ip_range`` overlapping ``vpc_cidr`` -- unless it is this lab's own
-    VPC (same name AND same range), which tofu manages in place.  Tofu can
-    destroy Droplets before hitting the resulting 422, so callers run this
-    before any tofu step.
+    VPC: its id equals ``own_vpc_id`` (the ``digitalocean_vpc`` id in the
+    per-lab tfstate) and it still has the same name and range, so tofu
+    manages it in place.  A same-name, same-range VPC that tofu does not
+    manage is an orphan (typically from a failed destroy) and a conflict.
+    Tofu can destroy Droplets before hitting the resulting 422, so callers
+    run this before any tofu step.
     """
     try:
         want = ipaddress.ip_network(vpc_cidr, strict=False)
@@ -397,15 +410,26 @@ def check_vpc_conflicts(
             and other.version == want.version
             and other.overlaps(want)
         )
-        if same_name and other == want:
-            continue  # this lab's own VPC
+        is_own = (
+            own_vpc_id is not None
+            and str(vpc.get("id")) == str(own_vpc_id)
+            and same_name
+            and other == want
+        )
+        if is_own:
+            continue  # tofu manages this one in place
         if not (same_name or overlaps):
             continue
-        why = (
-            f"has the same name {vpc_name!r}"
-            if same_name
-            else f"has ip_range {rng} overlapping {vpc_cidr}"
-        )
+        orphan = same_name and other == want
+        if orphan:
+            why = (
+                f"has the same name {vpc_name!r} and range but is not in this "
+                "lab's OpenTofu state; it is likely an orphan from a failed destroy"
+            )
+        elif same_name:
+            why = f"has the same name {vpc_name!r}"
+        else:
+            why = f"has ip_range {rng} overlapping {vpc_cidr}"
         out.append(
             Diagnostic(
                 id="runtime.cloud.vpc_conflict",
@@ -417,12 +441,42 @@ def check_vpc_conflicts(
                 ),
                 source=SourceLocation(path="DigitalOcean API"),
                 suggestion=(
-                    "delete the unused VPC, or change the lab network CIDR "
+                    f"delete the unused VPC (id {vpc.get('id')}) at "
+                    f"{VPC_CONSOLE_URL}, or change the lab network CIDR "
                     "so it does not overlap any VPC in the account"
                 ),
             )
         )
     return out
+
+
+def check_vpc_would_be_default(
+    vpcs: list[dict[str, Any]], *, lab_name: str, region: str,
+) -> list[Diagnostic]:
+    """Warn when ``region`` has no VPC yet, so the lab's VPC may become its default.
+
+    DigitalOcean may make the first VPC created in a region that region's
+    default, and a default VPC cannot be deleted (so ``destroy`` would leave
+    it behind).  ``vpcs`` is the full account listing already fetched.
+    """
+    if any(v.get("region") == region for v in vpcs):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.cloud.vpc_would_be_default",
+            severity="warning",
+            message=(
+                f"lab {lab_name!r}: the account has no VPC in region {region!r}; "
+                "DigitalOcean may make this lab's VPC the region's default, and "
+                "a default VPC cannot be deleted, so destroy would leave it behind"
+            ),
+            source=SourceLocation(path="DigitalOcean API"),
+            suggestion=(
+                f"create any resource in {region!r} first, or pick a region "
+                "that already has a default VPC"
+            ),
+        )
+    ]
 
 
 def delete_vpc(token: str, vpc_id: str) -> list[Diagnostic]:
@@ -528,6 +582,7 @@ def check_size_region_availability(
     lab_name: str,
     size: str,
     region: str,
+    catalogue: tuple[list[dict[str, Any]], bool, str | None, int] | None = None,
 ) -> list[Diagnostic]:
     """Preflight check: is ``size`` currently available in ``region``?
 
@@ -559,9 +614,14 @@ def check_size_region_availability(
       "not found" is reported as a hard error; any inconclusive result
       degrades to a warning and lets the apply proceed.
 
+    ``catalogue`` is an already-fetched :func:`_fetch_all_sizes` result; pass
+    it to check several slugs against ONE paginated fetch.
+
     The token value is never logged or included in any Diagnostic.
     """
-    sizes, complete, incomplete_reason, status = _fetch_all_sizes(token)
+    sizes, complete, incomplete_reason, status = (
+        catalogue if catalogue is not None else _fetch_all_sizes(token)
+    )
 
     match: dict[str, Any] | None = None
     for entry in sizes:
@@ -710,12 +770,14 @@ def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
 __all__ = [
     "CONSOLE_URL",
     "DEFAULT_TOKEN_ENV",
+    "VPC_CONSOLE_URL",
     "check_size_region_availability",
+    "check_vpc_would_be_default",
+    "put_firewall",
     "delete_droplet",
     "check_vpc_conflicts",
     "delete_vpc",
     "droplet_summary",
-    "find_firewall",
     "get_firewall",
     "find_vpc",
     "list_droplets_by_tag",

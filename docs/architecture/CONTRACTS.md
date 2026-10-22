@@ -315,9 +315,14 @@ ResolvedLab (backend=cloud-digitalocean)
         |
         v
 ================ execute_apply / execute_resume (runner.py) ================
-| cloud-preflight  token, size/region per distinct size, VPC name/range
-|                  conflict (runtime.cloud.vpc_conflict), pre-VPC lab
-|                  (runtime.apply.pre_vpc_lab) -- all before any tofu run
+| cloud-preflight  token, size/region per distinct size (one /v2/sizes
+|                  fetch), VPC name/range conflict
+|                  (runtime.cloud.vpc_conflict), pre-VPC lab
+|                  (runtime.apply.pre_vpc_lab), default-VPC warning
+|                  (runtime.cloud.vpc_would_be_default) -- all before any
+|                  tofu run. Before the run starts at all: a per-lab
+|                  tfvars with egress_isolated=true is refused
+|                  (runtime.apply.lab_isolated, "run playground connect")
 | tofu-init        (.playground/state/cloud-digitalocean/<lab>/ as cwd)
 | tofu-apply       (-var-file=<lab>.tfvars.json)
 | fetch-vm-ips     (tofu output -json → vm_ips map)
@@ -396,7 +401,16 @@ prefix (`config.network.do_vpc_cidr_invalid`), and warns that pinned
 per-VM IPs are ignored (`config.network.do_ip_pin_ignored`). The range
 must not overlap another VPC in the account (including DO's per-region
 default VPCs, e.g. `10.108.0.0/20` in nyc3); cloud-preflight checks this
-before tofu runs (`runtime.cloud.vpc_conflict`), and the validator warns
+before tofu runs (`runtime.cloud.vpc_conflict`). A VPC is exempt as "our
+own" only when its id equals the `digitalocean_vpc` id in the per-lab
+tfstate (and name and range still match); a same-name, same-range VPC that
+tofu does not manage is a conflict reported as a likely orphan from a
+failed destroy (console URL and id in the message). When the account has
+no VPC in the lab's region, preflight warns
+`runtime.cloud.vpc_would_be_default`: DO may make the first VPC in a region
+that region's default, and a default VPC cannot be deleted (vpc-sweep's
+warning says "it may be the region's default VPC" when deletion fails on a
+`default: true` VPC). The validator warns
 when two DO labs declare overlapping CIDRs (`config.network.do_cidr_overlap`). `tofu destroy` removes the VPC after the Droplets; teardown
 also runs a best-effort `vpc-sweep` after the tag sweep (find
 `<lab>-vpc`, delete, three attempts 5 s apart, warnings only:
@@ -1106,7 +1120,17 @@ connections therefore time out instead of failing fast. The CLI says so.
     is refused with `runtime.<op>.unexpected_changes`, so isolate never
     recreates a hand-deleted Droplet or applies config drift. Then
     `tofu apply <planfile>`. The tfvars file is restored if init, plan or
-    apply fails.
+    apply fails. Plan-time refusals record no `tofu-apply` step.
+  - **connect-only drift fallback:** a drifted lab is stuck otherwise
+    (apply is refused while isolated). On unexpected changes `connect` runs
+    no tofu: step `api-reopen` GETs our firewall by id, PUTs the full body
+    (name, inbound_rules, outbound_rules open `0.0.0.0/0`+`::/0` for
+    tcp/udp/icmp, droplet_ids, empty tags), waits for it to settle, verifies
+    it is open, and sets `egress_isolated=false`. The run `succeeded` with
+    warning `runtime.connect.reopened_out_of_band` (lists the drift; run
+    `playground apply <lab>` to reconcile). Opening is the safe direction;
+    `isolate` still refuses on drift and egress is never closed outside
+    tofu. On PUT/verify failure the run fails and the tfvars are restored.
   - **Verify by ID, after it settles:** the firewall id and Droplet ids
     come from the per-lab tfstate (output `firewall_id` too); the firewall
     is read with `GET /v2/firewalls/{id}` and polled (60 s, every 3 s)

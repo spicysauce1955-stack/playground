@@ -22,6 +22,13 @@ confirm through the DigitalOcean API, BY FIREWALL ID taken from the tfstate
 (names are not unique) and after DO reports the firewall settled, that the
 firewall covers the whole lab and has the intended outbound destinations.
 
+``connect`` has one fallback: when the scoped plan has unexpected changes (a
+drifted lab), it does not run tofu but PUTs our firewall BY ID with outbound
+reopened, waits for it to settle, verifies it, and warns the operator to run
+`playground apply` (step ``api-reopen``; never a ``tofu-apply`` step).
+Opening is the safe direction; ``isolate`` still refuses on drift and egress
+is never closed outside tofu.
+
 NOT blocked (verified live): the link-local metadata service
 (169.254.169.254) is served by the hypervisor, outside Cloud Firewall's
 reach, so it stays reachable while isolated.
@@ -42,6 +49,7 @@ from playground.backend.cloud_digitalocean.do import (
     get_firewall,
     list_droplets_by_tag,
     list_firewalls,
+    put_firewall,
     read_token,
     token_env_name,
 )
@@ -49,6 +57,8 @@ from playground.backend.cloud_digitalocean.runner import (
     _finalize_failure,
     _iso_now,
     _step,
+    tfstate_instance_ids,
+    tfstate_resources,
 )
 from playground.backend.local_libvirt.apply import _run_step, run_tofu_init
 from playground.events import EventBus, JsonlWriter
@@ -230,6 +240,53 @@ def _set_egress(
         ["<plan could not be read>"] if plan_json is None
         else _unexpected_changes(plan_json)
     )
+    if unexpected and operation == "connect":
+        # Drifted lab: tofu would refuse to apply (and apply is refused while
+        # isolated), leaving the operator stuck.  Opening egress is the safe
+        # direction, so reopen our firewall BY ID outside tofu.
+        firewall_id, _ = _read_state_ids(per_lab_dir / "terraform.tfstate")
+        bus.publish(run.run_id, "step_started", {"step": "api-reopen"})
+        reopen_log = logs_dir / "api-reopen.log"
+        started = _iso_now()
+        if firewall_id is None:
+            reopen_log.write_text("no readable firewall id in the OpenTofu state\n")
+            reopen_diags = [Diagnostic(
+                id="runtime.connect.state_unreadable",
+                severity="error",
+                message=f"the OpenTofu state for lab {lab!r} has no readable firewall id",
+                source=SourceLocation(path=str(per_lab_dir / "terraform.tfstate")),
+                suggestion=f"re-run `playground apply {lab}`",
+            )]
+        else:
+            reopen_diags = _api_reopen(
+                lab=lab, token=token, firewall_id=firewall_id, log_path=reopen_log,
+            )
+        steps.append(_step("api-reopen", exit_code=1 if reopen_diags else 0,
+                           log_path=reopen_log, started=started))
+        bus.publish(run.run_id, "step_finished",
+                    {"step": "api-reopen", "exit_code": 1 if reopen_diags else 0})
+        if reopen_diags:
+            revert()
+            return fail(reopen_diags, f"connect lab {lab!r}: out-of-band reopen failed")
+        finished = finish_run(
+            run, run_dir, status="succeeded", steps=steps,
+            summary=(
+                f"connected lab {lab!r}: outbound reopened through the API "
+                "(lab has drifted from its config)"
+            ),
+        )
+        bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
+        return finished, [Diagnostic(
+            id="runtime.connect.reopened_out_of_band",
+            severity="warning",
+            message=(
+                f"lab {lab!r} has drifted from its config ({', '.join(unexpected)}), "
+                "so egress was reopened directly through the DigitalOcean API "
+                "instead of OpenTofu"
+            ),
+            source=SourceLocation(path=str(per_lab_dir)),
+            suggestion=f"run `playground apply {lab}` to reconcile the lab",
+        )]
     if unexpected:
         revert()
         return fail(
@@ -398,17 +455,7 @@ def _preflight(
 
 def _state_has_firewall(state_path: Path) -> bool:
     """True when the local tfstate records a ``digitalocean_firewall``."""
-    try:
-        state = json.loads(state_path.read_text())
-    except (OSError, ValueError):
-        return False
-    resources = state.get("resources") if isinstance(state, dict) else None
-    if not isinstance(resources, list):
-        return False
-    return any(
-        isinstance(r, dict) and r.get("type") == "digitalocean_firewall"
-        for r in resources
-    )
+    return bool(tfstate_resources(state_path, "digitalocean_firewall"))
 
 
 def _read_state_ids(state_path: Path) -> tuple[str | None, set[str]]:
@@ -416,26 +463,76 @@ def _read_state_ids(state_path: Path) -> tuple[str | None, set[str]]:
 
     Ids come back as strings; ``firewall_id`` is None when unreadable.
     """
-    try:
-        state = json.loads(state_path.read_text())
-    except (OSError, ValueError):
-        return None, set()
-    firewall_id: str | None = None
-    droplet_ids: set[str] = set()
-    resources = state.get("resources") if isinstance(state, dict) else None
-    for res in resources if isinstance(resources, list) else []:
-        if not isinstance(res, dict) or res.get("mode", "managed") != "managed":
-            continue
-        for inst in res.get("instances") or []:
-            attrs = inst.get("attributes") if isinstance(inst, dict) else None
-            rid = attrs.get("id") if isinstance(attrs, dict) else None
-            if rid in (None, ""):
-                continue
-            if res.get("type") == "digitalocean_firewall" and res.get("name") == "lab":
-                firewall_id = str(rid)
-            elif res.get("type") == "digitalocean_droplet":
-                droplet_ids.add(str(rid))
-    return firewall_id, droplet_ids
+    fw_ids = tfstate_instance_ids(state_path, "digitalocean_firewall", name="lab")
+    return (
+        fw_ids[-1] if fw_ids else None,
+        set(tfstate_instance_ids(state_path, "digitalocean_droplet")),
+    )
+
+
+def _open_outbound_body(firewall: dict[str, Any]) -> dict[str, Any]:
+    """Full PUT body for ``firewall`` with outbound reopened to the internet.
+
+    Keeps name, inbound rules and attached Droplets; ``tags`` stays empty
+    (the lab firewall is attached by Droplet id only).
+    """
+    return {
+        "name": firewall.get("name"),
+        "inbound_rules": firewall.get("inbound_rules") or [],
+        "outbound_rules": [
+            {
+                "protocol": proto,
+                **({"ports": "all"} if proto != "icmp" else {}),
+                "destinations": {"addresses": list(_OPEN_DESTINATIONS)},
+            }
+            for proto in ("tcp", "udp", "icmp")
+        ],
+        "droplet_ids": firewall.get("droplet_ids") or [],
+        "tags": [],
+    }
+
+
+def _api_reopen(
+    *,
+    lab: str,
+    token: str,
+    firewall_id: str,
+    log_path: Path,
+) -> list[Diagnostic]:
+    """Reopen OUR firewall's outbound through the API, BY ID; ``[]`` means verified open.
+
+    Connect-only fallback for a drifted lab: opening egress is the safe
+    direction, so it may bypass tofu; closing never does.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fw, get_diags, ok = get_firewall(token, firewall_id)
+    if not ok or fw is None:
+        log_path.write_text(f"could not read firewall id={firewall_id}\n")
+        return get_diags or [_verify_failed(
+            "connect",
+            f"firewall id={firewall_id} was not found in the DigitalOcean account",
+            f"re-run `playground apply {lab}` to recreate it",
+        )]
+    put_ok, put_diags = put_firewall(token, firewall_id, _open_outbound_body(fw))
+    if not put_ok:
+        log_path.write_text(f"PUT firewall id={firewall_id} failed\n")
+        return [Diagnostic(
+            id="runtime.connect.apply_failed",
+            severity="error",
+            message=(
+                f"could not reopen outbound on firewall id={firewall_id} through the "
+                "DigitalOcean API; its actual rules are unknown"
+            ),
+            source=SourceLocation(path=f"firewall/{firewall_id}"),
+            suggestion=(
+                f"re-run `playground connect {lab}` or open the {lab}-fw firewall's "
+                "outbound rules in the console"
+            ),
+        ), *put_diags]
+    return _verify_firewall(
+        operation="connect", isolated=False, token=token, firewall_id=firewall_id,
+        state_droplet_ids=set(), log_path=log_path, lab=lab,
+    )
 
 
 def _tofu_plan(

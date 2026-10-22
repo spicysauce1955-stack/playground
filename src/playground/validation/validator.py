@@ -1089,7 +1089,7 @@ def _check_do_vm_sizes(
       string slug, or a ``cloud-digitalocean`` override block that is not a
       mapping.
     - ``config.backend.do_size_below_resources`` (warning): the VM's
-      effective slug (override > lab/provider ``size``) provides fewer vCPUs
+      effective slug (override > lab/provider ``size`` > ``DEFAULT_SIZE``) provides fewer vCPUs
       or less memory than the VM's declared resources. Slugs that do not
       parse as ``<n>vcpu-<m>gb`` are skipped.
     """
@@ -1107,6 +1107,11 @@ def _check_do_vm_sizes(
                 cfg_size = None
             if isinstance(cfg_size, str) and cfg_size.strip():
                 lab_size = cfg_size.strip()
+    if lab_size is None:
+        # Lazy import: the backend package imports the validator's siblings.
+        from playground.backend.cloud_digitalocean.plan import DEFAULT_SIZE
+
+        lab_size = DEFAULT_SIZE
 
     for idx, vm in enumerate(lab.spec.vms):
         size = lab_size

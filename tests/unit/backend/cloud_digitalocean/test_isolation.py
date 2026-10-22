@@ -690,11 +690,118 @@ def test_plan_with_other_changes_is_refused(resolved, state_dir, fakes, change) 
     assert _tfvars(state_dir)["egress_isolated"] is False
 
 
-def test_connect_refuses_unexpected_changes_with_its_own_id(resolved, state_dir, fakes) -> None:
+def _set_isolated_tfvars(state_dir: Path) -> None:
+    path = state_dir / "state" / "cloud-digitalocean" / LAB / f"{LAB}.tfvars.json"
+    data = json.loads(path.read_text())
+    data["egress_isolated"] = True
+    path.write_text(json.dumps(data))
+
+
+def _drifted(fakes: Fakes) -> None:
     fakes.plan_json = _plan(("digitalocean_droplet.node[0]", ["create"]))
+
+
+def _api_reopen_fakes(fakes: Fakes, monkeypatch: pytest.MonkeyPatch, *, put_ok: bool = True):
+    """Isolated firewall (with an inbound rule) is read, PUT, then reads open."""
+    isolated = {
+        **_fw(True),
+        "inbound_rules": [{"protocol": "tcp", "ports": "22",
+                           "sources": {"addresses": ["0.0.0.0/0"]}}],
+        "tags": ["leftover"],
+    }
+    fakes.firewall_queue = [isolated]
+    puts: list[tuple[str, dict[str, Any]]] = []
+
+    def put(token, fw_id, body):
+        assert token == FAKE_TOKEN
+        puts.append((fw_id, body))
+        fakes.api = [_fw(False)]
+        return put_ok, []
+
+    monkeypatch.setattr(iso, "put_firewall", put)
+    return puts
+
+
+def test_connect_on_drifted_lab_reopens_through_the_api(
+    resolved, state_dir, fakes, monkeypatch,
+) -> None:
+    _set_isolated_tfvars(state_dir)
+    _drifted(fakes)
+    puts = _api_reopen_fakes(fakes, monkeypatch)
+    run, diags = _run(execute_connect, resolved, state_dir)
+    assert run.status == "succeeded"
+    assert [d.id for d in diags] == ["runtime.connect.reopened_out_of_band"]
+    assert diags[0].severity == "warning"
+    assert "digitalocean_droplet.node[0] (create)" in diags[0].message
+    assert f"playground apply {LAB}" in (diags[0].suggestion or "")
+    names = [st.name for st in run.steps]
+    assert "api-reopen" in names and "tofu-apply" not in names
+    assert "apply" not in fakes.calls
+    assert _tfvars(state_dir)["egress_isolated"] is False
+    # Full body, by firewall id, tags empty, outbound open for all protocols.
+    [(fw_id, body)] = puts
+    assert fw_id == FW_ID
+    assert set(body) == {"name", "inbound_rules", "outbound_rules", "droplet_ids", "tags"}
+    assert body["name"] == f"{LAB}-fw" and body["droplet_ids"] == [111]
+    assert body["tags"] == []
+    assert body["inbound_rules"][0]["ports"] == "22"
+    assert {r["protocol"] for r in body["outbound_rules"]} == {"tcp", "udp", "icmp"}
+    assert all(r["destinations"] == {"addresses": ["0.0.0.0/0", "::/0"]}
+               for r in body["outbound_rules"])
+
+
+def test_drifted_connect_waits_for_settle_before_trusting(
+    resolved, state_dir, fakes, monkeypatch,
+) -> None:
+    _set_isolated_tfvars(state_dir)
+    _drifted(fakes)
+    _api_reopen_fakes(fakes, monkeypatch)
+    fakes.firewall_queue.append(_pending(False, status="waiting"))
+    run, _ = _run(execute_connect, resolved, state_dir)
+    assert run.status == "succeeded"
+    assert fakes.calls.count("get_firewall") == 3  # read, pending, settled
+
+
+def test_drifted_connect_put_failure_fails_and_keeps_tfvars(
+    resolved, state_dir, fakes, monkeypatch,
+) -> None:
+    _set_isolated_tfvars(state_dir)
+    _drifted(fakes)
+    _api_reopen_fakes(fakes, monkeypatch, put_ok=False)
     run, diags = _run(execute_connect, resolved, state_dir)
     assert run.status == "failed"
-    assert diags[0].id == "runtime.connect.unexpected_changes"
+    assert diags[0].id == "runtime.connect.apply_failed"
+    assert _tfvars(state_dir)["egress_isolated"] is True  # unchanged: still isolated
+
+
+def test_drifted_connect_fails_when_firewall_is_still_closed_after_put(
+    resolved, state_dir, fakes, monkeypatch,
+) -> None:
+    _set_isolated_tfvars(state_dir)
+    _drifted(fakes)
+    _api_reopen_fakes(fakes, monkeypatch)
+    fakes.firewall_queue.append(_fw(True))  # still isolated after the PUT
+    monkeypatch.setattr(iso, "put_firewall", lambda t, i, b: (True, []))
+    run, diags = _run(execute_connect, resolved, state_dir)
+    assert run.status == "failed" and diags[0].id == "runtime.connect.verify_failed"
+    assert _tfvars(state_dir)["egress_isolated"] is True
+
+
+def test_isolate_never_uses_the_api_path_on_drift(
+    resolved, state_dir, fakes, monkeypatch,
+) -> None:
+    _drifted(fakes)
+    puts = _api_reopen_fakes(fakes, monkeypatch)
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed" and diags[0].id == "runtime.isolate.unexpected_changes"
+    assert puts == []
+
+
+def test_open_outbound_body_is_pure_and_complete() -> None:
+    body = iso._open_outbound_body({"name": "n", "droplet_ids": [1], "tags": ["x"]})
+    assert body["inbound_rules"] == [] and body["tags"] == [] and body["droplet_ids"] == [1]
+    icmp = next(r for r in body["outbound_rules"] if r["protocol"] == "icmp")
+    assert "ports" not in icmp
 
 
 def test_unreadable_plan_is_refused(resolved, state_dir, fakes) -> None:

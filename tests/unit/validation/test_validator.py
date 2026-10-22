@@ -1240,6 +1240,29 @@ def test_do_size_below_resources_uses_lab_size_when_no_override(
     assert len(_do_diags(committed_load, "config.backend.do_size_below_resources")) == 1
 
 
+def test_do_size_below_resources_falls_back_to_default_size(
+    committed_load: LoadedConfig,
+) -> None:
+    """No lab size, no provider-config size: DEFAULT_SIZE (1 vCPU, 1 GiB) applies."""
+    lab = committed_load.labs["cloud-smoke"]
+    providers = dict(lab.spec.providers)
+    providers.pop("cloud-digitalocean", None)
+    committed_load.labs["cloud-smoke"] = lab.model_copy(
+        update={"spec": lab.spec.model_copy(update={"providers": providers})}
+    )
+    cfg = committed_load.providers["cloud-digitalocean"]
+    committed_load.providers["cloud-digitalocean"] = cfg.model_copy(
+        update={"spec": cfg.spec.model_copy(update={"size": None})}
+    )
+    _do_lab_with_vms(
+        committed_load,
+        [{"name": "a", "resources": Resources(vcpu=1, memory_mb=2048, disk_gb=25)}],
+    )
+    warns = _do_diags(committed_load, "config.backend.do_size_below_resources")
+    assert len(warns) == 1
+    assert "'s-1vcpu-1gb'" in warns[0].message
+
+
 def test_do_size_below_resources_skips_unparseable_slug(
     committed_load: LoadedConfig,
 ) -> None:

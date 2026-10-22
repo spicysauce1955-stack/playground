@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from playground.backend.cloud_digitalocean import do as do_module
-from playground.backend.cloud_digitalocean.do import _is_api_url, find_firewall, get_firewall
+from playground.backend.cloud_digitalocean.do import _is_api_url, get_firewall, list_firewalls
 
 TOKEN = "dop_v1_faketoken0000000000000000000000000000"
 
@@ -43,8 +43,8 @@ def test_foreign_next_link_is_not_followed(monkeypatch) -> None:
     seen = _recording(monkeypatch, {"/v2/firewalls": (200, {
         "firewalls": [{"name": "a"}], "links": {"pages": {"next": evil}},
     })})
-    fw, diags, ok = find_firewall(TOKEN, "b")
-    assert not ok and fw is None
+    fws, diags, ok = list_firewalls(TOKEN)
+    assert not ok and fws == []
     assert diags and diags[0].severity == "warning"
     assert seen == ["/v2/firewalls"]  # the token never left for the other host
 
