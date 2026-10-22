@@ -361,7 +361,12 @@ def test_wait_cloud_init_passes_ssh_options(
     assert "BatchMode=yes" in captured["args"]
     assert "StrictHostKeyChecking=accept-new" in captured["args"]
     assert "root@10.0.0.10" in captured["args"]
-    assert "cloud-init status --wait" in captured["args"]
+    assert wait_mod.CLOUD_INIT_WAIT_COMMAND in captured["args"]
+    # Rocky 8's non-root `cloud-init status --wait` crashes; the gate
+    # must prefer the passwordless-sudo form and keep a plain fallback.
+    cmd = wait_mod.CLOUD_INIT_WAIT_COMMAND
+    assert "sudo -n cloud-init status --wait" in cmd
+    assert "else cloud-init status --wait" in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -428,3 +433,9 @@ def test_ssh_probe_omits_port_for_default() -> None:
         w.subprocess.run = orig
     assert rc == 0
     assert "-p" not in captured["args"]
+
+
+def test_cloud_init_default_budget_fits_slow_first_boot_upgrade() -> None:
+    """Stock Rocky 8.10 takes ~13 min in `dnf upgrade`; the default
+    budget must exceed that."""
+    assert wait_mod.DEFAULT_CLOUD_INIT_TIMEOUT_SECONDS >= 1500

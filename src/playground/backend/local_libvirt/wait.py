@@ -15,11 +15,13 @@ This module probes each VM in two phases, in parallel:
    ``ssh_timeout`` elapses. Cheap, fast, and a strict prerequisite
    for phase 2.
 2. **cloud-init done** — SSH into the VM and run
-   ``cloud-init status --wait``. That command blocks on the *VM*
+   ``cloud-init status --wait`` (under ``sudo -n`` when available:
+   Rocky/Alma 8's non-root form crashes). That command blocks on the *VM*
    side until every cloud-init stage (including
    ``package_upgrade``) is finished, which is the second race we
    need to gate on: cloud-init holds the apt lock while ansible
-   would otherwise be trying to ``apt install``.
+   would otherwise be trying to ``apt install`` (or ``dnf upgrade``
+   on RedHat-family images).
 
 Both phases run concurrently across VMs via a thread pool — total
 wall time is roughly ``max(per-VM time)`` rather than the sum.
@@ -45,9 +47,11 @@ from playground.ssh.argv import build_ssh_argv
 DEFAULT_SSH_TIMEOUT_SECONDS = 300.0
 """Per-VM wait for sshd to accept TCP connections."""
 
-DEFAULT_CLOUD_INIT_TIMEOUT_SECONDS = 600.0
+DEFAULT_CLOUD_INIT_TIMEOUT_SECONDS = 1800.0
 """Per-VM wait for ``cloud-init status --wait`` to return; covers
-package_update + package_upgrade time."""
+package_update + package_upgrade time. 30 minutes because a stock
+Rocky 8.10 Droplet (s-1vcpu-2gb) needs ~12-13 minutes for the first-boot
+``dnf upgrade``. It is only a ceiling: a ready VM returns immediately."""
 
 SSH_PORT = 22
 
@@ -442,6 +446,13 @@ class _CloudInitResult:
     timed_out: bool = False
 
 
+CLOUD_INIT_WAIT_COMMAND = (
+    "if sudo -n true 2>/dev/null; then sudo -n cloud-init status --wait; "
+    "else cloud-init status --wait; fi"
+)
+"""Remote command for the cloud-init gate; see ``_wait_cloud_init``."""
+
+
 def _wait_cloud_init(
     *, ip: str, user: str, timeout: float, port: int = SSH_PORT,
 ) -> _CloudInitResult:
@@ -451,12 +462,20 @@ def _wait_cloud_init(
     subprocess timeout is the effective overall budget for this phase.
     ``-p <port>`` is added only for non-default ports (vbox NAT
     forwards) so the libvirt command line is byte-for-byte unchanged.
+
+    The command runs under ``sudo -n`` when sudo is passwordless: on
+    Rocky/Alma 8 (cloud-init 23.4) the non-root form crashes with exit 1
+    (PermissionError on /run/cloud-init/cloud.cfg, D-Bus disconnect
+    during the first-boot package upgrade) while the root form blocks
+    correctly. Every playground VM user has NOPASSWD sudo from
+    cloud-init on all backends; the plain form is the fallback for
+    root / sudo-less images.
     """
     cmd = build_ssh_argv(
         ip,
         user=user,
         port=port,
-        command="cloud-init status --wait",
+        command=CLOUD_INIT_WAIT_COMMAND,
         batch=True,
     )
     try:
