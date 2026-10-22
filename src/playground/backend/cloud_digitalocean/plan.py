@@ -64,7 +64,13 @@ class DoPlan:
     """DigitalOcean region slug, e.g. ``"nyc3"``."""
 
     size: str
-    """Droplet size slug, e.g. ``"s-1vcpu-1gb"``."""
+    """Lab-wide Droplet size slug, e.g. ``"s-1vcpu-1gb"``.  The default for
+    any VM without a per-VM override."""
+
+    vm_sizes: dict[str, str]
+    """Effective Droplet size slug for EVERY VM (VM name -> slug): the
+    per-VM ``provider_overrides.cloud-digitalocean.size`` when set, else
+    :attr:`size`."""
 
     image: str
     """Droplet base image slug, e.g. ``"ubuntu-24-04-x64"``."""
@@ -88,9 +94,30 @@ class DoPlan:
     """Per-lab DNS domain, used for cloud-init hostname / fqdn."""
 
     @property
+    def distinct_sizes(self) -> list[str]:
+        """Distinct size slugs in use, in first-seen VM order."""
+        return list(dict.fromkeys(self.vm_sizes[n] for n in self.vm_names))
+
+    @property
     def vm_count(self) -> int:
         """Number of Droplets this plan will create."""
         return len(self.vm_names)
+
+
+def _vm_size_override(provider_overrides: dict[str, Any]) -> str | None:
+    """Return the per-VM ``cloud-digitalocean`` size override, or ``None``.
+
+    Only a non-empty string counts; a malformed value is the validator's
+    error to report (``config.backend.do_vm_size_invalid``), so the plan
+    quietly falls back to the lab-wide size rather than raising.
+    """
+    block = provider_overrides.get("cloud-digitalocean")
+    if not isinstance(block, dict):
+        return None
+    value = block.get("size")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def build_do_plan(
@@ -108,6 +135,9 @@ def build_do_plan(
 
     - ``region``, ``size``, ``image`` fall back to the module defaults when
       the key is absent or falsy in ``provider_settings``.
+    - ``vm_sizes`` maps every VM to its per-VM
+      ``provider_overrides["cloud-digitalocean"]["size"]`` (a non-empty
+      string) when set, else the lab-wide ``size``.
     - ``vm_names`` preserves lab declaration order (``resolved.vms``).
     - ``ssh_key_fingerprints`` defaults to an empty list.
     - ``firewall_ssh_cidrs`` is read from the nested
@@ -125,6 +155,10 @@ def build_do_plan(
     image: str = provider_settings.get("image") or DEFAULT_IMAGE
 
     vm_names: list[str] = [vm.name for vm in resolved.vms]
+    vm_sizes: dict[str, str] = {
+        vm.name: _vm_size_override(vm.provider_overrides) or size
+        for vm in resolved.vms
+    }
 
     ssh_key_fingerprints: list[str] = list(
         provider_settings.get("ssh_key_fingerprints") or []
@@ -148,6 +182,7 @@ def build_do_plan(
         name_prefix=resolved.lab_name,
         region=region,
         size=size,
+        vm_sizes=vm_sizes,
         image=image,
         vm_names=vm_names,
         ssh_key_fingerprints=ssh_key_fingerprints,

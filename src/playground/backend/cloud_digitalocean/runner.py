@@ -468,12 +468,17 @@ def _provision(
             # API response must NOT block the apply — it degrades to a
             # warning (see check_size_region_availability) so a DigitalOcean
             # API blip never breaks an otherwise-valid apply.
-            size_diags = check_size_region_availability(
-                preflight_token,
-                lab_name=lab,
-                size=plan.size,
-                region=plan.region,
-            )
+            # Per-VM sizing: every DISTINCT size in use is checked.
+            size_diags: list[Diagnostic] = []
+            for distinct_size in plan.distinct_sizes:
+                size_diags.extend(
+                    check_size_region_availability(
+                        preflight_token,
+                        lab_name=lab,
+                        size=distinct_size,
+                        region=plan.region,
+                    )
+                )
             size_errors = [d for d in size_diags if d.severity == "error"]
             size_warnings = [d for d in size_diags if d.severity != "error"]
             for d in size_warnings:
@@ -502,8 +507,9 @@ def _provision(
                 )
                 return _finalize_failure(
                     run, run_dir, steps, bus, size_errors,
-                    f"credential preflight failed: size {plan.size!r} is "
-                    f"not available in region {plan.region!r} for lab "
+                    f"credential preflight failed: size(s) "
+                    f"{', '.join(repr(s) for s in plan.distinct_sizes)} not "
+                    f"all available in region {plan.region!r} for lab "
                     f"{lab!r}",
                 )
 

@@ -1708,7 +1708,10 @@ def _render_status_human(status: LabStatus) -> None:
     for vm in status.vms:
         marker = "+" if vm.state == "provisioned" else "-"
         ip = vm.ip or "—"
-        typer.echo(f"  {marker} {vm.name}  role={vm.role}  ip={ip}")
+        addrs = f"ip={ip}"
+        if vm.public_ip:
+            addrs += f"  public_ip={vm.public_ip}"
+        typer.echo(f"  {marker} {vm.name}  role={vm.role}  {addrs}")
     if status.unknown_vms:
         typer.echo("")
         typer.echo(

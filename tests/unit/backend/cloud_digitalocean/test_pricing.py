@@ -84,3 +84,18 @@ def test_price_table_values(size: str, count: int, expected_monthly: float) -> N
     result = estimate_cost(size, count)
     assert result is not None
     assert result.monthly_usd == expected_monthly
+
+
+def test_estimate_cost_for_sizes_sums_per_vm() -> None:
+    from playground.backend.cloud_digitalocean.pricing import estimate_cost_for_sizes
+
+    result = estimate_cost_for_sizes(["s-1vcpu-2gb"] * 5 + ["s-2vcpu-4gb"])
+    assert result is not None
+    assert result.monthly_usd == 12.0 * 5 + 24.0
+    assert result.hourly_usd == round((12.0 * 5 + 24.0) / _HOURS_PER_MONTH, 5)
+
+
+def test_estimate_cost_for_sizes_none_when_any_size_unknown() -> None:
+    from playground.backend.cloud_digitalocean.pricing import estimate_cost_for_sizes
+
+    assert estimate_cost_for_sizes(["s-1vcpu-2gb", "s-99vcpu-1gb"]) is None

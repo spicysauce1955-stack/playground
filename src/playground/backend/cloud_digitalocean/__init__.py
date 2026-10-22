@@ -28,7 +28,7 @@ from playground.backend.cloud_digitalocean.plan import (
     build_do_plan,
     ownership_tags,
 )
-from playground.backend.cloud_digitalocean.pricing import estimate_cost
+from playground.backend.cloud_digitalocean.pricing import estimate_cost, estimate_cost_for_sizes
 from playground.backend.cloud_digitalocean.runner import (
     execute_apply,
     execute_destroy,
@@ -47,6 +47,7 @@ __all__ = [
     "DoPlan",
     "build_do_plan",
     "estimate_cost",
+    "estimate_cost_for_sizes",
     "execute_apply",
     "execute_connect",
     "execute_destroy",

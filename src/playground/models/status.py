@@ -64,13 +64,23 @@ class VmStatus(StrictModel):
     name: str
     role: str
     ip: str | None = None
+    """Primary address of the VM. libvirt: the DHCP lease; vbox: the
+    guest-side address; cloud-digitalocean: the PRIVATE VPC IPv4 (``None``
+    when the Droplet has none -- it never falls back to the public one).
+    Display/in-lab addressing only; anything that CONNECTS to the VM must
+    use ``ssh_host`` / ``ssh_port``."""
+    public_ip: str | None = None
+    """Publicly routable IPv4, set only by backends whose VMs have both a
+    private and a public address (cloud-digitalocean). ``None`` on local
+    backends, so their JSON output is unchanged (``exclude_none``)."""
     state: VmState
     provider_id: str | None = None
     """Cloud provider resource ID (e.g. DigitalOcean Droplet ID as a string).
     ``None`` for local backends (libvirt, vbox) that have no external resource ID."""
     ssh_host: str | None = None
     """Reachable SSH host for a backend-neutral consumer.
-    libvirt and cloud backends set this to the VM IP; vbox uses
+    libvirt sets this to the VM IP; cloud-digitalocean to the PUBLIC IP
+    (not ``ip``, which is the private VPC address); vbox uses
     ``127.0.0.1`` (NAT port-forward). ``None`` when the VM is not
     yet provisioned or otherwise unreachable."""
     ssh_port: int | None = None

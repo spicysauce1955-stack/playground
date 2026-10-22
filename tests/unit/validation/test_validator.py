@@ -9,7 +9,7 @@ import pytest
 from ruamel.yaml import YAML
 
 from playground.config.loader import LoadedConfig, load_config
-from playground.models.kinds import Lab, VmRole, parse_resource
+from playground.models.kinds import Lab, Resources, VmRole, parse_resource
 from playground.validation.validator import validate
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -1120,3 +1120,132 @@ def test_device_profile_reference_must_exist(committed_load: LoadedConfig) -> No
     assert len(matching) == 1
     assert matching[0].severity == "error"
     assert matching[0].key_path == "spec.devices[0].profile"
+
+# ---------------------------------------------------------------------------
+# cloud-digitalocean per-VM size overrides
+# ---------------------------------------------------------------------------
+
+
+def _do_lab_with_vms(committed_load: LoadedConfig, vm_updates: list[dict]) -> None:
+    """Rebuild cloud-smoke with one VM per update dict (cloned from node1)."""
+    lab = committed_load.labs["cloud-smoke"]
+    base = lab.spec.vms[0]
+    vms = [base.model_copy(update=u) for u in vm_updates]
+    committed_load.labs["cloud-smoke"] = lab.model_copy(
+        update={"spec": lab.spec.model_copy(update={"vms": vms})}
+    )
+
+
+def _do_diags(committed_load: LoadedConfig, diag_id: str):
+    return [
+        d for d in validate(committed_load, lab="cloud-smoke") if d.id == diag_id
+    ]
+
+
+def test_do_per_vm_resources_warning_fires_without_overrides(
+    committed_load: LoadedConfig,
+) -> None:
+    _do_lab_with_vms(
+        committed_load,
+        [
+            {"name": "a", "resources": Resources(vcpu=1, memory_mb=1024, disk_gb=25)},
+            {"name": "b", "resources": Resources(vcpu=1, memory_mb=1024, disk_gb=50)},
+        ],
+    )
+    matching = _do_diags(committed_load, "config.backend.per_vm_resources_unsupported")
+    assert len(matching) == 1
+    assert "a, b" in matching[0].message
+    assert "provider_overrides.cloud-digitalocean.size" in (
+        matching[0].suggestion or ""
+    )
+
+
+def test_do_per_vm_resources_warning_silent_when_all_vms_have_size_override(
+    committed_load: LoadedConfig,
+) -> None:
+    ov = {"cloud-digitalocean": {"size": "s-2vcpu-4gb"}}
+    _do_lab_with_vms(
+        committed_load,
+        [
+            {"name": "a", "provider_overrides": ov,
+             "resources": Resources(vcpu=1, memory_mb=1024, disk_gb=25)},
+            {"name": "b", "provider_overrides": ov,
+             "resources": Resources(vcpu=2, memory_mb=2048, disk_gb=50)},
+        ],
+    )
+    assert not _do_diags(committed_load, "config.backend.per_vm_resources_unsupported")
+
+
+@pytest.mark.parametrize("bad", [4, "", "  ", ["s-1vcpu-1gb"], None])
+def test_do_vm_size_override_must_be_string_slug(
+    committed_load: LoadedConfig, bad: object,
+) -> None:
+    _do_lab_with_vms(
+        committed_load,
+        [{"name": "a", "provider_overrides": {"cloud-digitalocean": {"size": bad}}}],
+    )
+    errors = _do_diags(committed_load, "config.backend.do_vm_size_invalid")
+    assert len(errors) == 1
+    assert errors[0].severity == "error"
+    assert errors[0].key_path == (
+        "spec.vms[0].provider_overrides.cloud-digitalocean.size"
+    )
+
+
+def test_do_vm_size_override_block_must_be_mapping(
+    committed_load: LoadedConfig,
+) -> None:
+    _do_lab_with_vms(
+        committed_load,
+        [{"name": "a", "provider_overrides": {"cloud-digitalocean": "s-1vcpu-1gb"}}],
+    )
+    assert len(_do_diags(committed_load, "config.backend.do_vm_size_invalid")) == 1
+
+
+def test_do_valid_size_override_is_clean(committed_load: LoadedConfig) -> None:
+    _do_lab_with_vms(
+        committed_load,
+        [{"name": "a", "resources": Resources(vcpu=1, memory_mb=1024, disk_gb=25),
+          "provider_overrides": {"cloud-digitalocean": {"size": "s-1vcpu-2gb"}}}],
+    )
+    assert not _do_diags(committed_load, "config.backend.do_vm_size_invalid")
+    assert not _do_diags(committed_load, "config.backend.do_size_below_resources")
+
+
+def test_do_size_below_resources_warns_per_vm(committed_load: LoadedConfig) -> None:
+    _do_lab_with_vms(
+        committed_load,
+        [
+            {"name": "a", "resources": Resources(vcpu=2, memory_mb=4096, disk_gb=25),
+             "provider_overrides": {"cloud-digitalocean": {"size": "s-1vcpu-2gb"}}},
+            {"name": "b", "resources": Resources(vcpu=2, memory_mb=4096, disk_gb=25),
+             "provider_overrides": {"cloud-digitalocean": {"size": "s-2vcpu-4gb"}}},
+        ],
+    )
+    warns = _do_diags(committed_load, "config.backend.do_size_below_resources")
+    assert len(warns) == 1
+    assert warns[0].severity == "warning"
+    assert "'a'" in warns[0].message
+    assert warns[0].key_path == "spec.vms[0].resources"
+
+
+def test_do_size_below_resources_uses_lab_size_when_no_override(
+    committed_load: LoadedConfig,
+) -> None:
+    # cloud-smoke's lab size is s-1vcpu-1gb (1 vCPU, 1024 MiB).
+    _do_lab_with_vms(
+        committed_load,
+        [{"name": "a", "resources": Resources(vcpu=1, memory_mb=2048, disk_gb=25)}],
+    )
+    assert len(_do_diags(committed_load, "config.backend.do_size_below_resources")) == 1
+
+
+def test_do_size_below_resources_skips_unparseable_slug(
+    committed_load: LoadedConfig,
+) -> None:
+    _do_lab_with_vms(
+        committed_load,
+        [{"name": "a", "resources": Resources(vcpu=8, memory_mb=65536, disk_gb=25),
+          "provider_overrides": {"cloud-digitalocean": {"size": "custom-slug"}}}],
+    )
+    assert not _do_diags(committed_load, "config.backend.do_size_below_resources")

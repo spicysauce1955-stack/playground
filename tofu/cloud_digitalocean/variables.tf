@@ -18,6 +18,12 @@ variable "size" {
   type        = string
 }
 
+variable "vm_sizes" {
+  description = "Per-VM Droplet size slug overrides keyed by VM name. A VM absent from the map uses var.size. Set from spec.vms[].provider_overrides.cloud-digitalocean.size."
+  type        = map(string)
+  default     = {}
+}
+
 variable "image" {
   description = "DigitalOcean image slug or ID used as the Droplet base image (e.g. 'ubuntu-24-04-x64'). Set via the provider config or per-lab override."
   type        = string

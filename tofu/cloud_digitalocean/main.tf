@@ -17,7 +17,7 @@ resource "digitalocean_droplet" "node" {
 
   name   = "${var.name_prefix}-${var.vm_names[count.index]}"
   region = var.region
-  size   = var.size
+  size   = lookup(var.vm_sizes, var.vm_names[count.index], var.size)
   image  = var.image
 
   # DO-registered keys attached at creation time (optional belt-and-braces;

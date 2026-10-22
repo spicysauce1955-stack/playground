@@ -420,24 +420,29 @@ def verify_token(token: str) -> int:
 
 
 def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
-    """Extract ``{name, id, status, public_ipv4}`` from a raw droplet dict.
+    """Extract ``{name, id, status, public_ipv4, private_ipv4}`` from a raw
+    droplet dict.
 
-    ``public_ipv4`` is the first ``networks.v4`` entry whose ``type`` is
-    ``"public"``, or ``None`` when no public IPv4 is present.
+    ``public_ipv4`` / ``private_ipv4`` are the first ``networks.v4`` entries
+    whose ``type`` is ``"public"`` / ``"private"`` (the private one is the
+    VPC address), or ``None`` when absent.
     """
     networks_v4: list[dict[str, Any]] = (
         (d.get("networks") or {}).get("v4") or []
     )
     public_ipv4: str | None = None
+    private_ipv4: str | None = None
     for net in networks_v4:
-        if net.get("type") == "public":
+        if public_ipv4 is None and net.get("type") == "public":
             public_ipv4 = net.get("ip_address")
-            break
+        elif private_ipv4 is None and net.get("type") == "private":
+            private_ipv4 = net.get("ip_address")
     return {
         "name": d.get("name"),
         "id": d.get("id"),
         "status": d.get("status"),
         "public_ipv4": public_ipv4,
+        "private_ipv4": private_ipv4,
     }
 
 

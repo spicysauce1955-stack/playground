@@ -540,7 +540,9 @@ def estimate_cost(
             resolved,
             provider_settings=provider_settings,
         )
-        return cloud_digitalocean.estimate_cost(plan.size, plan.vm_count)
+        return cloud_digitalocean.estimate_cost_for_sizes(
+            [plan.vm_sizes[name] for name in plan.vm_names]
+        )
     return None
 
 
@@ -560,7 +562,8 @@ def plan_provider_summary(
     ``region``
         DigitalOcean region slug.
     ``size``
-        Droplet size slug.
+        Droplet size slug when every VM uses the same one; otherwise a
+        per-size count such as ``"s-1vcpu-2gb x5, s-2vcpu-4gb x1"``.
     ``image``
         Droplet base image slug.
     ``ssh_exposure``
@@ -589,9 +592,16 @@ def plan_provider_summary(
     else:
         ssh_exposure = "open to all (0.0.0.0/0, ::/0)"
 
+    sizes = [plan.vm_sizes[name] for name in plan.vm_names]
+    counts = {s: sizes.count(s) for s in dict.fromkeys(sizes)}
+    if len(counts) > 1:
+        size_summary = ", ".join(f"{s} x{n}" for s, n in counts.items())
+    else:
+        size_summary = plan.size
+
     return {
         "region": plan.region,
-        "size": plan.size,
+        "size": size_summary,
         "image": plan.image,
         "ssh_exposure": ssh_exposure,
     }

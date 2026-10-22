@@ -412,3 +412,49 @@ def test_plan_provider_summary_ssh_exposure_lists_cidrs(
     assert summary is not None
     assert "203.0.113.0/24" in summary["ssh_exposure"]
     assert "198.51.100.0/24" in summary["ssh_exposure"]
+
+
+def _mixed_size_resolved():
+    resolved = _resolved("cloud-smoke")
+    base = resolved.vms[0]
+    vms = [
+        base.model_copy(update={"name": f"n{i}", "provider_overrides": {}})
+        for i in range(5)
+    ] + [
+        base.model_copy(
+            update={
+                "name": "big",
+                "provider_overrides": {"cloud-digitalocean": {"size": "s-2vcpu-4gb"}},
+            }
+        )
+    ]
+    return resolved.model_copy(update={"vms": vms})
+
+
+def _fake_merge(resolved, *, config_dir=None, loaded=None):
+    return {"size": "s-1vcpu-2gb"}
+
+
+def test_estimate_cost_sums_per_vm_sizes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(do_backend, "merge_provider_settings", _fake_merge)
+    result = dispatch.estimate_cost(_mixed_size_resolved())
+    assert result is not None
+    assert result.monthly_usd == 12.0 * 5 + 24.0
+
+
+def test_plan_provider_summary_lists_mixed_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(do_backend, "merge_provider_settings", _fake_merge)
+    summary = dispatch.plan_provider_summary(_mixed_size_resolved())
+    assert summary is not None
+    assert summary["size"] == "s-1vcpu-2gb x5, s-2vcpu-4gb x1"
+
+
+def test_plan_provider_summary_uniform_size_is_bare_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(do_backend, "merge_provider_settings", _fake_merge)
+    summary = dispatch.plan_provider_summary(_resolved("cloud-smoke"))
+    assert summary is not None
+    assert summary["size"] == "s-1vcpu-2gb"

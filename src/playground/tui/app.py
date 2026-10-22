@@ -228,7 +228,10 @@ class PlaygroundTui(App[None]):
         for vm in status.vms:
             marker = "+" if vm.state == "provisioned" else "-"
             ip = vm.ip or "—"
-            lines.append(f"  {marker} {vm.name}  role={vm.role}  ip={ip}")
+            addrs = f"ip={ip}"
+            if vm.public_ip:
+                addrs += f"  public_ip={vm.public_ip}"
+            lines.append(f"  {marker} {vm.name}  role={vm.role}  {addrs}")
         lines += ["", "## Plan"]
         for action in plan.actions:
             lines.append(f"  + {action.resource_type:<8}  {action.name}  {action.summary}")
