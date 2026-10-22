@@ -29,6 +29,33 @@ variable "image" {
   type        = string
 }
 
+variable "vm_images" {
+  description = "Per-VM image slug or numeric ID (as a string) keyed by VM name. A VM absent from the map uses var.image; a VM in var.vm_custom_images ignores it. Set from spec.vms[].provider_overrides.cloud-digitalocean.image."
+  type        = map(string)
+  default     = {}
+}
+
+variable "custom_images" {
+  description = "Custom images to import from a URL, keyed by 'img-<sha256(url)[:10]>' (one per distinct URL). Each becomes digitalocean_custom_image '<name_prefix>-<key>' in var.region; destroy removes it. Set from spec.vms[].provider_overrides.cloud-digitalocean.image_url / image_distribution."
+  type = map(object({
+    url          = string
+    distribution = string
+  }))
+  default = {}
+}
+
+variable "vm_custom_images" {
+  description = "VM name -> var.custom_images key for VMs booting from an imported custom image. Such a Droplet takes the imported image's ID instead of var.vm_images / var.image."
+  type        = map(string)
+  default     = {}
+}
+
+variable "vm_package_upgrade" {
+  description = "Per-VM cloud-init package_upgrade keyed by VM name; a VM absent from the map upgrades (true). False keeps a pinned point release (e.g. Rocky 8.8) from being upgraded on first boot. Set from spec.providers / spec.vms[].provider_overrides cloud-digitalocean.package_upgrade."
+  type        = map(bool)
+  default     = {}
+}
+
 variable "ssh_public_key" {
   description = "SSH public key content (not a path) injected into the ubuntu user's `ssh_authorized_keys` via cloud-init. This is the primary SSH access mechanism and works regardless of whether the key is pre-registered in DigitalOcean."
   type        = string
@@ -38,6 +65,12 @@ variable "ssh_key_fingerprints" {
   description = "Optional list of DigitalOcean-registered SSH key fingerprints attached to each Droplet via the `ssh_keys` parameter. Belt-and-braces with the cloud-init injection; both may be set independently. Defaults to empty so the cloud-init path works without any pre-registration."
   type        = list(string)
   default     = []
+}
+
+variable "vm_ssh_keys" {
+  description = "Extra DigitalOcean SSH key fingerprints per VM name, appended to var.ssh_key_fingerprints. Holds the lab key's fingerprint for VMs whose image (custom, or not ubuntu-*) DigitalOcean refuses to create without ssh_keys; empty for an all-Ubuntu lab."
+  type        = map(list(string))
+  default     = {}
 }
 
 variable "tags" {

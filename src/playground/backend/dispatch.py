@@ -667,11 +667,25 @@ def plan_provider_summary(
         Droplet size slug when every VM uses the same one; otherwise a
         per-size count such as ``"s-1vcpu-2gb x5, s-2vcpu-4gb x1"``.
     ``image``
-        Droplet base image slug.
+        Droplet image slug/ID when every VM uses the same one; otherwise a
+        per-image count such as ``"ubuntu-24-04-x64 x5, rockylinux-8-x64
+        x1"``.  A custom image counts under its key (``img-<hash>``).
     ``ssh_exposure``
         Human-readable SSH CIDR allowlist: ``"open to all (0.0.0.0/0,
         ::/0)"`` when ``firewall_ssh_cidrs`` is empty; otherwise the
         joined CIDR list.
+
+    Only when relevant (so an all-Ubuntu lab's summary is unchanged):
+
+    ``custom_images``
+        Each imported image as ``<key> <- <url> (distribution <d>)`` plus
+        the cost of the import (minutes on every apply/resume, removed on
+        destroy/suspend) and how to skip it (a numeric image ID).
+    ``ssh_key``
+        The VMs whose image needs a DigitalOcean-registered SSH key, and
+        that apply/resume register the lab's key if absent (kept on destroy).
+    ``package_upgrade``
+        The VMs whose first boot skips ``package_upgrade``.
 
     :param resolved: Fully resolved lab model.
     :param config_dir: Config directory to load provider defaults from.
@@ -694,19 +708,49 @@ def plan_provider_summary(
     else:
         ssh_exposure = "open to all (0.0.0.0/0, ::/0)"
 
-    sizes = [plan.vm_sizes[name] for name in plan.vm_names]
-    counts = {s: sizes.count(s) for s in dict.fromkeys(sizes)}
-    if len(counts) > 1:
-        size_summary = ", ".join(f"{s} x{n}" for s, n in counts.items())
-    else:
-        size_summary = next(iter(counts), plan.size)
-
-    return {
+    summary: dict[str, str] = {
         "region": plan.region,
-        "size": size_summary,
-        "image": plan.image,
+        "size": _count_summary(
+            [plan.vm_sizes[name] for name in plan.vm_names], plan.size,
+        ),
+        "image": _count_summary(
+            [plan.vm_images[name] for name in plan.vm_names], plan.image,
+        ),
         "ssh_exposure": ssh_exposure,
     }
+    if plan.custom_images:
+        imports = ", ".join(
+            f"{key} <- {img.url} (distribution {img.distribution})"
+            for key, img in plan.custom_images.items()
+        )
+        summary["custom_images"] = (
+            f"{imports}; the import can take 15+ minutes on every apply/resume "
+            "and the image is removed on destroy/suspend (reference a "
+            "pre-imported image by numeric ID via `image` to skip the import)"
+        )
+    needing_key = plan.vms_needing_do_ssh_key
+    if needing_key:
+        summary["ssh_key"] = (
+            f"{', '.join(needing_key)}: custom/non-Ubuntu image needs a "
+            "DigitalOcean-registered SSH key; apply/resume register the lab's "
+            "public key (as playground-<fingerprint prefix>) if absent, and "
+            "destroy keeps it"
+        )
+    no_upgrade = [n for n in plan.vm_names if not plan.vm_package_upgrade[n]]
+    if no_upgrade:
+        summary["package_upgrade"] = (
+            f"off for {', '.join(no_upgrade)} (first boot skips the package "
+            "upgrade)"
+        )
+    return summary
+
+
+def _count_summary(values: list[str], fallback: str) -> str:
+    """The single value, or ``"a x5, b x1"`` (first-seen order) when they differ."""
+    counts = {v: values.count(v) for v in dict.fromkeys(values)}
+    if len(counts) > 1:
+        return ", ".join(f"{v} x{n}" for v, n in counts.items())
+    return next(iter(counts), fallback)
 
 
 __all__ = [
