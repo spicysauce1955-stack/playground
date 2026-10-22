@@ -192,6 +192,124 @@ def delete_droplet(
     ]
 
 
+_MAX_LIST_PAGES = 25
+"""Page cap for :func:`_list_paged` (bounds a looping ``links.pages.next``)."""
+
+
+def _list_paged(
+    token: str, path: str, key: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    """GET a paginated collection, following ``links.pages.next``.
+
+    Returns ``(items, ok)``.  ``ok`` is False on any transport/HTTP failure,
+    malformed body, or page-cap hit; callers must not read an empty list as
+    "absent" unless ``ok`` is True.
+    """
+    items: list[dict[str, Any]] = []
+    url = path
+    params: dict[str, Any] | None = {"per_page": 200}
+    for _ in range(_MAX_LIST_PAGES):
+        status, body = _request("GET", url, token, params=params)
+        if status == 0 or status >= 300:
+            return items, False
+        page = body.get(key)
+        if not isinstance(page, list):
+            return items, False
+        items.extend(i for i in page if isinstance(i, dict))
+        next_url: str | None = None
+        links = body.get("links")
+        if isinstance(links, dict):
+            pages = links.get("pages")
+            if isinstance(pages, dict):
+                candidate = pages.get("next")
+                if isinstance(candidate, str) and candidate:
+                    next_url = candidate
+        if next_url is None:
+            return items, True
+        url, params = next_url, None
+    return items, False
+
+
+def _api_error(what: str, suggestion: str) -> Diagnostic:
+    """Warning diagnostic for a failed read of ``what``; never carries the token."""
+    return Diagnostic(
+        id="runtime.cloud.api_error",
+        severity="warning",
+        message=f"DigitalOcean API request failed while {what}",
+        source=SourceLocation(path="DigitalOcean API"),
+        suggestion=suggestion,
+    )
+
+
+def find_firewall(
+    token: str, name: str,
+) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
+    """Find the Cloud Firewall called ``name`` via ``GET /v2/firewalls``.
+
+    Returns ``(firewall_or_None, diagnostics, ok)``.  ``ok`` False means the
+    listing failed, so ``None`` does not mean "absent".
+    """
+    items, ok = _list_paged(token, "/v2/firewalls", "firewalls")
+    if not ok:
+        return None, [
+            _api_error(
+                f"listing firewalls (looking for {name!r})",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/firewalls",
+            )
+        ], False
+    for fw in items:
+        if fw.get("name") == name:
+            return fw, [], True
+    return None, [], True
+
+
+def find_vpc(
+    token: str, name: str,
+) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
+    """Find the VPC called ``name`` via ``GET /v2/vpcs`` (same contract as
+    :func:`find_firewall`)."""
+    items, ok = _list_paged(token, "/v2/vpcs", "vpcs")
+    if not ok:
+        return None, [
+            _api_error(
+                f"listing VPCs (looking for {name!r})",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/vpc",
+            )
+        ], False
+    for vpc in items:
+        if vpc.get("name") == name:
+            return vpc, [], True
+    return None, [], True
+
+
+def delete_vpc(token: str, vpc_id: str) -> list[Diagnostic]:
+    """DELETE /v2/vpcs/<id>.  204 and 404 are success; anything else warns.
+
+    DigitalOcean refuses to delete a VPC that still has members, so a
+    non-2xx right after a Droplet delete can be transient.
+    """
+    status, _ = _request("DELETE", f"/v2/vpcs/{vpc_id}", token)
+    if status in (204, 404):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.cloud.api_error",
+            severity="warning",
+            message=(
+                f"DigitalOcean API returned status {status} when deleting "
+                f"VPC {vpc_id}; it may still exist"
+            ),
+            source=SourceLocation(path=f"vpc/{vpc_id}"),
+            suggestion=(
+                "delete it at https://cloud.digitalocean.com/networking/vpc "
+                "(an orphaned VPC is free but blocks re-creating its CIDR)"
+            ),
+        )
+    ]
+
+
 _MAX_SIZE_PAGES = 25
 """Page cap for :func:`_fetch_all_sizes`.
 
@@ -451,7 +569,10 @@ __all__ = [
     "DEFAULT_TOKEN_ENV",
     "check_size_region_availability",
     "delete_droplet",
+    "delete_vpc",
     "droplet_summary",
+    "find_firewall",
+    "find_vpc",
     "list_droplets_by_tag",
     "read_token",
     "token_env_name",

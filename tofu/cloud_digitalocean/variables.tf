@@ -57,3 +57,14 @@ variable "dns_domain" {
   type        = string
   default     = "playground.lab"
 }
+
+variable "vpc_cidr" {
+  description = "IPv4 CIDR of the per-lab VPC (the lab network's cidr; RFC1918, /16 to /28). Droplets get their private address from it and the lab firewall allows all inbound traffic from it. Must not overlap another VPC in the same DigitalOcean account."
+  type        = string
+}
+
+variable "egress_isolated" {
+  description = "When true, the lab firewall's outbound rules only allow the VPC CIDR (no internet, no outside DNS). Flipped by `playground isolate` / `playground connect`; false for a normal apply."
+  type        = bool
+  default     = false
+}

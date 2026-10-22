@@ -7,9 +7,10 @@ Apply/resume steps:
   ``tofu-init`` → ``tofu-apply`` → ``fetch-vm-ips`` → ``render-inventory`` →
   ``wait-for-vms-ready`` → ``ansible-playbook`` → ``verify-lab`` (warning-only).
 
-Destroy/suspend steps: ``tofu-destroy`` → ``tag-sweep``.
+Destroy/suspend steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep``.
 
-Reset steps: ``tofu-destroy`` → ``tag-sweep`` → ``clean-state-files``.
+Reset steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep`` →
+``clean-state-files``.  ``vpc-sweep`` is best-effort (warnings only).
 
 Droplets have routable public IPs so the configure half uses ``ssh_port=22``
 (no NAT port-forward); same backend-neutral code the libvirt/vbox adapters use.
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,7 +33,9 @@ from playground.backend.cloud_digitalocean.do import (
     CONSOLE_URL,
     check_size_region_availability,
     delete_droplet,
+    delete_vpc,
     droplet_summary,
+    find_vpc,
     list_droplets_by_tag,
     read_token,
     token_env_name,
@@ -241,6 +245,19 @@ def execute_reset(
         )
         bus.publish(run.run_id, "operation_finished", {"status": "failed"})
         return finished, all_diagnostics
+
+    # ---- Step 2b: vpc-sweep (best-effort; warnings only) ----
+    bus.publish(run.run_id, "step_started", {"step": "vpc-sweep"})
+    vpc_step, vpc_diags = _vpc_sweep(
+        operation="reset", resolved=resolved,
+        log_path=logs_dir / "vpc-sweep.log",
+    )
+    steps.append(vpc_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "vpc-sweep", "exit_code": vpc_step.exit_code},
+    )
+    all_diagnostics.extend(vpc_diags)
 
     # ---- Step 3: clean-state-files (only when teardown is confirmed clean) ----
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
@@ -817,6 +834,19 @@ def _teardown(
         bus.publish(run.run_id, "operation_finished", {"status": "failed"})
         return finished, all_diagnostics
 
+    # ---- Step 3: vpc-sweep (best-effort; warnings only, never fails) ----
+    bus.publish(run.run_id, "step_started", {"step": "vpc-sweep"})
+    vpc_step, vpc_diags = _vpc_sweep(
+        operation=operation, resolved=resolved,
+        log_path=logs_dir / "vpc-sweep.log",
+    )
+    steps.append(vpc_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "vpc-sweep", "exit_code": vpc_step.exit_code},
+    )
+    all_diagnostics.extend(vpc_diags)
+
     finished = finish_run(
         run, run_dir, status="succeeded", steps=steps,
         summary=f"{operation} lab {lab!r} on digitalocean",
@@ -1052,6 +1082,97 @@ def _tag_sweep(
         _step("tag-sweep", exit_code=0, log_path=log_path, started=started),
         diagnostics,
     )
+
+
+_VPC_DELETE_ATTEMPTS = 3
+_VPC_RETRY_SECONDS = 5.0
+
+
+def _vpc_sweep(
+    *,
+    operation: str,
+    resolved: ResolvedLab,
+    log_path: Path,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Best-effort delete of an orphaned ``<lab>-vpc`` after the Droplet sweep.
+
+    Normally ``tofu destroy`` already removed the VPC and this only confirms
+    it is gone.  An orphan appears when destroy failed or state was lost; a
+    leftover VPC is free but blocks re-creating its CIDR/name.  This step
+    never fails the teardown: every problem is a warning diagnostic and the
+    step exit code is always 0.  DigitalOcean refuses to delete a VPC that
+    still has members, so the delete is retried a few times to ride out
+    Droplets that are still shutting down.
+    """
+    lab = resolved.lab_name
+    name = f"{lab}-vpc"
+    started = _iso_now()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# vpc-sweep for lab {lab!r} (vpc={name!r})"]
+    diagnostics: list[Diagnostic] = []
+
+    def done() -> tuple[StepResult, list[Diagnostic]]:
+        log_path.write_text("\n".join(lines) + "\n")
+        return (
+            _step("vpc-sweep", exit_code=0, log_path=log_path, started=started),
+            diagnostics,
+        )
+
+    token = read_token(resolved)
+    if not token:
+        lines.append("token absent -- vpc-sweep skipped")
+        return done()
+
+    vpc, find_diags, ok = find_vpc(token, name)
+    if not ok:
+        lines.append("could not list VPCs -- vpc-sweep inconclusive")
+        diagnostics.extend(find_diags)
+        diagnostics.append(
+            Diagnostic(
+                id=f"runtime.{operation}.vpc_sweep_inconclusive",
+                severity="warning",
+                message=(
+                    f"could not check whether VPC {name!r} was removed "
+                    "(API/transport error)"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "check https://cloud.digitalocean.com/networking/vpc and "
+                    "delete it if it is still there"
+                ),
+            )
+        )
+        return done()
+    if vpc is None:
+        lines.append("no VPC present")
+        return done()
+
+    vpc_id = str(vpc.get("id"))
+    last: list[Diagnostic] = []
+    for attempt in range(1, _VPC_DELETE_ATTEMPTS + 1):
+        last = delete_vpc(token, vpc_id)
+        lines.append(
+            f"delete VPC {name!r} (id={vpc_id}) attempt {attempt}: "
+            f"{'ok' if not last else 'refused'}"
+        )
+        if not last:
+            return done()
+        if attempt < _VPC_DELETE_ATTEMPTS:
+            time.sleep(_VPC_RETRY_SECONDS)
+    diagnostics.extend(last)
+    diagnostics.append(
+        Diagnostic(
+            id=f"runtime.{operation}.orphaned_vpc",
+            severity="warning",
+            message=(
+                f"VPC {name!r} (id={vpc_id}) could not be deleted; it is free "
+                "but blocks re-creating this lab's network"
+            ),
+            source=SourceLocation(path=f"vpc/{vpc_id}"),
+            suggestion="delete it at https://cloud.digitalocean.com/networking/vpc",
+        )
+    )
+    return done()
 
 
 def _sweep_failed(operation: str, sweep_diags: list[Diagnostic]) -> bool:

@@ -32,11 +32,18 @@ _TFVARS_KEYS = frozenset(
         "tags",
         "firewall_ssh_cidrs",
         "dns_domain",
+        "vpc_cidr",
+        "egress_isolated",
     }
 )
 
 
-def render_do_tfvars(plan: DoPlan, *, ssh_public_key: str) -> dict[str, Any]:
+def render_do_tfvars(
+    plan: DoPlan,
+    *,
+    ssh_public_key: str,
+    egress_isolated: bool = False,
+) -> dict[str, Any]:
     """Render a tfvars dict for ``tofu/cloud_digitalocean/``.
 
     Keys are exactly the allowlist matching ``variables.tf``.  The API
@@ -48,6 +55,10 @@ def render_do_tfvars(plan: DoPlan, *, ssh_public_key: str) -> dict[str, Any]:
         inject into each Droplet via cloud-init.  The runner reads the key
         from disk and passes it here; keeping it a parameter keeps this
         function pure and testable.
+    :param egress_isolated: Whether the lab firewall's outbound rules are
+        narrowed to the VPC.  A normal apply renders ``False``; only
+        ``playground isolate`` flips it (by editing the last-applied tfvars
+        file, not by re-rendering).
     """
     return {
         "name_prefix": plan.name_prefix,
@@ -61,6 +72,8 @@ def render_do_tfvars(plan: DoPlan, *, ssh_public_key: str) -> dict[str, Any]:
         "tags": list(plan.tags),
         "firewall_ssh_cidrs": list(plan.firewall_ssh_cidrs),
         "dns_domain": plan.dns_domain,
+        "vpc_cidr": plan.vpc_cidr,
+        "egress_isolated": egress_isolated,
     }
 
 

@@ -245,6 +245,8 @@ def _install_shims(
     monkeypatch.setattr(f"{MOD}.run_ansible_playbook", fake_run_ansible_playbook)
     monkeypatch.setattr(f"{MOD}.verify_lab", fake_verify_lab)
     monkeypatch.setattr(f"{MOD}.list_droplets_by_tag", fake_list_droplets_by_tag)
+    # Teardown's best-effort vpc-sweep: no VPC left behind, and no real HTTP.
+    monkeypatch.setattr(f"{MOD}.find_vpc", lambda token, name: (None, [], True))
     monkeypatch.setattr(f"{MOD}.schedule_workloads", fake_schedule_workloads)
     monkeypatch.setattr(f"{MOD}.stage_workload_files", fake_stage_workload_files)
 

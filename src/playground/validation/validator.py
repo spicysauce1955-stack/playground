@@ -355,6 +355,7 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_backend_capability(lab, loaded, source))
     diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
+    diagnostics.extend(_check_digitalocean_network(lab, source))
     diagnostics.extend(_check_dns_domain(lab, source))
     diagnostics.extend(_check_devices(lab, source, loaded))
 
@@ -594,6 +595,94 @@ def _check_network_ips(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
                 )
                 continue
             seen[key] = vm.name
+    return diagnostics
+
+
+_RFC1918_NETS = tuple(
+    ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def _check_digitalocean_network(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
+    """cloud-digitalocean maps the lab's network to ONE per-lab VPC.
+
+    - ``config.network.do_single_network`` (error): exactly one network must
+      be declared; the backend creates a single ``digitalocean_vpc`` from it.
+    - ``config.network.do_vpc_cidr_invalid`` (error): the CIDR must be IPv4
+      RFC1918 with a prefix between /16 and /28 (DigitalOcean's VPC API
+      limit), otherwise apply would fail late with a 422.
+    - ``config.network.do_ip_pin_ignored`` (warning): DigitalOcean assigns
+      each Droplet's VPC address itself, so a pinned per-VM IP is ignored.
+    """
+    if lab.spec.backend != "cloud-digitalocean":
+        return []
+    diagnostics: list[Diagnostic] = []
+
+    if len(lab.spec.networks) != 1:
+        diagnostics.append(
+            Diagnostic(
+                id="config.network.do_single_network",
+                severity="error",
+                message=(
+                    f"lab {lab.metadata.name!r} uses cloud-digitalocean and "
+                    f"declares {len(lab.spec.networks)} networks; exactly one "
+                    "is required (it becomes the lab's VPC)"
+                ),
+                source=source,
+                key_path="spec.networks",
+                suggestion="declare a single network with an RFC1918 cidr",
+            )
+        )
+
+    for idx, net in enumerate(lab.spec.networks):
+        problem: str | None = None
+        try:
+            cidr = ipaddress.ip_network(net.cidr, strict=False)
+        except ValueError:
+            problem = "is not a valid CIDR"
+        else:
+            if cidr.version != 4 or not any(
+                cidr.subnet_of(r) for r in _RFC1918_NETS  # type: ignore[arg-type]
+            ):
+                problem = "is not an RFC1918 IPv4 range (10/8, 172.16/12, 192.168/16)"
+            elif not 16 <= cidr.prefixlen <= 28:
+                problem = (
+                    f"has prefix /{cidr.prefixlen}; DigitalOcean VPCs need /16 to /28"
+                )
+        if problem is not None:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.network.do_vpc_cidr_invalid",
+                    severity="error",
+                    message=(
+                        f"network {net.name!r} cidr {net.cidr!r} {problem}"
+                    ),
+                    source=source,
+                    key_path=f"spec.networks[{idx}].cidr",
+                    suggestion="use a private range such as 10.60.0.0/24",
+                )
+            )
+
+    for vm_idx, vm in enumerate(lab.spec.vms):
+        for net_idx, vm_net in enumerate(vm.networks):
+            if vm_net.ip is not None:
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.network.do_ip_pin_ignored",
+                        severity="warning",
+                        message=(
+                            f"VM {vm.name!r} pins {vm_net.name!r} to "
+                            f"{vm_net.ip!r}, but cloud-digitalocean assigns "
+                            "VPC addresses itself; the pin is ignored"
+                        ),
+                        source=source,
+                        key_path=f"spec.vms[{vm_idx}].networks[{net_idx}].ip",
+                        suggestion=(
+                            "remove the pin; read the private address from "
+                            "`playground status`"
+                        ),
+                    )
+                )
     return diagnostics
 
 

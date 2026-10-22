@@ -16,6 +16,7 @@ sweeps to catch orphaned, still-billing resources.
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,6 +94,11 @@ class DoPlan:
     dns_domain: str
     """Per-lab DNS domain, used for cloud-init hostname / fqdn."""
 
+    vpc_cidr: str
+    """CIDR of the per-lab VPC: the lab's single network CIDR, normalised to
+    its network address (DigitalOcean rejects host bits).  Empty string only
+    for a lab with no network, which the validator rejects."""
+
     @property
     def distinct_sizes(self) -> list[str]:
         """Distinct size slugs in use, in first-seen VM order."""
@@ -146,6 +152,8 @@ def build_do_plan(
       fallback.
     - ``tags`` comes from :func:`ownership_tags`.
     - ``dns_domain`` is taken directly from ``resolved.dns_domain``.
+    - ``vpc_cidr`` is the first (only; the validator enforces exactly one)
+      lab network's CIDR, normalised with host bits cleared.
 
     :param resolved: Fully resolved, backend-neutral lab model.
     :param provider_settings: Merged provider config + lab overrides dict.
@@ -177,6 +185,8 @@ def build_do_plan(
 
     tags = ownership_tags(resolved.lab_name)
 
+    vpc_cidr = _vpc_cidr(resolved)
+
     return DoPlan(
         lab_name=resolved.lab_name,
         name_prefix=resolved.lab_name,
@@ -189,7 +199,19 @@ def build_do_plan(
         firewall_ssh_cidrs=firewall_ssh_cidrs,
         tags=tags,
         dns_domain=resolved.dns_domain,
+        vpc_cidr=vpc_cidr,
     )
+
+
+def _vpc_cidr(resolved: ResolvedLab) -> str:
+    """Return the lab network CIDR as a canonical network address, or ``""``."""
+    if not resolved.networks:
+        return ""
+    raw = resolved.networks[0].cidr
+    try:
+        return str(ipaddress.ip_network(raw, strict=False))
+    except ValueError:
+        return raw
 
 
 __all__ = [
