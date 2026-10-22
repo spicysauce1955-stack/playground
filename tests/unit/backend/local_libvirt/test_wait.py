@@ -377,6 +377,7 @@ case "$MODE" in
   error) echo "status: error"; echo "a module failed" >&2; exit 1;;
   degraded) echo "status: done"; exit 2;;
   crashforever) echo "Traceback (most recent call last):" >&2; exit 1;;
+  noisyok) echo "status: done"; echo "Traceback (most recent call last):" >&2; exit 0;;
 esac
 """
 
@@ -392,6 +393,8 @@ esac
         ("degraded", 2, 1, "status: done", ""),
         # A crash that never clears gives up after 30 tries with its stderr.
         ("crashforever", 1, 30, "", "Traceback"),
+        # A traceback on a clean exit is noise, not a crash: no retry.
+        ("noisyok", 0, 1, "status: done", "Traceback"),
     ],
 )
 def test_cloud_init_wait_command_retries_only_status_crashes(

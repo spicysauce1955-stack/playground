@@ -161,8 +161,8 @@ every VM passes both phases.
   The command is `cloud-init status --wait` run under `sudo -n` when
   passwordless sudo works (every playground cloud-init grants it), with
   the plain form as the fallback, and a crash of the `status` command
-  itself (a Python traceback on stderr) is retried every 10 s, up to 30
-  times, rather than taken as cloud-init's verdict. Blocks on the VM side
+  itself (a non-zero exit with a Python traceback on stderr) is retried
+  every 10 s, up to 30 times, rather than taken as cloud-init's verdict. Blocks on the VM side
   until every cloud-init stage is done (incl. `package_upgrade`). Three
   facts drive this (verified live on DigitalOcean): Rocky 8's cloud-init
   23.4 crashes with exit 1 when `status` runs as a non-root user
