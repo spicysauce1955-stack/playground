@@ -12,6 +12,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -25,6 +26,10 @@ class IsolationRecord(StrictModel):
     """ISO-8601 UTC timestamp of the succeeded isolate."""
     lab_cidrs: list[str]
     run_id: str
+    state: Literal["isolating", "isolated"] = "isolated"
+    """``isolating`` is written BEFORE the backend runs and stays if the run
+    fails, so a partially isolated lab is still guarded. Default keeps
+    pre-existing record files parseable."""
 
 
 def isolation_path(state_dir: Path, lab: str) -> Path:

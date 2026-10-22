@@ -115,28 +115,130 @@ def test_isolate_routes_and_writes_record(
     assert rec.isolated_at.endswith("+00:00")
 
 
-def test_isolate_failed_run_writes_no_record(tmp_path: Path, calls: Calls) -> None:
+def test_isolate_failed_run_keeps_record_fail_closed(tmp_path: Path, calls: Calls) -> None:
     calls.status = "failed"
+    run, diags = dispatch.execute_isolate(
+        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, bus=EventBus(),
+    )
+    assert run is not None and run.status == "failed"
+    rec = read_isolation(tmp_path, LIBVIRT_LAB)
+    assert rec is not None and rec.state == "isolating"
+    warn = [d for d in diags if d.id == "runtime.isolate.partially_isolated"]
+    assert len(warn) == 1 and warn[0].severity == "warning"
+    assert "partially isolated" in warn[0].message
+    assert f"playground connect {LIBVIRT_LAB}" in (warn[0].suggestion or "")
+    assert f"playground isolate {LIBVIRT_LAB}" in (warn[0].suggestion or "")
+
+
+def test_isolate_records_isolating_before_backend_and_isolated_after(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    def fake(**kwargs: Any):
+        rec = read_isolation(tmp_path, LIBVIRT_LAB)
+        seen.append(rec.state if rec else "absent")
+        return _run("isolate", LIBVIRT_LAB), []
+
+    monkeypatch.setattr(local_libvirt, "execute_isolate", fake)
     run, _ = dispatch.execute_isolate(
+        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, bus=EventBus(),
+    )
+    assert seen == ["isolating"]
+    final = read_isolation(tmp_path, LIBVIRT_LAB)
+    assert final is not None and final.state == "isolated"
+    assert run is not None and final.run_id == run.run_id
+
+
+def test_isolate_prewrite_failure_aborts_without_calling_backend(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*a: Any, **k: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(dispatch, "write_isolation", boom)
+    run, diags = dispatch.execute_isolate(
+        resolved=_resolved(DO_LAB), state_dir=tmp_path, bus=EventBus(),
+    )
+    assert run is None
+    assert [d.id for d in diags] == ["runtime.isolate.record_write_failed"]
+    assert diags[0].severity == "error"
+    assert calls.verbs() == []
+
+
+@pytest.mark.parametrize(
+    "diag_id",
+    [
+        "runtime.isolate.not_provisioned",
+        "runtime.isolate.needs_reapply",
+        "runtime.cloud.token_missing",
+        "runtime.isolate.virsh_missing",
+    ],
+)
+def test_isolate_failure_with_nothing_changed_clears_record(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch, diag_id: str,
+) -> None:
+    monkeypatch.setattr(
+        local_libvirt, "execute_isolate",
+        lambda **kw: (_run("isolate", LIBVIRT_LAB, "failed"), [_warn(diag_id)]),
+    )
+    run, diags = dispatch.execute_isolate(
         resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, bus=EventBus(),
     )
     assert run is not None and run.status == "failed"
     assert read_isolation(tmp_path, LIBVIRT_LAB) is None
+    assert all(d.id != "runtime.isolate.partially_isolated" for d in diags)
 
 
-def test_isolate_record_write_failure_is_warning(
+def test_isolate_success_record_update_failure_keeps_guard(
     tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def boom(*a: Any, **k: Any) -> None:
-        raise OSError("disk full")
+    real = dispatch.write_isolation
+    n = {"c": 0}
 
-    monkeypatch.setattr(dispatch, "write_isolation", boom)
+    def flaky(sd: Path, rec: IsolationRecord) -> Path:
+        n["c"] += 1
+        if n["c"] == 2:
+            raise OSError("disk full")
+        return real(sd, rec)
+
+    monkeypatch.setattr(dispatch, "write_isolation", flaky)
     run, diags = dispatch.execute_isolate(
         resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, bus=EventBus(),
     )
     assert run is not None and run.status == "succeeded"
-    assert [d.id for d in diags] == ["runtime.isolate.record_write_failed"]
-    assert diags[0].severity == "warning"
+    assert [d.id for d in diags] == ["runtime.isolate.record_update_failed"]
+    rec = read_isolation(tmp_path, LIBVIRT_LAB)
+    assert rec is not None and rec.state == "isolating"
+
+
+def test_guard_mentions_isolating_state(tmp_path: Path, calls: Calls) -> None:
+    rec = _record(LIBVIRT_LAB, "local-libvirt").model_copy(update={"state": "isolating"})
+    write_isolation(tmp_path, rec)
+    run, diags = dispatch.execute_apply(
+        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, tofu_dir=Path("t"),
+        ansible_dir=Path("a"), config_dir=CONFIG_DIR, bus=EventBus(),
+    )
+    assert run is None
+    assert "partially isolated" in diags[0].message
+    assert calls.verbs() == []
+
+
+def test_guard_fails_closed_on_unreadable_record(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*a: Any, **k: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(dispatch, "read_isolation", boom)
+    run, diags = dispatch.execute_apply(
+        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, tofu_dir=Path("t"),
+        ansible_dir=Path("a"), config_dir=CONFIG_DIR, bus=EventBus(),
+    )
+    assert run is None
+    assert [d.id for d in diags] == ["runtime.apply.lab_isolated"]
+    assert "denied" in diags[0].message
+    assert calls.verbs() == []
 
 
 @pytest.mark.parametrize("lab", [LIBVIRT_LAB, DO_LAB])

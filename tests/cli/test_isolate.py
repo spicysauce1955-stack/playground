@@ -81,7 +81,40 @@ def test_isolate_failed_run_exits_1(
     result = _invoke("isolate", "generic-infra", tmp_path)
     assert result.exit_code == 1
     assert "isolate failed" in result.output
-    assert read_isolation(tmp_path / "state", "generic-infra") is None
+    # Fail closed: the record stays so apply is still guarded.
+    rec = read_isolation(tmp_path / "state", "generic-infra")
+    assert rec is not None and rec.state == "isolating"
+    assert "partially isolated" in result.output
+
+
+def test_isolate_help_does_not_claim_metadata_blocked() -> None:
+    out = CliRunner().invoke(app, ["isolate", "--help"]).output
+    assert "NOT" in out and "metadata" in out
+    assert "cloud metadata," not in out
+
+
+def test_isolate_human_output_does_not_mention_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _patch_backend(monkeypatch)
+    result = _invoke("isolate", "generic-infra", tmp_path)
+    assert "metadata" not in result.output
+
+
+def test_connect_noop_says_nothing_to_restore(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    def fake(**kwargs: Any):
+        run = _run("connect", kwargs["resolved"].lab_name).model_copy(
+            update={"summary": "connected lab 'x': nothing to reopen (not isolated)"}
+        )
+        return run, []
+
+    monkeypatch.setattr(local_libvirt, "execute_connect", fake)
+    result = _invoke("connect", "generic-infra", tmp_path)
+    assert result.exit_code == 0
+    assert "nothing to restore" in result.output
+    assert "egress restored" not in result.output
 
 
 def test_connect_clears_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

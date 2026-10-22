@@ -877,8 +877,8 @@ and `cloud-digitalocean`; `local-vbox` is unsupported.
 ### Intent (backend-neutral)
 
 - **Blocked:** TCP/UDP/ICMP from lab VMs to anything outside the lab
-  networks: the internet, the cloud metadata service (see the DO caveat
-  below), and DNS forwarded to outside resolvers. A lookup of an outside
+  networks: the internet and DNS forwarded to outside resolvers. The
+  cloud metadata service is NOT blocked on DigitalOcean (see below). A lookup of an outside
   name from a VM must fail.
 - **Kept:** all VM-to-VM traffic on any port, and SSH from this machine to
   every VM (`exec` / `cp` / SSH tunnels / `adb`).
@@ -896,24 +896,30 @@ isolation record**; dispatch does.
 
 The record is `<state_dir>/isolation/<lab>.json`
 (`state/isolation.py`: `lab`, `backend`, `isolated_at` ISO UTC,
-`lab_cidrs`, `run_id`), written atomically:
+`lab_cidrs`, `run_id`, `state` = `isolating` | `isolated`, default
+`isolated` so older files parse), written atomically. **Fail closed:** the
+record is written (`isolating`) BEFORE the backend runs; if that write
+fails, dispatch aborts with error `runtime.isolate.record_write_failed`
+without calling the backend.
 
 | Event | Record |
 | --- | --- |
-| `isolate` run `succeeded` | written (overwritten on re-isolate) |
+| `isolate` starts | written as `isolating` (overwritten on re-isolate) |
+| `isolate` run `succeeded` | updated to `isolated` (new run id and time); an update failure is only a warning (`runtime.isolate.record_update_failed`), the `isolating` record still guards |
+| `isolate` run `failed` | kept (lab may be partially isolated; warning `runtime.isolate.partially_isolated` names `connect` / `isolate`), EXCEPT cleared when a diagnostic proves nothing changed: id ending `.not_provisioned`, `.needs_reapply`, `.token_missing`, or `runtime.isolate.virsh_missing` |
 | `connect` run `succeeded` | cleared |
 | `destroy` / `reset` / `suspend` run not `failed` | cleared (the resources carrying the enforcement are gone; resume is a fresh, connected apply) |
-| any run `failed` | untouched |
+| `connect` / `destroy` / `reset` / `suspend` run `failed` | untouched |
 
 An unreadable (corrupt) record counts as isolated: the guard must fail
-closed. A failed record write is only a warning
-(`runtime.isolate.record_write_failed`), because the isolation itself
-succeeded; the consequence is that `apply` is no longer refused.
+closed, and so does a record that cannot be read (`OSError`): the guard
+reports it as isolated with the error in the message.
 
 ### The apply guard: `runtime.apply.lab_isolated`
 
 `execute_apply` and `execute_resume` return `(None, [error])` while the
-record exists, before any backend code runs. The suggestion names
+record exists in either state (the message calls out a half-finished
+`isolating`), before any backend code runs. The suggestion names
 `playground connect <lab>`. Reasons: Ansible needs internet, and
 re-rendering the DO tfvars must never silently reopen egress. The
 operator workflow is `connect`, `apply`, `isolate`. The CLI and TUI

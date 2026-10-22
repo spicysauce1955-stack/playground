@@ -2175,8 +2175,7 @@ def _run_isolation_verb(
         cidrs = ", ".join(n.cidr for n in resolved.networks) or "(none)"
         typer.echo(f"isolated lab {lab!r}")
         typer.echo(
-            f"  cut: egress from lab VMs to anything outside the lab "
-            f"network(s) {cidrs}"
+            f"  cut: egress from lab VMs outside the lab network(s) {cidrs}"
         )
         typer.echo("  kept: VM-to-VM traffic and SSH from this machine")
         if resolved.backend == "local-libvirt":
@@ -2186,7 +2185,10 @@ def _run_isolation_verb(
             )
         typer.echo(f"  undo: playground connect {lab}")
     else:
-        typer.echo(f"connected lab {lab!r}: egress restored")
+        if "nothing to reopen" in (finished.summary or ""):
+            typer.echo(f"connected lab {lab!r}: nothing to restore (not isolated)")
+        else:
+            typer.echo(f"connected lab {lab!r}: egress restored")
     typer.echo(f"  run: {finished.run_id}")
     typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
 

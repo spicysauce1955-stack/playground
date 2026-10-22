@@ -114,3 +114,21 @@ async def test_lab_highlight_never_probes_devices(
         listview.index = labels.index("lab-device-lab")
         await pilot.pause()
         assert "device-lab" in app.detail_text
+
+
+@pytest.mark.asyncio
+async def test_finish_operation_shows_refusal_reason() -> None:
+    from playground.models.diagnostic import Diagnostic, SourceLocation
+
+    app = PlaygroundTui(config_dir=CONFIG_DIR)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        diag = Diagnostic(
+            id="runtime.apply.lab_isolated", severity="error",
+            message="lab 'x' is egress-isolated", source=SourceLocation(path="c"),
+        )
+        app._finish_operation(None, [diag])
+        pane = app.query_one("#log-pane")
+        assert any("lab 'x' is egress-isolated" in ln for ln in pane._lines)
+        app._finish_operation(None, [])
+        assert any("pre-flight failed" in ln for ln in pane._lines)

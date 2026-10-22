@@ -43,6 +43,7 @@ from playground.backend.dispatch import (
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
 from playground.events import EventBus, OperationEvent
+from playground.models.diagnostic import Diagnostic
 from playground.planner import render_plan
 from playground.runs import OperationRun
 from playground.validation import validate as validate_loaded_config
@@ -298,7 +299,7 @@ class PlaygroundTui(App[None]):
             loaded, _ = load_config(self.config_dir)
             resolved = resolve_lab(loaded, lab)
             bus = self._build_bus()
-            run, _diags = execute_apply(
+            run, diags = execute_apply(
                 resolved=resolved,
                 state_dir=self.state_dir,
                 tofu_dir=self.tofu_dir,
@@ -306,7 +307,7 @@ class PlaygroundTui(App[None]):
                 config_dir=self.config_dir,
                 bus=bus,
             )
-            self.call_from_thread(self._finish_operation, run)
+            self.call_from_thread(self._finish_operation, run, diags)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -343,12 +344,18 @@ class PlaygroundTui(App[None]):
         bus.subscribe(bridge)
         return bus
 
-    def _finish_operation(self, run: OperationRun | None) -> None:
+    def _finish_operation(
+        self, run: OperationRun | None, diags: list[Diagnostic] | None = None,
+    ) -> None:
         self._busy = False
         self.last_run = run
         pane = self.query_one("#log-pane", _LogPane)
         if run is None:
-            pane.append("--- aborted before run: pre-flight failed ---")
+            reason = next((d.message for d in diags or [] if d.severity == "error"), None)
+            pane.append(
+                f"--- aborted before run: {reason} ---"
+                if reason else "--- aborted before run: pre-flight failed ---"
+            )
             return
         pane.append(
             f"--- finished: {run.run_id} (status={run.status}) ---"

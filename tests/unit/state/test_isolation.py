@@ -55,6 +55,17 @@ def test_records_are_per_lab(tmp_path: Path) -> None:
     assert isolation_path(tmp_path, "a").exists()
 
 
+def test_legacy_record_without_state_parses_as_isolated(tmp_path: Path) -> None:
+    path = isolation_path(tmp_path, "lab1")
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '{"lab": "lab1", "backend": "b", "isolated_at": "t", '
+        '"lab_cidrs": [], "run_id": "r"}'
+    )
+    rec = read_isolation(tmp_path, "lab1")
+    assert rec is not None and rec.state == "isolated"
+
+
 def test_corrupt_record_fails_closed(tmp_path: Path) -> None:
     """An unreadable record still counts as isolated (guard must not fail open)."""
     path = isolation_path(tmp_path, "lab1")

@@ -112,15 +112,28 @@ def verb_not_supported_diagnostic(verb: str, backend: str) -> Diagnostic:
     )
 
 
-def lab_isolated_diagnostic(verb: str, lab: str, record: IsolationRecord) -> Diagnostic:
+def lab_isolated_diagnostic(
+    verb: str, lab: str, record: IsolationRecord, *, read_error: str | None = None,
+) -> Diagnostic:
     """Error for a ``verb`` (apply / resume) refused on an isolated lab."""
+    if read_error is not None:
+        why = (
+            f"its isolation record could not be read ({read_error}); "
+            "treating it as isolated"
+        )
+    elif record.state == "isolating":
+        why = (
+            f"an isolate started {record.isolated_at} did not finish "
+            "cleanly, so it may be partially isolated"
+        )
+    else:
+        why = f"it is egress-isolated (since {record.isolated_at})"
     return Diagnostic(
         id="runtime.apply.lab_isolated",
         severity="error",
         message=(
-            f"lab {lab!r} is egress-isolated (since {record.isolated_at}); "
-            f"refusing to {verb}: provisioning needs internet access and a "
-            "re-render must not silently reopen egress"
+            f"lab {lab!r}: {why}; refusing to {verb}: provisioning needs "
+            "internet access and a re-render must not silently reopen egress"
         ),
         source=SourceLocation(path="config"),
         suggestion=(
@@ -133,10 +146,37 @@ def lab_isolated_diagnostic(verb: str, lab: str, record: IsolationRecord) -> Dia
 def _refuse_if_isolated(
     verb: str, resolved: ResolvedLab, state_dir: Path,
 ) -> list[Diagnostic] | None:
-    record = read_isolation(state_dir, resolved.lab_name)
+    """Refuse on any record, in either state; an unreadable record fails closed."""
+    lab = resolved.lab_name
+    try:
+        record = read_isolation(state_dir, lab)
+    except OSError as exc:
+        placeholder = IsolationRecord(
+            lab=lab, backend=resolved.backend, isolated_at="unknown",
+            lab_cidrs=[], run_id="unknown",
+        )
+        return [lab_isolated_diagnostic(verb, lab, placeholder, read_error=str(exc))]
     if record is None:
         return None
-    return [lab_isolated_diagnostic(verb, resolved.lab_name, record)]
+    return [lab_isolated_diagnostic(verb, lab, record)]
+
+
+# A failed isolate normally keeps its record (fail closed: some VMs may be
+# filtered). These diagnostics prove the backend stopped before changing
+# anything, so the record is cleared instead of wedging the lab behind the
+# apply guard.
+_NOTHING_CHANGED_SUFFIXES = frozenset(
+    {".not_provisioned", ".needs_reapply", ".token_missing"}
+)
+_NOTHING_CHANGED_IDS = frozenset({"runtime.isolate.virsh_missing"})
+
+
+def _nothing_changed(diagnostics: list[Diagnostic]) -> bool:
+    return any(
+        d.id in _NOTHING_CHANGED_IDS
+        or d.id.endswith(tuple(_NOTHING_CHANGED_SUFFIXES))
+        for d in diagnostics
+    )
 
 
 def execute_apply(
@@ -318,51 +358,83 @@ def execute_isolate(
     """Cut the lab's egress outside its own networks (post-provision).
 
     ``tofu_dir`` / ``config_dir`` are accepted for a uniform signature with
-    the other dispatch verbs and are unused. Writes the isolation record
-    after a succeeded run. Returns ``(None, [diag])`` for ``local-vbox``
+    the other dispatch verbs and are unused. The isolation record is written
+    (state ``isolating``) BEFORE the backend runs and promoted to
+    ``isolated`` on success; a failed run keeps it unless the diagnostics
+    prove nothing changed. If the record cannot be written the backend is not
+    called. Returns ``(None, [diag])`` for ``local-vbox``
     (``runtime.backend.verb_not_supported``).
     """
+    if resolved.backend not in (LIBVIRT, DIGITALOCEAN):
+        if resolved.backend == VBOX:
+            return None, [verb_not_supported_diagnostic("isolate", resolved.backend)]
+        return None, [unsupported_backend_diagnostic(resolved.backend)]
+
+    lab = resolved.lab_name
+    cidrs = [n.cidr for n in resolved.networks]
+    try:
+        write_isolation(state_dir, IsolationRecord(
+            lab=lab, backend=resolved.backend, isolated_at=now_iso(),
+            lab_cidrs=cidrs, run_id="pending", state="isolating",
+        ))
+    except OSError as exc:
+        return None, [Diagnostic(
+            id="runtime.isolate.record_write_failed",
+            severity="error",
+            message=(
+                f"could not write the isolation record for lab {lab!r}: {exc}; "
+                "not isolating, because an unrecorded isolation would let a "
+                "later apply silently reopen egress"
+            ),
+            source=SourceLocation(path=str(state_dir / "isolation")),
+            suggestion="fix permissions on the state directory and retry",
+        )]
+
     if resolved.backend == LIBVIRT:
         run, diagnostics = local_libvirt.execute_isolate(
             resolved=resolved, state_dir=state_dir, bus=bus,
         )
-    elif resolved.backend == DIGITALOCEAN:
+    else:
         run, diagnostics = cloud_digitalocean.execute_isolate(
             resolved=resolved, state_dir=state_dir, bus=bus,
         )
-    elif resolved.backend == VBOX:
-        return None, [verb_not_supported_diagnostic("isolate", resolved.backend)]
-    else:
-        return None, [unsupported_backend_diagnostic(resolved.backend)]
 
     if run.status == "succeeded":
-        record = IsolationRecord(
-            lab=resolved.lab_name,
-            backend=resolved.backend,
-            isolated_at=now_iso(),
-            lab_cidrs=[n.cidr for n in resolved.networks],
-            run_id=run.run_id,
-        )
         try:
-            write_isolation(state_dir, record)
+            write_isolation(state_dir, IsolationRecord(
+                lab=lab, backend=resolved.backend, isolated_at=now_iso(),
+                lab_cidrs=cidrs, run_id=run.run_id, state="isolated",
+            ))
         except OSError as exc:
-            diagnostics = [
-                *diagnostics,
-                Diagnostic(
-                    id="runtime.isolate.record_write_failed",
-                    severity="warning",
-                    message=(
-                        f"lab {resolved.lab_name!r} is isolated but the "
-                        f"isolation record could not be written: {exc}"
-                    ),
-                    source=SourceLocation(path=str(state_dir / "isolation")),
-                    suggestion=(
-                        "apply will not be refused for this lab until the "
-                        "record exists; run `playground connect` before any "
-                        "apply"
-                    ),
+            # The "isolating" record is still on disk, so the guard holds.
+            diagnostics = [*diagnostics, Diagnostic(
+                id="runtime.isolate.record_update_failed",
+                severity="warning",
+                message=(
+                    f"lab {lab!r} is isolated but its record could not be "
+                    f"updated to 'isolated': {exc}"
                 ),
-            ]
+                source=SourceLocation(path=str(state_dir / "isolation")),
+                suggestion="the lab stays guarded; `playground connect` clears it",
+            )]
+        return run, diagnostics
+
+    if _nothing_changed(diagnostics):
+        clear_isolation(state_dir, lab)
+    else:
+        diagnostics = [*diagnostics, Diagnostic(
+            id="runtime.isolate.partially_isolated",
+            severity="warning",
+            message=(
+                f"isolate failed; lab {lab!r} may be partially isolated and "
+                "is still guarded against apply"
+            ),
+            source=SourceLocation(path=str(state_dir / "isolation")),
+            suggestion=(
+                f"run `playground connect {lab}` to undo, or "
+                f"`playground isolate {lab}` to retry"
+            ),
+        )]
     return run, diagnostics
 
 
