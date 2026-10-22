@@ -2504,3 +2504,24 @@ def test_validate_whole_tree_still_emits_generic_infra_warning() -> None:
         "per_vm_resources_unsupported warning — the whole-tree validate path "
         "is broken."
     )
+
+
+def test_render_status_human_shows_public_ip_when_set(capsys) -> None:
+    from playground.cli.main import _render_status_human
+    from playground.models.status import LabStatus, VmStatus
+
+    status = LabStatus(
+        lab="l",
+        backend="cloud-digitalocean",
+        expected_vms=2,
+        provisioned_vms=2,
+        vms=[
+            VmStatus(name="a", role="r", ip="10.0.0.4", public_ip="203.0.113.9",
+                     state="provisioned"),
+            VmStatus(name="b", role="r", ip="192.168.1.5", state="provisioned"),
+        ],
+    )
+    _render_status_human(status)
+    out = capsys.readouterr().out
+    assert "ip=10.0.0.4  public_ip=203.0.113.9" in out
+    assert "ip=192.168.1.5\n" in out
