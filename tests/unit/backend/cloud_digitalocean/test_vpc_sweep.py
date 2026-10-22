@@ -109,12 +109,13 @@ def test_destroy_runs_vpc_sweep_after_tag_sweep_and_survives_its_failure(
     monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
     monkeypatch.setattr(runner, "list_droplets_by_tag", lambda t, tag: ([], [], True))
     monkeypatch.setattr(runner, "find_vpc", lambda t, n: (None, [], False))
+    monkeypatch.setattr(runner, "list_private_images", lambda t: ([], [], True))
     run, diags = runner.execute_destroy(
         resolved=resolved, state_dir=tmp_path / ".playground",
         tofu_dir=tmp_path / "tofu", bus=EventBus(), config_dir=CONFIG_DIR,
     )
     names = [s.name for s in run.steps]
-    assert names[-2:] == ["tag-sweep", "vpc-sweep"]
+    assert names[-3:] == ["tag-sweep", "vpc-sweep", "image-sweep"]
     assert run.status == "succeeded"
     assert "runtime.destroy.vpc_sweep_inconclusive" in {d.id for d in diags}
 

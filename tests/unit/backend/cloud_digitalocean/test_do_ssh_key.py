@@ -325,6 +325,7 @@ def test_teardown_renders_the_same_vm_ssh_keys_without_the_api(
         runner._noop_step("tofu-destroy", Path(a[2])), []))
     monkeypatch.setattr(runner, "list_droplets_by_tag", lambda t, tag: ([], [], True))
     monkeypatch.setattr(runner, "find_vpc", lambda t, n: (None, [], True))
+    monkeypatch.setattr(runner, "list_private_images", lambda t: ([], [], True))
     resolved = lab_factory("rockylinux-8-x64")
     per_lab = shims["state_dir"] / "state" / "cloud-digitalocean" / "cloud-smoke"
     per_lab.mkdir(parents=True)

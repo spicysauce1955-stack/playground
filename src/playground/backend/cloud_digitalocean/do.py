@@ -217,17 +217,18 @@ _MAX_LIST_PAGES = 25
 
 
 def _list_paged(
-    token: str, path: str, key: str,
+    token: str, path: str, key: str, *, extra_params: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """GET a paginated collection, following ``links.pages.next``.
 
     Returns ``(items, ok)``.  ``ok`` is False on any transport/HTTP failure,
     malformed body, or page-cap hit; callers must not read an empty list as
-    "absent" unless ``ok`` is True.
+    "absent" unless ``ok`` is True.  ``extra_params`` go on the first page
+    only; DigitalOcean's ``next`` links already carry the full query string.
     """
     items: list[dict[str, Any]] = []
     url = path
-    params: dict[str, Any] | None = {"per_page": 200}
+    params: dict[str, Any] | None = {"per_page": 200, **(extra_params or {})}
     for _ in range(_MAX_LIST_PAGES):
         status, body = _request("GET", url, token, params=params)
         if status == 0 or status >= 300:
@@ -594,6 +595,57 @@ def ensure_ssh_key(
     return None, False, f"registering the key failed (status {status})"
 
 
+# ---------------------------------------------------------------------------
+# Custom images
+# ---------------------------------------------------------------------------
+
+IMAGES_CONSOLE_URL = "https://cloud.digitalocean.com/images/custom_images"
+
+
+def list_private_images(
+    token: str,
+) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
+    """List the account's private images (``GET /v2/images?private=true``).
+
+    Covers custom images (and snapshots/backups, which callers filter out
+    by name/tag).  Returns ``(images, diagnostics, ok)``; ``ok`` False means
+    the list is incomplete and must not be read as "no images".
+    """
+    items, ok = _list_paged(
+        token, "/v2/images", "images", extra_params={"private": "true"},
+    )
+    if not ok:
+        return [], [
+            _api_error(
+                "listing private images",
+                f"check the token and retry; inspect {IMAGES_CONSOLE_URL}",
+            )
+        ], False
+    return items, [], True
+
+
+def delete_image(token: str, image_id: int | str) -> list[Diagnostic]:
+    """DELETE /v2/images/<id>.  204 and 404 are success; anything else warns."""
+    status, _ = _request("DELETE", f"/v2/images/{image_id}", token)
+    if status in (204, 404):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.cloud.api_error",
+            severity="warning",
+            message=(
+                f"DigitalOcean API returned status {status} when deleting "
+                f"image {image_id}; it may still exist"
+            ),
+            source=SourceLocation(path=f"image/{image_id}"),
+            suggestion=(
+                f"delete it at {IMAGES_CONSOLE_URL} (a custom image is billed "
+                "for its storage)"
+            ),
+        )
+    ]
+
+
 _MAX_SIZE_PAGES = 25
 """Page cap for :func:`_fetch_all_sizes`.
 
@@ -859,6 +911,7 @@ def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
 __all__ = [
     "CONSOLE_URL",
     "DEFAULT_TOKEN_ENV",
+    "IMAGES_CONSOLE_URL",
     "SSH_KEYS_CONSOLE_URL",
     "VPC_CONSOLE_URL",
     "check_size_region_availability",
@@ -866,6 +919,7 @@ __all__ = [
     "create_ssh_key",
     "put_firewall",
     "delete_droplet",
+    "delete_image",
     "check_vpc_conflicts",
     "delete_vpc",
     "droplet_summary",
@@ -874,6 +928,7 @@ __all__ = [
     "find_vpc",
     "list_droplets_by_tag",
     "list_firewalls",
+    "list_private_images",
     "list_ssh_keys",
     "list_vpcs",
     "read_token",
