@@ -505,6 +505,95 @@ def delete_vpc(token: str, vpc_id: str) -> list[Diagnostic]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Account SSH keys (needed for non-Ubuntu / custom-image Droplets)
+# ---------------------------------------------------------------------------
+
+SSH_KEYS_CONSOLE_URL = "https://cloud.digitalocean.com/account/security"
+
+
+def list_ssh_keys(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
+    """List every SSH key registered in the account (``GET /v2/account/keys``).
+
+    Returns ``(keys, diagnostics, ok)``; ``ok`` False means the list is
+    incomplete and must not be read as "key not registered".
+    """
+    items, ok = _list_paged(token, "/v2/account/keys", "ssh_keys")
+    if not ok:
+        return [], [
+            _api_error(
+                "listing account SSH keys",
+                f"check the token and retry; inspect {SSH_KEYS_CONSOLE_URL}",
+            )
+        ], False
+    return items, [], True
+
+
+def create_ssh_key(
+    token: str, *, name: str, public_key: str,
+) -> tuple[int, dict[str, Any] | None]:
+    """``POST /v2/account/keys``.  Returns ``(status, key_or_None)``.
+
+    201 with an ``ssh_key`` object is success.  DigitalOcean answers 422 when
+    the key is already registered (e.g. a concurrent apply won the race);
+    callers re-list on 422.  The public key is not a secret, but nothing
+    here logs it either.
+    """
+    status, body = _request(
+        "POST", "/v2/account/keys", token,
+        json={"name": name, "public_key": public_key},
+    )
+    key = body.get("ssh_key") if isinstance(body, dict) else None
+    if 200 <= status < 300 and isinstance(key, dict):
+        return status, key
+    return status, None
+
+
+def _find_key(keys: list[dict[str, Any]], fingerprint: str) -> dict[str, Any] | None:
+    want = fingerprint.lower()
+    for key in keys:
+        fp = key.get("fingerprint")
+        if isinstance(fp, str) and fp.lower() == want:
+            return key
+    return None
+
+
+def ensure_ssh_key(
+    token: str, *, name: str, public_key: str, fingerprint: str,
+) -> tuple[dict[str, Any] | None, bool, str]:
+    """Make sure the account has a key with ``fingerprint``.
+
+    Lists ``/v2/account/keys`` and reuses a key with that fingerprint
+    (whatever its name); otherwise registers ``public_key`` as ``name``.  A
+    422 from the create means someone registered it meanwhile (a concurrent
+    apply), so the list is re-read once.
+
+    Returns ``(key_or_None, created, problem)``: ``key`` is the registered
+    key dict on success; ``problem`` is a token-free one-line reason on
+    failure (``""`` on success).  Never raises.
+    """
+    keys, _diags, ok = list_ssh_keys(token)
+    if not ok:
+        return None, False, "listing the account's SSH keys failed (API/transport error)"
+    found = _find_key(keys, fingerprint)
+    if found is not None:
+        return found, False, ""
+    status, created = create_ssh_key(token, name=name, public_key=public_key)
+    if created is not None:
+        return created, True, ""
+    if status == 422:
+        keys, _diags, ok = list_ssh_keys(token)
+        found = _find_key(keys, fingerprint) if ok else None
+        if found is not None:
+            return found, False, ""
+        return None, False, (
+            "registering the key was refused (status 422) and it is not in the "
+            "account's key list"
+            + ("" if ok else " (the re-list failed)")
+        )
+    return None, False, f"registering the key failed (status {status})"
+
+
 _MAX_SIZE_PAGES = 25
 """Page cap for :func:`_fetch_all_sizes`.
 
@@ -770,18 +859,22 @@ def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
 __all__ = [
     "CONSOLE_URL",
     "DEFAULT_TOKEN_ENV",
+    "SSH_KEYS_CONSOLE_URL",
     "VPC_CONSOLE_URL",
     "check_size_region_availability",
     "check_vpc_would_be_default",
+    "create_ssh_key",
     "put_firewall",
     "delete_droplet",
     "check_vpc_conflicts",
     "delete_vpc",
     "droplet_summary",
+    "ensure_ssh_key",
     "get_firewall",
     "find_vpc",
     "list_droplets_by_tag",
     "list_firewalls",
+    "list_ssh_keys",
     "list_vpcs",
     "read_token",
     "token_env_name",
