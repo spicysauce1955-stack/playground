@@ -170,6 +170,21 @@ local-vbox reports `127.0.0.1` with a per-VM NAT-forwarded port (its
 On cloud-digitalocean `ip` is the Droplet's **private** VPC address
 (use it for VM-to-VM traffic and in app config) and `public_ip` is the
 public one; `ssh_host` is the public address.
+A DigitalOcean VM can run a different OS from the rest of its lab:
+
+```yaml
+    - name: central
+      role: docker-host
+      networks: [lab-net]
+      provider_overrides:
+        cloud-digitalocean:
+          image: rockylinux-8-x64        # stock slug (latest 8.x) or an image ID
+          # image_url: https://.../Rocky-8-GenericCloud-Base-8.8-...qcow2  # exact point release (15+ min import)
+          # package_upgrade: false       # keep a pinned release from upgrading on first boot
+```
+
+Rocky/Alma get `common` + `docker`; `redroid`, `capture` and
+`lab_scheduler` are Ubuntu-only. The SSH user is `ubuntu` everywhere.
 
 States to handle:
 - `provisioned` / `running` — VM exists, SSH should work.
