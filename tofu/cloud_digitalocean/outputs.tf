@@ -29,3 +29,8 @@ output "vm_private_ips" {
     name => digitalocean_droplet.node[idx].ipv4_address_private
   }
 }
+
+output "firewall_id" {
+  description = "ID of the lab Cloud Firewall. DigitalOcean firewall names are not unique, so isolate/connect identify and verify the firewall by this id, never by name."
+  value       = digitalocean_firewall.lab.id
+}

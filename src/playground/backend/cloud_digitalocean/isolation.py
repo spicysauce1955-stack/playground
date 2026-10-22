@@ -15,8 +15,12 @@ the operator still flow while isolated.
 ``egress_isolated`` variable.  We edit that one key in the per-lab tfvars
 JSON written by the last apply (never re-render from config, never re-copy
 the ``.tf`` sources, so an unrelated config edit cannot ride along), run
-``tofu apply`` in the per-lab directory, then confirm through the DigitalOcean
-API that the firewall really has the intended outbound destinations.
+``tofu plan -out`` in the per-lab directory, refuse unless the only change is
+an update of ``digitalocean_firewall.lab`` (so isolate never recreates a
+hand-deleted Droplet or applies drift), ``tofu apply`` that exact plan, then
+confirm through the DigitalOcean API, BY FIREWALL ID taken from the tfstate
+(names are not unique) and after DO reports the firewall settled, that the
+firewall covers the whole lab and has the intended outbound destinations.
 
 NOT blocked (verified live): the link-local metadata service
 (169.254.169.254) is served by the hypervisor, outside Cloud Firewall's
@@ -29,11 +33,13 @@ file, argv, log line, or Diagnostic.
 from __future__ import annotations
 
 import json
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from playground.backend.cloud_digitalocean.do import (
-    find_firewall,
+    get_firewall,
     list_droplets_by_tag,
     list_firewalls,
     read_token,
@@ -44,7 +50,7 @@ from playground.backend.cloud_digitalocean.runner import (
     _iso_now,
     _step,
 )
-from playground.backend.local_libvirt.apply import run_tofu_apply, run_tofu_init
+from playground.backend.local_libvirt.apply import _run_step, run_tofu_init
 from playground.events import EventBus, JsonlWriter
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.models.resolved import ResolvedLab
@@ -52,6 +58,13 @@ from playground.runs import OperationRun, StepResult, finish_run, start_run
 
 _OPEN_DESTINATIONS = ("0.0.0.0/0", "::/0")
 _OUTBOUND_PROTOCOLS = frozenset({"tcp", "udp", "icmp"})
+
+_SETTLE_TIMEOUT = 60.0
+"""Seconds to wait for DigitalOcean to finish applying firewall changes."""
+_SETTLE_INTERVAL = 3.0
+_sleep = time.sleep
+_clock = time.monotonic
+"""Indirections so tests can drive the settle loop without real waiting."""
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +203,57 @@ def _set_egress(
             revert()
             return fail(init_diags, f"{operation} lab {lab!r}: tofu-init failed")
 
-    # ---- Step 4: tofu-apply (changes only the firewall's outbound rules) ----
+    # ---- Step 4: tofu-plan, then refuse anything but a firewall update ----
+    plan_file = (logs_dir / "egress.tfplan").resolve()
+    bus.publish(run.run_id, "step_started", {"step": "tofu-plan"})
+    plan_step, plan_diags = _tofu_plan(
+        per_lab_dir, var_file, plan_file, logs_dir / "tofu-plan.log",
+        bus=bus, run_id=run.run_id,
+    )
+    steps.append(plan_step)
+    bus.publish(run.run_id, "step_finished",
+                {"step": "tofu-plan", "exit_code": plan_step.exit_code})
+    if plan_step.exit_code != 0:
+        revert()
+        return fail(
+            plan_diags or [Diagnostic(
+                id=f"runtime.{operation}.plan_failed",
+                severity="error",
+                message=f"tofu plan failed for lab {lab!r}; nothing was changed",
+                source=SourceLocation(path=str(per_lab_dir)),
+                suggestion=f"see {plan_step.log_path}",
+            )],
+            f"{operation} lab {lab!r}: tofu-plan failed; nothing was changed",
+        )
+    plan_json = _tofu_show_plan(per_lab_dir, plan_file)
+    unexpected = (
+        ["<plan could not be read>"] if plan_json is None
+        else _unexpected_changes(plan_json)
+    )
+    if unexpected:
+        revert()
+        return fail(
+            [Diagnostic(
+                id=f"runtime.{operation}.unexpected_changes",
+                severity="error",
+                message=(
+                    f"the plan for lab {lab!r} changes more than the firewall's "
+                    f"outbound rules: {', '.join(unexpected)}; refusing to apply it"
+                ),
+                source=SourceLocation(path=str(per_lab_dir)),
+                suggestion=(
+                    "the lab has drifted from its config (e.g. a Droplet was deleted "
+                    f"by hand); run `playground apply {lab}` (after `connect` if "
+                    "isolated) to reconcile it first"
+                ),
+            )],
+            f"{operation} lab {lab!r}: plan has unexpected changes; nothing was applied",
+        )
+
+    # ---- Step 4b: tofu-apply of exactly that saved plan ----
     bus.publish(run.run_id, "step_started", {"step": "tofu-apply"})
-    apply_step, apply_diags = run_tofu_apply(
-        per_lab_dir, var_file, logs_dir / "tofu-apply.log",
+    apply_step, apply_diags = _tofu_apply_plan(
+        per_lab_dir, plan_file, logs_dir / "tofu-apply.log",
         bus=bus, run_id=run.run_id,
     )
     steps.append(apply_step)
@@ -222,10 +282,21 @@ def _set_egress(
     bus.publish(run.run_id, "step_started", {"step": "verify-firewall"})
     verify_log = logs_dir / "verify-firewall.log"
     started = _iso_now()
-    verify_diags = _verify_firewall(
-        operation=operation, isolated=isolated, token=token,
-        firewall_name=f"{lab}-fw", log_path=verify_log, lab=lab,
-    )
+    firewall_id, state_ids = _read_state_ids(per_lab_dir / "terraform.tfstate")
+    if firewall_id is None:
+        verify_diags = [Diagnostic(
+            id=f"runtime.{operation}.state_unreadable",
+            severity="error",
+            message=f"the OpenTofu state for lab {lab!r} has no readable firewall id",
+            source=SourceLocation(path=str(per_lab_dir / "terraform.tfstate")),
+            suggestion=f"re-run `playground apply {lab}`",
+        )]
+    else:
+        verify_diags = _verify_firewall(
+            operation=operation, isolated=isolated, token=token,
+            firewall_id=firewall_id, state_droplet_ids=state_ids,
+            log_path=verify_log, lab=lab,
+        )
     steps.append(_step("verify-firewall", exit_code=1 if verify_diags else 0,
                        log_path=verify_log, started=started))
     bus.publish(run.run_id, "step_finished",
@@ -340,6 +411,92 @@ def _state_has_firewall(state_path: Path) -> bool:
     )
 
 
+def _read_state_ids(state_path: Path) -> tuple[str | None, set[str]]:
+    """``(firewall_id, droplet_ids)`` of the lab as recorded in the tfstate.
+
+    Ids come back as strings; ``firewall_id`` is None when unreadable.
+    """
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return None, set()
+    firewall_id: str | None = None
+    droplet_ids: set[str] = set()
+    resources = state.get("resources") if isinstance(state, dict) else None
+    for res in resources if isinstance(resources, list) else []:
+        if not isinstance(res, dict) or res.get("mode", "managed") != "managed":
+            continue
+        for inst in res.get("instances") or []:
+            attrs = inst.get("attributes") if isinstance(inst, dict) else None
+            rid = attrs.get("id") if isinstance(attrs, dict) else None
+            if rid in (None, ""):
+                continue
+            if res.get("type") == "digitalocean_firewall" and res.get("name") == "lab":
+                firewall_id = str(rid)
+            elif res.get("type") == "digitalocean_droplet":
+                droplet_ids.add(str(rid))
+    return firewall_id, droplet_ids
+
+
+def _tofu_plan(
+    per_lab_dir: Path, var_file: Path, plan_file: Path, log_path: Path,
+    *, bus: EventBus, run_id: str,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """``tofu plan -out=<plan_file>`` in the per-lab dir (token via the environment)."""
+    return _run_step(
+        name="tofu-plan",
+        command=[
+            "tofu", "plan", "-input=false", f"-out={plan_file}", f"-var-file={var_file}",
+        ],
+        cwd=per_lab_dir, log_path=log_path,
+        missing_binary_id="runtime.apply.tofu_binary_missing",
+        bus=bus, run_id=run_id,
+    )
+
+
+def _tofu_show_plan(per_lab_dir: Path, plan_file: Path) -> dict[str, Any] | None:
+    """``tofu show -json <plan_file>`` parsed, or None if it cannot be read."""
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["tofu", "show", "-json", str(plan_file)],
+            cwd=per_lab_dir, capture_output=True, text=True, timeout=120, check=False,
+        )
+        data = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _tofu_apply_plan(
+    per_lab_dir: Path, plan_file: Path, log_path: Path,
+    *, bus: EventBus, run_id: str,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """``tofu apply <plan_file>``: applies exactly the plan that was inspected."""
+    return _run_step(
+        name="tofu-apply",
+        command=["tofu", "apply", "-input=false", str(plan_file)],
+        cwd=per_lab_dir, log_path=log_path,
+        missing_binary_id="runtime.apply.tofu_binary_missing",
+        bus=bus, run_id=run_id,
+    )
+
+
+def _unexpected_changes(plan: dict[str, Any]) -> list[str]:
+    """Addresses of resource changes other than an update of the lab firewall."""
+    bad: list[str] = []
+    for rc in plan.get("resource_changes") or []:
+        if not isinstance(rc, dict):
+            continue
+        change = rc.get("change")
+        actions = list((change or {}).get("actions") or []) if isinstance(change, dict) else []
+        if set(actions) <= {"no-op", "read"}:
+            continue
+        if rc.get("address") == "digitalocean_firewall.lab" and actions == ["update"]:
+            continue
+        bad.append(f"{rc.get('address')} ({'+'.join(actions) or 'unknown'})")
+    return bad
+
+
 def _write_tfvars_atomic(path: Path, data: dict[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n")
@@ -411,7 +568,8 @@ def _check_foreign_firewalls(
     operation: str,
     token: str,
     lab: str,
-    own_name: str,
+    own_id: str,
+    lab_ids: set[str],
     droplets: list[dict[str, Any]],
     log_path: Path,
 ) -> list[Diagnostic]:
@@ -420,7 +578,8 @@ def _check_foreign_firewalls(
     DigitalOcean unions allow rules across the firewalls attached to a
     Droplet, so one foreign firewall with open egress silently defeats
     isolation.  A firewall applies to a Droplet by ``droplet_ids`` or by a
-    ``tags`` overlap with the Droplet's tags.
+    ``tags`` overlap with the Droplet's tags.  Only OUR firewall, identified
+    by id (names are not unique), is exempt.
     """
     firewalls, _, f_ok = list_firewalls(token)
     if not f_ok:
@@ -437,11 +596,10 @@ def _check_foreign_firewalls(
             source=SourceLocation(path="DigitalOcean API"),
             suggestion=f"re-run `playground {operation}` once the API is reachable",
         )]
-    lab_ids = {str(d.get("id")) for d in droplets}
     lab_tags = {t for d in droplets for t in (d.get("tags") or [])}
     diags: list[Diagnostic] = []
     for fw in firewalls:
-        if fw.get("name") == own_name:
+        if str(fw.get("id")) == own_id:
             continue
         applies = bool(lab_ids & {str(i) for i in (fw.get("droplet_ids") or [])}) or bool(
             lab_tags & set(fw.get("tags") or [])
@@ -471,80 +629,166 @@ def _check_foreign_firewalls(
     return diags
 
 
+def _verify_failed(operation: str, message: str, suggestion: str | None = None) -> Diagnostic:
+    return Diagnostic(
+        id=f"runtime.{operation}.verify_failed",
+        severity="error",
+        message=message,
+        source=SourceLocation(path="DigitalOcean API"),
+        suggestion=suggestion or f"re-run `playground {operation}` once the API is reachable",
+    )
+
+
+def _wait_settled(
+    *, operation: str, token: str, firewall_id: str, log_path: Path,
+) -> tuple[dict[str, Any] | None, list[Diagnostic]]:
+    """Poll the firewall by id until ``status == succeeded`` with no pending changes.
+
+    DigitalOcean applies firewall changes asynchronously, so reading the
+    rules right after ``tofu apply`` can show the old or a half-applied
+    state.  Bounded by ``_SETTLE_TIMEOUT``; not settling in time is a failure
+    (inconclusive), never a pass.
+    """
+    deadline = _clock() + _SETTLE_TIMEOUT
+    last = "no response"
+    while True:
+        fw, _, ok = get_firewall(token, firewall_id)
+        if ok and fw is None:
+            log_path.write_text(f"firewall id={firewall_id} not found\n")
+            return None, [_verify_failed(
+                operation,
+                f"firewall id={firewall_id} was not found in the DigitalOcean account",
+                "re-run `playground apply` to recreate it",
+            )]
+        if ok and fw is not None:
+            pending = fw.get("pending_changes") or []
+            if fw.get("status") == "succeeded" and not pending:
+                return fw, []
+            last = f"status={fw.get('status')!r}, {len(pending)} pending change(s)"
+        else:
+            last = "API request failed"
+        if _clock() >= deadline:
+            break
+        _sleep(_SETTLE_INTERVAL)
+    log_path.write_text(f"INCONCLUSIVE: firewall id={firewall_id} did not settle ({last})\n")
+    return None, [_verify_failed(
+        operation,
+        f"firewall id={firewall_id} did not finish applying within "
+        f"{int(_SETTLE_TIMEOUT)}s ({last}); its effective rules are unconfirmed",
+    )]
+
+
 def _verify_firewall(
     *,
     operation: str,
     isolated: bool,
     token: str,
-    firewall_name: str,
+    firewall_id: str,
+    state_droplet_ids: set[str],
     log_path: Path,
     lab: str,
 ) -> list[Diagnostic]:
-    """Read the firewall back from the DO API; ``[]`` means the state holds."""
+    """Read our firewall back BY ID from the DO API; ``[]`` means the state holds.
+
+    Always waits for the firewall to settle first.  Connect then needs only
+    "open again".  Isolate additionally requires the lab Droplet set (tofu
+    state union the Droplets tagged ``lab:<lab>``) to be fully covered by our
+    firewall, the outbound rules to name exactly that set, and no foreign
+    firewall to widen egress.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    wanted = "outbound limited to the lab's own Droplets" if isolated else "outbound open"
-    lab_droplets: list[dict[str, Any]] = []
-    if isolated:
-        lab_droplets, _, d_ok = list_droplets_by_tag(token, f"lab:{lab}")
-        if not d_ok:
-            log_path.write_text("INCONCLUSIVE: could not list the lab's Droplets\n")
-            return [Diagnostic(
-                id=f"runtime.{operation}.verify_failed",
+    fw, diags = _wait_settled(
+        operation=operation, token=token, firewall_id=firewall_id, log_path=log_path,
+    )
+    if fw is None:
+        return diags
+
+    if not isolated:
+        holds = outbound_is_open(fw)
+        log_path.write_text(
+            f"firewall id={firewall_id}: outbound open: "
+            f"{'confirmed' if holds else 'NOT confirmed'}\n"
+        )
+        if holds:
+            return []
+        return [_verify_failed(
+            operation,
+            f"firewall id={firewall_id} does not have outbound open after tofu apply",
+            f"inspect https://cloud.digitalocean.com/networking/firewalls and re-run "
+            f"`playground {operation}`",
+        )]
+
+    tagged, _, d_ok = list_droplets_by_tag(token, f"lab:{lab}")
+    if not d_ok:
+        log_path.write_text("INCONCLUSIVE: could not list the lab's Droplets\n")
+        return [_verify_failed(
+            operation,
+            f"the DigitalOcean API could not list lab {lab!r} Droplets to confirm "
+            "isolation; do not rely on it",
+        )]
+    tag_ids = {str(d.get("id")) for d in tagged}
+    names = {str(d.get("id")): str(d.get("name")) for d in tagged}
+    if not state_droplet_ids:
+        log_path.write_text("no Droplets recorded in the OpenTofu state\n")
+        return [_verify_failed(
+            operation,
+            f"the OpenTofu state for lab {lab!r} records no Droplets, so isolation "
+            "cannot be confirmed",
+            f"re-run `playground apply {lab}`",
+        )]
+    if not tag_ids or state_droplet_ids - tag_ids:
+        missing = sorted(state_droplet_ids - tag_ids)
+        log_path.write_text(
+            f"tag listing lab:{lab} {'is empty' if not tag_ids else 'misses ' + str(missing)}\n"
+        )
+        return [_verify_failed(
+            operation,
+            f"the Droplets tagged lab:{lab} "
+            f"{'came back empty' if not tag_ids else 'are missing ' + ', '.join(missing)} "
+            "although the OpenTofu state has them; isolation cannot be confirmed",
+            "check the tags in the DigitalOcean console and retry",
+        )]
+
+    lab_ids = state_droplet_ids | tag_ids
+    attached = {str(i) for i in (fw.get("droplet_ids") or [])}
+    uncovered = sorted(lab_ids - attached)
+    if uncovered:
+        log_path.write_text(f"uncovered Droplets: {uncovered}\n")
+        return [
+            Diagnostic(
+                id=f"runtime.{operation}.uncovered_droplet",
                 severity="error",
                 message=(
-                    "tofu apply succeeded but the DigitalOcean API could not list "
-                    f"lab {lab!r} Droplets to confirm isolation; do not rely on it"
+                    f"Droplet {names.get(i, '<not in tag listing>')!r} (id={i}) belongs "
+                    f"to lab {lab!r} but is not covered by firewall id={firewall_id}; "
+                    "it keeps whatever egress it had"
                 ),
-                source=SourceLocation(path="DigitalOcean API"),
-                suggestion=f"re-run `playground {operation}` once the API is reachable",
-            )]
-    lab_ids = {str(d.get("id")) for d in lab_droplets}
-    fw, api_diags, ok = find_firewall(token, firewall_name)
-    if not ok:
-        log_path.write_text(f"INCONCLUSIVE: could not list firewalls ({wanted} unconfirmed)\n")
-        return [Diagnostic(
-            id=f"runtime.{operation}.verify_failed",
-            severity="error",
-            message=(
-                f"tofu apply succeeded but the DigitalOcean API could not confirm "
-                f"firewall {firewall_name!r} has {wanted}; do not rely on it"
-            ),
-            source=SourceLocation(path="DigitalOcean API"),
-            suggestion=f"re-run `playground {operation}` once the API is reachable",
-        ), *api_diags]
-    if fw is None:
-        log_path.write_text(f"firewall {firewall_name!r} not found\n")
-        return [Diagnostic(
-            id=f"runtime.{operation}.verify_failed",
-            severity="error",
-            message=f"firewall {firewall_name!r} was not found in the DigitalOcean account",
-            source=SourceLocation(path="DigitalOcean API"),
-            suggestion="re-run `playground apply` to recreate it",
-        )]
-    holds = outbound_is_droplets_only(fw, lab_ids) if isolated else outbound_is_open(fw)
-    log_path.write_text(
-        f"firewall {firewall_name!r}: {wanted}: {'confirmed' if holds else 'NOT confirmed'}\n"
-    )
-    if holds:
-        if isolated:
-            return _check_foreign_firewalls(
-                operation=operation, token=token, lab=lab,
-                own_name=firewall_name, droplets=lab_droplets, log_path=log_path,
+                source=SourceLocation(path=f"droplet/{i}"),
+                suggestion=(
+                    f"re-run `playground apply {lab}` to attach it, or delete the "
+                    "orphaned Droplet in the DigitalOcean console"
+                ),
             )
-        return []
-    return [Diagnostic(
-        id=f"runtime.{operation}.verify_failed",
-        severity="error",
-        message=(
-            f"firewall {firewall_name!r} does not have the expected state "
-            f"({wanted}) after tofu apply"
-        ),
-        source=SourceLocation(path="DigitalOcean API"),
-        suggestion=(
-            f"inspect the firewall at https://cloud.digitalocean.com/networking/firewalls "
-            f"and re-run `playground {operation}`"
-        ),
-    )]
+            for i in uncovered
+        ]
+
+    holds = outbound_is_droplets_only(fw, lab_ids)
+    log_path.write_text(
+        f"firewall id={firewall_id}: outbound limited to the lab's own Droplets: "
+        f"{'confirmed' if holds else 'NOT confirmed'}\n"
+    )
+    if not holds:
+        return [_verify_failed(
+            operation,
+            f"firewall id={firewall_id} does not have outbound limited to the lab's "
+            "own Droplets after tofu apply",
+            f"inspect https://cloud.digitalocean.com/networking/firewalls and re-run "
+            f"`playground {operation}`",
+        )]
+    return _check_foreign_firewalls(
+        operation=operation, token=token, lab=lab, own_id=firewall_id,
+        lab_ids=lab_ids, droplets=tagged, log_path=log_path,
+    )
 
 
 __all__ = [

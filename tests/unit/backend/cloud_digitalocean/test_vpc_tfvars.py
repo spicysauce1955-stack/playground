@@ -99,3 +99,9 @@ def test_tofu_firewall_targets_droplet_ids_only_not_tags() -> None:
     body = block.group(1)
     assert "droplet_ids = digitalocean_droplet.node[*].id" in body
     assert not re.search(r"^\s*tags\s*=", body, re.M)
+
+
+def test_tofu_exports_the_firewall_id() -> None:
+    out = (TOFU_DIR / "outputs.tf").read_text()
+    assert "output \"firewall_id\"" in out
+    assert "digitalocean_firewall.lab.id" in out

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -192,6 +193,22 @@ def delete_droplet(
     ]
 
 
+_API_ORIGIN = ("https", "api.digitalocean.com")
+
+
+def _is_api_url(url: str) -> bool:
+    """True only for an https URL on the DigitalOcean API host.
+
+    ``links.pages.next`` is followed with the bearer token attached, so it
+    must never lead anywhere but the API itself.
+    """
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme, parts.hostname or "") == _API_ORIGIN and parts.port in (None, 443)
+    except ValueError:
+        return False
+
+
 _MAX_LIST_PAGES = 25
 """Page cap for :func:`_list_paged` (bounds a looping ``links.pages.next``)."""
 
@@ -226,6 +243,8 @@ def _list_paged(
                     next_url = candidate
         if next_url is None:
             return items, True
+        if not _is_api_url(next_url):
+            return items, False  # never send the token to another origin
         url, params = next_url, None
     return items, False
 
@@ -257,6 +276,30 @@ def list_firewalls(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], 
             )
         ], False
     return items, [], True
+
+
+def get_firewall(
+    token: str, firewall_id: str,
+) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
+    """``GET /v2/firewalls/<id>``: look a firewall up BY ID (names are not unique).
+
+    Returns ``(firewall_or_None, diagnostics, ok)``.  404 is ``(None, [], True)``
+    (definitively absent); any other failure is ``ok`` False.  The firewall
+    dict carries ``status`` and ``pending_changes`` for settle polling.
+    """
+    status, body = _request("GET", f"/v2/firewalls/{firewall_id}", token)
+    if status == 404:
+        return None, [], True
+    fw = body.get("firewall") if isinstance(body, dict) else None
+    if status == 0 or status >= 300 or not isinstance(fw, dict):
+        return None, [
+            _api_error(
+                f"reading firewall {firewall_id}",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/firewalls",
+            )
+        ], False
+    return fw, [], True
 
 
 def find_firewall(
@@ -386,6 +429,8 @@ def _fetch_all_sizes(
 
         if next_url is None:
             return sizes, True, None, status
+        if not _is_api_url(next_url):
+            return sizes, False, "status_error", status
 
         # `next_url` is an absolute URL that already carries its own query
         # string (DigitalOcean's pagination convention); passing it as
@@ -590,6 +635,7 @@ __all__ = [
     "delete_vpc",
     "droplet_summary",
     "find_firewall",
+    "get_firewall",
     "find_vpc",
     "list_droplets_by_tag",
     "list_firewalls",
