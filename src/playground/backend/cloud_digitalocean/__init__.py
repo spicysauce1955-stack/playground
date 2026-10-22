@@ -16,6 +16,10 @@ See ``docs/architecture/cloud_digitalocean_design.md`` for the full
 design and ``docs/architecture/CONTRACTS.md`` for pipeline contracts.
 """
 
+from playground.backend.cloud_digitalocean.isolation import (
+    execute_connect,
+    execute_isolate,
+)
 from playground.backend.cloud_digitalocean.plan import (
     DEFAULT_IMAGE,
     DEFAULT_REGION,
@@ -44,7 +48,9 @@ __all__ = [
     "build_do_plan",
     "estimate_cost",
     "execute_apply",
+    "execute_connect",
     "execute_destroy",
+    "execute_isolate",
     "execute_reset",
     "execute_resume",
     "execute_suspend",
