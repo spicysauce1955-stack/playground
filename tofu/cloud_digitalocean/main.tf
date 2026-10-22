@@ -42,6 +42,14 @@ resource "digitalocean_custom_image" "lab" {
   timeouts {
     create = "60m"
   }
+
+  # DigitalOcean normalises the label it stores (seen live: "Unknown" comes
+  # back as "Unknown OS"), which would plan an in-place update on every
+  # apply -- and make `playground isolate` (firewall-only plans) refuse the
+  # lab. The label is cosmetic, so drift on it is ignored.
+  lifecycle {
+    ignore_changes = [distribution]
+  }
 }
 
 # One Droplet per entry in var.vm_names. The Droplet name is prefixed so

@@ -361,6 +361,15 @@ def test_droplet_ssh_keys_expression_has_no_distinct() -> None:
     assert "distinct(" not in main
 
 
+def test_custom_image_ignores_distribution_drift() -> None:
+    """DO stores "Unknown" as "Unknown OS" (seen live); without this every
+    apply plans an image update and `isolate` (firewall-only plans) refuses."""
+    main = _squash(_main_tf())
+    start = main.index('resource "digitalocean_custom_image" "lab"')
+    block = main[start:main.index('resource "digitalocean_droplet"')]
+    assert "lifecycle { ignore_changes = [distribution] }" in block
+
+
 def test_template_vars_include_package_upgrade_defaulting_true() -> None:
     main = _squash(_main_tf())
     assert (
