@@ -315,6 +315,9 @@ ResolvedLab (backend=cloud-digitalocean)
         |
         v
 ================ execute_apply / execute_resume (runner.py) ================
+| cloud-preflight  token, size/region per distinct size, VPC name/range
+|                  conflict (runtime.cloud.vpc_conflict), pre-VPC lab
+|                  (runtime.apply.pre_vpc_lab) -- all before any tofu run
 | tofu-init        (.playground/state/cloud-digitalocean/<lab>/ as cwd)
 | tofu-apply       (-var-file=<lab>.tfvars.json)
 | fetch-vm-ips     (tofu output -json → vm_ips map)
@@ -330,9 +333,10 @@ ResolvedLab (backend=cloud-digitalocean)
 ```
 destroy / suspend:
   tofu-destroy  → tag-sweep (list+delete by tag lab:<lab>, re-list survivors)
+                → vpc-sweep (best-effort: delete an orphaned <lab>-vpc; warnings only)
 
 reset:
-  tofu-destroy  → tag-sweep → clean-state-files
+  tofu-destroy  → tag-sweep → vpc-sweep → clean-state-files
   (clean-state-files removes per-lab dir + inventory; run logs are kept)
 ```
 
@@ -383,6 +387,56 @@ reading.
 **ssh_port**: always 22. Droplets receive public IPv4 directly; no NAT
 port-forward is involved. `wait_for_vms_ready` and `verify_lab` receive
 `ssh_ports=None`, which both functions treat as "use port 22 for all VMs".
+
+**VPC per lab**: `digitalocean_vpc.lab` (`<lab>-vpc`, `ip_range` = the
+lab network's CIDR normalised to its network address); every Droplet sets
+`vpc_uuid`. The validator requires exactly one network on this backend
+(`config.network.do_single_network`), an RFC1918 IPv4 CIDR with a /16–/28
+prefix (`config.network.do_vpc_cidr_invalid`), and warns that pinned
+per-VM IPs are ignored (`config.network.do_ip_pin_ignored`). The range
+must not overlap another VPC in the account (including DO's per-region
+default VPCs, e.g. `10.108.0.0/20` in nyc3); cloud-preflight checks this
+before tofu runs (`runtime.cloud.vpc_conflict`), and the validator warns
+when two DO labs declare overlapping CIDRs (`config.network.do_cidr_overlap`). `tofu destroy` removes the VPC after the Droplets; teardown
+also runs a best-effort `vpc-sweep` after the tag sweep (find
+`<lab>-vpc`, delete, three attempts 5 s apart, warnings only:
+`runtime.<op>.orphaned_vpc`), because an orphaned VPC blocks re-creating
+the lab under the same name / range.
+
+**Firewall**: `<lab>-fw` is attached by `droplet_ids` only (see "Lab egress isolation" →
+"Backend: cloud-digitalocean (isolation)"). Inbound:
+SSH from `firewall.ssh_cidrs`, plus all tcp/udp/icmp from the VPC CIDR
+(VM-to-VM on any port). Outbound: open, or lab-droplets-only while
+isolated (see "Lab egress isolation").
+
+**Addresses in `status`**: `VmStatus.ip` is the Droplet's private VPC
+IPv4 (`None` when absent, never the public one); `VmStatus.public_ip` is
+the public IPv4; `ssh_host` = the public IP, `ssh_port` = 22. Anything
+that *connects* uses `ssh_host`. Local backends never set `public_ip`, so
+their JSON is unchanged. The tofu `vm_ips` output stays the public map
+(the configure half depends on it); `vm_private_ips` is the private map.
+
+**Per-VM size**: `spec.vms[].provider_overrides.cloud-digitalocean.size`
+> `spec.providers.cloud-digitalocean.size` > `DEFAULT_SIZE`. `DoPlan.vm_sizes`
+maps every VM to its slug, rendered as the `vm_sizes` tfvar; the
+Droplet takes `lookup(var.vm_sizes, <vm>, var.size)`. The cost estimate is
+the sum over VMs (`None` if any slug is unpriced), the size/region
+preflight runs once per distinct size, and the plan shows
+`s-1vcpu-2gb x5, s-2vcpu-4gb x1` when sizes differ. Validator:
+`config.backend.do_vm_size_invalid` (error: override is not a non-empty
+string), `config.backend.do_size_below_resources` (warning: a parseable
+`s-<n>vcpu-<m>gb` slug provides fewer vCPUs / less memory than the VM's
+declared resources).
+
+**Upgrade note**: labs provisioned before the VPC change have no VPC, and
+`vpc_uuid` forces Droplet replacement, so `apply` / `resume` refuse them
+(`runtime.apply.pre_vpc_lab`): run `playground destroy <lab>` then
+`playground apply <lab>` deliberately. The new validator errors
+(`do_single_network`, `do_vpc_cidr_invalid`, `do_vm_size_invalid`) are
+downgraded to warnings for destroy / reset / suspend, so an old lab can
+always be torn down.
+Until re-applied, their firewall keeps the account-wide tags and makes
+`isolate` on any other lab fail with `runtime.isolate.foreign_firewall`.
 
 ## Workload: `android_app`
 
@@ -957,44 +1011,142 @@ connections therefore time out instead of failing fast. The CLI says so.
 
 ### Backend: local-libvirt (isolation)
 
-- Mechanism: a libvirt nwfilter `playground-isolate-<lab>` referenced from
-  every lab VM interface, enforced by libvirtd on the host (no sudo, no
-  host nftables) and persisted in the domain config, so it survives VM
-  and host reboots.
+- Mechanism: a libvirt nwfilter `playground-isolate-<lab>` (name
+  sanitised), chain `root`, ebtables layer only, every rule
+  `direction='out'` (traffic sent BY the guest), referenced through a
+  `<filterref>` from every interface on a lab network. libvirtd enforces
+  it on the host (no sudo, no host nftables) and it is persisted in the
+  domain config. Verified live on libvirt 10.0 with real guests: a DHCP
+  renewal brings the default route back but egress stays cut, and the cut
+  survives a reboot.
+- Rule set, repeated per lab gateway `G` / per lab CIDR `C`:
+
+  | Prio | Action | Match |
+  | --- | --- | --- |
+  | 50 | accept | ARP |
+  | 100 | drop | tcp + udp dport 53 to `G` (dnsmasq forwards upstream) |
+  | 110 | accept | udp dport 67 to `G` (unicast DHCP renew) |
+  | 120 | accept | tcp sport 22 to `G` (replies to host-initiated SSH) |
+  | 130 | accept | icmp to `G` |
+  | 150 | drop | everything else to `G` |
+  | 160 | drop | the network and broadcast address of `C` |
+  | 200 | accept | ip to `C` (VM-to-VM, any port) |
+  | 210 | accept | udp dport 67 to 255.255.255.255 (DHCP discover / rebind) |
+  | 900 | drop | all other IPv4; all IPv6 |
+
+- **The host is outside the lab.** `G` is the host's bridge address and
+  lies inside `C`, so the gateway rules sort before the CIDR accept;
+  without them anything the host listens on at `0.0.0.0` (docker swarm,
+  rabbitmq, a registry, a proxy) would be an egress path, and the subnet
+  broadcast would reach host UDP sockets. Consequence: host→VM
+  connections other than SSH (e.g. curling a VM port from the host) do
+  not work while isolated; use an SSH tunnel. `exec` / `cp` / ansible /
+  `adb` ride sshd and keep working. IPv6 is dropped entirely, VM-to-VM
+  included.
+- **Scoped from libvirt, not the YAML.** `C` and `G` come from
+  `virsh net-dumpxml` of each lab network; a CIDR that differs from the
+  lab config fails with `runtime.isolate.network_drift` (re-apply first).
+  Every domain in `virsh list --all` with an interface on a lab network
+  is isolated, declared in the lab or not (`undeclared_domain` warning);
+  an isolated domain with any interface NOT on a lab network fails with
+  `runtime.isolate.non_lab_interface` before anything changes.
+- Steps: `isolate` = inspect-lab → define-nwfilter → attach-filter →
+  verify-isolation; `connect` = inspect-lab → detach-filter →
+  undefine-nwfilter. Running domains get `update-device --live` (live
+  XML) and `--config` (`dumpxml --inactive`); shut-off domains get
+  `--config` only. verify re-lists running domains and requires a live
+  binding (`virsh nwfilter-binding-list`) for each. Per-run XML is kept
+  under `runs/<id>/xml/`.
+- libvirt facts this code depends on (verified live): `nwfilter-define`
+  of an existing name **without** its UUID fails ("already exists with
+  uuid"), so a refresh reuses the UUID and is skipped when the rules are
+  unchanged; `update-device --live` accepts a filterref change on a
+  running domain; `nwfilter-undefine` of a referenced filter fails
+  ("nwfilter is in use"), so `connect` detaches every filterref first.
+- A half-isolated lab (crash mid-run) is completed by re-running
+  `isolate`. An interface already carrying a different filter is switched
+  to ours (`filter_replaced` warning; libvirt allows one filterref per
+  interface) and is NOT restored by `connect`. Domains tofu creates never
+  carry one.
 - `destroy` / `reset` call `local_libvirt.remove_isolation_filter(lab)`
-  best-effort after a non-failed run; its warnings are surfaced by the
-  CLI and never fail the teardown.
-- TODO(lead): fill in the exact rule set, filter-refresh/UUID handling
-  and the binding verification from the libvirt slice.
+  best-effort after a non-failed run; its warnings are surfaced by the CLI
+  and never fail the teardown.
 
 ### Backend: cloud-digitalocean (isolation)
 
-- Mechanism: the lab Cloud Firewall's outbound rules switch from
-  `0.0.0.0/0, ::/0` to the lab's own droplets BY ID
-  (`destination_droplet_ids`, no addresses), driven by the tofu variable
+- Mechanism: the lab Cloud Firewall, driven by the tofu variable
   `egress_isolated` (default false) so HCL and tofu state stay the single
-  source of truth. The VPC CIDR is deliberately NOT used: DO serves each
-  VPC droplet a resolver at an address inside the VPC range (e.g.
-  `10.97.0.254` for `10.97.0.0/24`) that forwards outside lookups, so a
-  CIDR destination would leave outside names resolving. Droplet-id
-  destinations keep VM-to-VM traffic on any port working and block that
-  resolver (verified live). DO firewalls are stateful, so replies to
+  source of truth. Open: outbound tcp/udp/icmp to `0.0.0.0/0, ::/0`.
+  Isolated: outbound only to `destination_droplet_ids` = the lab's own
+  Droplets, with no addresses. DO firewalls are stateful, so replies to
   inbound SSH still flow.
-- **Metadata service is NOT blocked** (verified live): `169.254.169.254`
-  is link-local, served by the hypervisor, and outside Cloud Firewall's
-  reach, so it stays reachable while isolated.
-- Verification reads the API, not tofu: our `<lab>-fw` must be attached to
-  exactly the lab droplets (listed by tag `lab:<lab>`) and every outbound
-  rule must have exactly those droplet ids and no addresses/tags/LBs/k8s.
-  Any OTHER firewall that applies to a lab droplet (by `droplet_ids` or a
-  `tags` overlap) and allows any other outbound destination, including
-  addresses inside the VPC CIDR, fails isolate with
-  `runtime.isolate.foreign_firewall` (DO unions allow rules).
-- The firewall must never set `tags`: a firewall's tags SELECT its target
-  droplets and the lab tags include the account-wide `playground`.
-- TODO(lead): fill in the VPC/inbound-rule details, the tfvars flip, the
-  API verification step and the pre-existing-lab upgrade note from the
-  DO networking slice.
+- **Not the VPC CIDR.** In a custom VPC, DigitalOcean gives droplets a
+  resolver at an address *inside* the VPC range (`10.97.0.254` for
+  `10.97.0.0/24`; `resolvectl dns` shows it) that forwards outside
+  lookups, so a CIDR-scoped rule leaves outside names resolving. Verified
+  live: droplet-id destinations make that lookup fail while VM-to-VM on
+  any port and inbound SSH keep working.
+- **The metadata service is NOT blocked** (verified live).
+  `169.254.169.254` is link-local, answered by the hypervisor, and outside
+  Cloud Firewall's reach. It is not a path to the internet; if a test
+  needs it unreachable, block it in-guest.
+- **The firewall targets Droplets by `droplet_ids` only, never `tags`.** A
+  DO firewall's `tags` *select the Droplets it applies to*, the ownership
+  tags include the account-wide `playground`, and DO unions allow rules
+  across firewalls, so one tagged open firewall silently defeats isolation
+  on every other lab (seen live with a firewall created before this
+  change; isolate now catches it, see below).
+- `isolate` / `connect` flip only `egress_isolated` in the per-lab
+  `<lab>.tfvars.json` written by the last apply (no re-render from config,
+  no re-copy of the `.tf` sources). Steps: preflight → set-egress-isolated →
+  tofu-plan → tofu-apply → verify-firewall.
+  - **Scoped plan:** `tofu plan -out` + `tofu show -json`; anything other
+    than an in-place update of `digitalocean_firewall.lab` (or no change)
+    is refused with `runtime.<op>.unexpected_changes`, so isolate never
+    recreates a hand-deleted Droplet or applies config drift. Then
+    `tofu apply <planfile>`. The tfvars file is restored if init, plan or
+    apply fails.
+  - **Verify by ID, after it settles:** the firewall id and Droplet ids
+    come from the per-lab tfstate (output `firewall_id` too); the firewall
+    is read with `GET /v2/firewalls/{id}` and polled (60 s, every 3 s)
+    until `status == "succeeded"` with no `pending_changes`.
+  - isolate requires: the lab set (state Droplet ids ∪ Droplets tagged
+    `lab:<lab>`) is attached to our firewall (`uncovered_droplet`
+    otherwise; an empty or short tag listing fails); every outbound rule
+    targets exactly that set and nothing else; every OTHER firewall that
+    applies to a lab Droplet (by `droplet_ids` or tag overlap, same name
+    or not) allows no other outbound destination
+    (`runtime.isolate.foreign_firewall`, naming it). connect requires our
+    firewall open again.
+  - API unreachable or not settled in time → the run fails; it never
+    claims isolation it could not confirm.
+- Pre-checks: no per-lab state, or no firewall in the tfstate (destroy
+  leaves tfvars behind) → `runtime.isolate.not_provisioned`; a per-lab
+  `variables.tf` without `egress_isolated` (lab provisioned before this
+  feature) → `runtime.isolate.needs_reapply`. `connect` on such a lab is a
+  no-op success ("nothing to restore").
+
+### Checking isolation from inside a guest
+
+The guest's own resolver cache (systemd-resolved) keeps answering names
+it already resolved until their TTL runs out, so a "lookup of an outside
+name must fail" check has to bypass it: `resolvectl flush-caches` first,
+or `resolvectl query --cache=no <name>`. A send to `/dev/udp/...` or
+`nc -u` "succeeds" whether or not anything arrives; probe UDP with a
+request that needs an answer (e.g. `dig @<server>`).
+
+### Threat model and known gaps
+
+- The guest is assumed non-adversarial: the point is a non-fragile air
+  gap for testing, not a jail. On libvirt the tcp sport 22 accept to the
+  gateway is stateless, so a root guest could SNAT to source port 22 and
+  reach host services on the gateway address.
+- There is no cross-command lock: an `apply` and an `isolate` racing on
+  the same lab (CLI + TUI) are not serialized. Nothing else in the CLI
+  locks either.
+- local-libvirt shares one global tofu state: applying another libvirt
+  lab destroys the first one's domains and leaves its record and filter
+  stale (`playground reset` / `connect` clean up).
 
 ## Cross-layer pitfalls (things future-you will hit)
 

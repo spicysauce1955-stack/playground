@@ -2,9 +2,9 @@
 #
 # Requires:  export DIGITALOCEAN_TOKEN=<your-token>  before apply.
 #
-# The declared network is advisory in this slice (Slice 1): the
-# DigitalOcean adapter does not yet wire it to a VPC.  The Droplet
-# receives a public IP directly from DigitalOcean.
+# The declared network becomes the lab's own DigitalOcean VPC (its CIDR
+# is the VPC ip_range). The Droplet gets a private address in it plus a
+# public IP; SSH uses the public one.
 apiVersion: playground/v1
 kind: Lab
 metadata:

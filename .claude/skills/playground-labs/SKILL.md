@@ -68,7 +68,7 @@ playground destroy generic-infra
 | `playground destroy <lab>` | `tofu destroy` the lab. | Clean teardown when apply state is consistent. |
 | `playground suspend <lab>` | (cloud backends only) Destroy Droplets to stop billing; config preserved. | Pausing a cloud lab to cut costs; disk state is NOT preserved. |
 | `playground resume <lab>` | (cloud backends only) Rebuild Droplets from config after a suspend. | Resuming a suspended cloud lab. |
-| `playground isolate <lab>` | (local-libvirt, cloud-digitalocean) Cut lab VM egress to anything outside the lab's own networks; VM-to-VM and SSH from this machine keep working. Idempotent. | Running untrusted/offline workloads. libvirt drops (outside connections time out) and also drops guest DNS via the lab gateway, so use IPs. `apply`/`resume` refuse an isolated lab. |
+| `playground isolate <lab>` | (local-libvirt, cloud-digitalocean) Cut lab VM egress to anything outside the lab's own networks; VM-to-VM and SSH from this machine keep working. Idempotent. | Air-gap tests after provisioning. libvirt drops (outside connections time out), drops guest DNS via the lab gateway (use IPs), and blocks host→VM traffic other than SSH (use `playground adb` / SSH tunnels). DigitalOcean leaves the metadata service (169.254.169.254) reachable. Flush the guest resolver cache before asserting DNS fails. `apply`/`resume` refuse an isolated lab. |
 | `playground connect <lab>` | Undo `isolate`. Idempotent; fine on a never-isolated lab. | Before re-running `apply`; then `isolate` again. |
 | `playground reset <lab>` | Scrub-by-name (works even when tofu state is corrupted). | When `destroy` fails or state is wedged. |
 | `playground runs list` | Past `apply` / `destroy` runs. | After a failed run, to find the run id. |
@@ -167,6 +167,9 @@ prefer them over `ip` when you SSH/SCP, because they're uniform across
 backends: local-libvirt and cloud use the VM IP on port 22, but
 local-vbox reports `127.0.0.1` with a per-VM NAT-forwarded port (its
 `ip` is null). They're `null` until the VM is reachable.
+On cloud-digitalocean `ip` is the Droplet's **private** VPC address
+(use it for VM-to-VM traffic and in app config) and `public_ip` is the
+public one; `ssh_host` is the public address.
 
 States to handle:
 - `provisioned` / `running` — VM exists, SSH should work.
