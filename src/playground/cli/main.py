@@ -2072,16 +2072,17 @@ def isolate_command(
     """Cut ``lab``'s egress: lab VMs can reach only the lab's own networks.
 
     Blocks TCP/UDP/ICMP from the lab VMs to anything outside the lab's
-    networks (internet, cloud metadata, outside DNS) while VM-to-VM traffic
-    and SSH from this machine keep working. Enforced outside the guests, so
-    it survives a reboot or DHCP renewal. Idempotent.
+    networks (internet, outside DNS) while VM-to-VM traffic and SSH from
+    this machine keep working. Enforced outside the guests, so it survives a
+    reboot or DHCP renewal. Idempotent.
 
     On local-libvirt the cut is a libvirt nwfilter that DROPS packets
     (outside connections time out rather than fail fast) and also drops
     guest DNS to the lab gateway, so lab-internal names stop resolving; use
     IPs. On cloud-digitalocean the lab Cloud Firewall's outbound rules are
-    narrowed to the lab VPC CIDR. ``apply`` / ``resume`` refuse an isolated
-    lab; run ``playground connect`` first. ``local-vbox`` is not supported.
+    narrowed to the lab's own droplets (the cloud metadata service
+    169.254.169.254 stays reachable: Cloud Firewalls do not filter it).
+    ``apply`` / ``resume`` refuse an isolated lab; run ``playground connect`` first. ``local-vbox`` is not supported.
     """
     _run_isolation_verb(
         "isolate", execute_isolate, lab, config_dir, tofu_dir, state_dir, output,

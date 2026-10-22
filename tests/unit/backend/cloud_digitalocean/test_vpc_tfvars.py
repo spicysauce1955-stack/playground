@@ -65,12 +65,16 @@ def test_tofu_places_droplets_in_the_lab_vpc() -> None:
     assert "ip_range    = var.vpc_cidr" in main
 
 
-def test_tofu_egress_is_driven_by_the_variable_on_every_outbound_rule() -> None:
+def test_tofu_isolated_egress_targets_droplet_ids_not_the_vpc_cidr() -> None:
+    """The VPC resolver (e.g. 10.97.0.254) lives INSIDE the CIDR and forwards
+    outside lookups, so isolated egress must use droplet ids."""
     main = (TOFU_DIR / "main.tf").read_text()
-    assert "var.egress_isolated ? [var.vpc_cidr]" in main
-    assert main.count("destination_addresses = local.egress_destinations") == 3
-    # No outbound rule may hardcode the open internet any more.
-    assert 'destination_addresses = ["0.0.0.0/0"' not in main
+    open_ = 'destination_addresses   = var.egress_isolated ? [] : ["0.0.0.0/0", "::/0"]'
+    ids = "destination_droplet_ids = var.egress_isolated ? digitalocean_droplet.node[*].id : []"
+    assert main.count(open_) == 3
+    assert main.count(ids) == 3
+    assert "egress_destinations" not in main
+    assert "destination_addresses = [var.vpc_cidr]" not in main
 
 
 def test_tofu_allows_lab_internal_traffic_inbound() -> None:

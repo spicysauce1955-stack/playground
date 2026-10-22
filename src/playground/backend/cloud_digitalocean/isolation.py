@@ -1,8 +1,12 @@
 """Post-provision egress isolation for cloud-digitalocean labs (``isolate`` / ``connect``).
 
 Enforcement is the lab's Cloud Firewall (``<lab>-fw``): its outbound rules
-switch from ``0.0.0.0/0, ::/0`` to the lab VPC CIDR only, so Droplets can
-still reach each other but nothing outside the VPC.  The firewall lives
+switch from ``0.0.0.0/0, ::/0`` to the lab's own Droplets BY ID (not the
+VPC CIDR), so Droplets can still reach each other on any port but nothing
+else.  The CIDR is deliberately not used: DigitalOcean gives VPC Droplets a
+resolver at an address inside the VPC range (e.g. ``10.97.0.254``) that
+forwards outside lookups, and droplet-id destinations do not cover it.  The
+firewall lives
 outside the guests, so a VM cannot undo it, and it persists across reboots.
 DigitalOcean Cloud Firewalls are stateful, so replies to inbound SSH from
 the operator still flow while isolated.
@@ -14,8 +18,9 @@ the ``.tf`` sources, so an unrelated config edit cannot ride along), run
 ``tofu apply`` in the per-lab directory, then confirm through the DigitalOcean
 API that the firewall really has the intended outbound destinations.
 
-UNVERIFIED: whether DigitalOcean Cloud Firewalls filter traffic to the link-
-local metadata service (169.254.169.254).  This module never claims it.
+NOT blocked (verified live): the link-local metadata service
+(169.254.169.254) is served by the hypervisor, outside Cloud Firewall's
+reach, so it stays reachable while isolated.
 
 The API token is read from the environment only; it never appears in a
 file, argv, log line, or Diagnostic.
@@ -60,7 +65,7 @@ def execute_isolate(
     state_dir: Path,
     bus: EventBus,
 ) -> tuple[OperationRun, list[Diagnostic]]:
-    """Narrow the lab firewall's outbound rules to the lab VPC. Never raises."""
+    """Narrow the lab firewall's outbound rules to the lab's own Droplets. Never raises."""
     return _set_egress(operation="isolate", isolated=True,
                        resolved=resolved, state_dir=state_dir, bus=bus)
 
@@ -135,7 +140,6 @@ def _set_egress(
     if pre_diags or tfvars is None:
         return fail(pre_diags, f"{operation} lab {lab!r} failed preflight")
 
-    cidr = str(tfvars.get("vpc_cidr") or "")
     token = read_token(resolved) or ""  # _preflight guarantees it is set
 
     # ---- Step 2: set-egress-isolated (edit the one tfvars key) ----
@@ -220,7 +224,7 @@ def _set_egress(
     started = _iso_now()
     verify_diags = _verify_firewall(
         operation=operation, isolated=isolated, token=token,
-        firewall_name=f"{lab}-fw", cidr=cidr, log_path=verify_log, lab=lab,
+        firewall_name=f"{lab}-fw", log_path=verify_log, lab=lab,
     )
     steps.append(_step("verify-firewall", exit_code=1 if verify_diags else 0,
                        log_path=verify_log, started=started))
@@ -230,7 +234,7 @@ def _set_egress(
         return fail(verify_diags, f"{operation} lab {lab!r}: firewall verification failed")
 
     summary = (
-        f"isolated lab {lab!r}: outbound limited to VPC {cidr}"
+        f"isolated lab {lab!r}: outbound limited to the lab's own Droplets"
         if isolated
         else f"connected lab {lab!r}: outbound open to the internet"
     )
@@ -347,21 +351,26 @@ def _destinations(rule: dict[str, Any]) -> dict[str, Any]:
     return dest if isinstance(dest, dict) else {}
 
 
-def outbound_is_vpc_only(firewall: dict[str, Any], cidr: str) -> bool:
-    """True when every outbound rule's only destination is exactly ``cidr``.
+def outbound_is_droplets_only(firewall: dict[str, Any], droplet_ids: set[str]) -> bool:
+    """True when every outbound rule's only destination is exactly ``droplet_ids``.
 
-    Also demands the three protocols are present, and no destination by
-    Droplet id, tag, load balancer or Kubernetes cluster (any of those
-    would be an extra reachable destination).
+    All three protocols must be present; no rule may carry an address, tag,
+    load balancer or Kubernetes destination (an address inside the VPC would
+    reach the VPC resolver, which forwards outside lookups).  The firewall
+    itself must also be attached to exactly those Droplets.
     """
+    if not droplet_ids:
+        return False
+    if {str(i) for i in (firewall.get("droplet_ids") or [])} != droplet_ids:
+        return False
     rules = [r for r in (firewall.get("outbound_rules") or []) if isinstance(r, dict)]
     if {str(r.get("protocol")) for r in rules} != _OUTBOUND_PROTOCOLS:
         return False
     for rule in rules:
         dest = _destinations(rule)
-        if set(dest.get("addresses") or []) != {cidr}:
+        if {str(i) for i in (dest.get("droplet_ids") or [])} != droplet_ids:
             return False
-        for extra in ("droplet_ids", "tags", "load_balancer_uids", "kubernetes_ids"):
+        for extra in ("addresses", "tags", "load_balancer_uids", "kubernetes_ids"):
             if dest.get(extra):
                 return False
     return True
@@ -378,17 +387,22 @@ def outbound_is_open(firewall: dict[str, Any]) -> bool:
     )
 
 
-def grants_egress_beyond(firewall: dict[str, Any], cidr: str) -> bool:
-    """True when any outbound rule allows a destination other than ``cidr``."""
+def grants_egress_beyond(firewall: dict[str, Any], droplet_ids: set[str]) -> bool:
+    """True when any outbound rule allows a destination other than lab Droplets.
+
+    ANY address (even inside the VPC CIDR, which reaches the VPC resolver),
+    tag, load balancer or Kubernetes destination counts, as does a Droplet id
+    outside the lab.
+    """
     for rule in firewall.get("outbound_rules") or []:
         if not isinstance(rule, dict):
             continue
         dest = _destinations(rule)
-        if set(dest.get("addresses") or []) - {cidr}:
-            return True
-        for extra in ("droplet_ids", "tags", "load_balancer_uids", "kubernetes_ids"):
+        for extra in ("addresses", "tags", "load_balancer_uids", "kubernetes_ids"):
             if dest.get(extra):
                 return True
+        if {str(i) for i in (dest.get("droplet_ids") or [])} - droplet_ids:
+            return True
     return False
 
 
@@ -398,7 +412,7 @@ def _check_foreign_firewalls(
     token: str,
     lab: str,
     own_name: str,
-    cidr: str,
+    droplets: list[dict[str, Any]],
     log_path: Path,
 ) -> list[Diagnostic]:
     """Fail if ANY other firewall applying to a lab Droplet grants wider egress.
@@ -408,16 +422,15 @@ def _check_foreign_firewalls(
     isolation.  A firewall applies to a Droplet by ``droplet_ids`` or by a
     ``tags`` overlap with the Droplet's tags.
     """
-    droplets, _, d_ok = list_droplets_by_tag(token, f"lab:{lab}")
     firewalls, _, f_ok = list_firewalls(token)
-    if not (d_ok and f_ok):
+    if not f_ok:
         with log_path.open("a") as fh:
-            fh.write("INCONCLUSIVE: could not enumerate Droplets/firewalls\n")
+            fh.write("INCONCLUSIVE: could not enumerate firewalls\n")
         return [Diagnostic(
             id=f"runtime.{operation}.verify_failed",
             severity="error",
             message=(
-                "could not enumerate the account's firewalls and the lab's Droplets "
+                "could not enumerate the account's firewalls "
                 "to rule out another firewall granting outside egress; do not rely "
                 "on isolation"
             ),
@@ -433,7 +446,7 @@ def _check_foreign_firewalls(
         applies = bool(lab_ids & {str(i) for i in (fw.get("droplet_ids") or [])}) or bool(
             lab_tags & set(fw.get("tags") or [])
         )
-        if not applies or not grants_egress_beyond(fw, cidr):
+        if not applies or not grants_egress_beyond(fw, lab_ids):
             continue
         fw_name, fw_id = fw.get("name"), fw.get("id")
         with log_path.open("a") as fh:
@@ -443,8 +456,9 @@ def _check_foreign_firewalls(
             severity="error",
             message=(
                 f"firewall {fw_name!r} (id={fw_id}) also applies to lab {lab!r} "
-                f"Droplets and allows outbound beyond {cidr}; DigitalOcean unions "
-                "allow rules, so the lab is NOT isolated"
+                "Droplets and allows outbound beyond the lab's own Droplets (any "
+                "address, even inside the VPC, reaches the VPC resolver); "
+                "DigitalOcean unions allow rules, so the lab is NOT isolated"
             ),
             source=SourceLocation(path=f"firewall/{fw_id}"),
             suggestion=(
@@ -463,14 +477,29 @@ def _verify_firewall(
     isolated: bool,
     token: str,
     firewall_name: str,
-    cidr: str,
     log_path: Path,
     lab: str,
 ) -> list[Diagnostic]:
     """Read the firewall back from the DO API; ``[]`` means the state holds."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    wanted = "outbound limited to the lab's own Droplets" if isolated else "outbound open"
+    lab_droplets: list[dict[str, Any]] = []
+    if isolated:
+        lab_droplets, _, d_ok = list_droplets_by_tag(token, f"lab:{lab}")
+        if not d_ok:
+            log_path.write_text("INCONCLUSIVE: could not list the lab's Droplets\n")
+            return [Diagnostic(
+                id=f"runtime.{operation}.verify_failed",
+                severity="error",
+                message=(
+                    "tofu apply succeeded but the DigitalOcean API could not list "
+                    f"lab {lab!r} Droplets to confirm isolation; do not rely on it"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=f"re-run `playground {operation}` once the API is reachable",
+            )]
+    lab_ids = {str(d.get("id")) for d in lab_droplets}
     fw, api_diags, ok = find_firewall(token, firewall_name)
-    wanted = f"outbound limited to {cidr}" if isolated else "outbound open"
     if not ok:
         log_path.write_text(f"INCONCLUSIVE: could not list firewalls ({wanted} unconfirmed)\n")
         return [Diagnostic(
@@ -492,7 +521,7 @@ def _verify_firewall(
             source=SourceLocation(path="DigitalOcean API"),
             suggestion="re-run `playground apply` to recreate it",
         )]
-    holds = outbound_is_vpc_only(fw, cidr) if isolated else outbound_is_open(fw)
+    holds = outbound_is_droplets_only(fw, lab_ids) if isolated else outbound_is_open(fw)
     log_path.write_text(
         f"firewall {firewall_name!r}: {wanted}: {'confirmed' if holds else 'NOT confirmed'}\n"
     )
@@ -500,7 +529,7 @@ def _verify_firewall(
         if isolated:
             return _check_foreign_firewalls(
                 operation=operation, token=token, lab=lab,
-                own_name=firewall_name, cidr=cidr, log_path=log_path,
+                own_name=firewall_name, droplets=lab_droplets, log_path=log_path,
             )
         return []
     return [Diagnostic(
@@ -523,5 +552,5 @@ __all__ = [
     "execute_isolate",
     "grants_egress_beyond",
     "outbound_is_open",
-    "outbound_is_vpc_only",
+    "outbound_is_droplets_only",
 ]

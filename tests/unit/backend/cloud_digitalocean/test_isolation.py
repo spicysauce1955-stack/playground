@@ -13,8 +13,9 @@ from playground.backend.cloud_digitalocean import isolation as iso
 from playground.backend.cloud_digitalocean.isolation import (
     execute_connect,
     execute_isolate,
+    grants_egress_beyond,
+    outbound_is_droplets_only,
     outbound_is_open,
-    outbound_is_vpc_only,
 )
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
@@ -27,13 +28,20 @@ CIDR = "10.60.0.0/24"
 LAB = "cloud-smoke"
 
 
-def _fw(isolated: bool, cidr: str = CIDR) -> dict[str, Any]:
-    dests = [cidr] if isolated else ["0.0.0.0/0", "::/0"]
+LAB_IDS = {"111"}
+
+
+def _fw(isolated: bool) -> dict[str, Any]:
+    """Our firewall as the DO API returns it: droplet-id destinations when isolated."""
+    dest: dict[str, Any] = (
+        {"droplet_ids": [111]} if isolated else {"addresses": ["0.0.0.0/0", "::/0"]}
+    )
     return {
         "name": f"{LAB}-fw",
+        "droplet_ids": [111],
         "outbound_rules": [
             {"protocol": p, "ports": "0" if p == "icmp" else "all",
-             "destinations": {"addresses": list(dests)}}
+             "destinations": dict(dest)}
             for p in ("tcp", "udp", "icmp")
         ],
     }
@@ -139,27 +147,57 @@ def _run(fn, resolved, state_dir):
 
 
 def test_predicates_on_open_and_isolated_firewalls() -> None:
-    assert outbound_is_vpc_only(_fw(True), CIDR)
-    assert not outbound_is_vpc_only(_fw(False), CIDR)
+    assert outbound_is_droplets_only(_fw(True), LAB_IDS)
+    assert not outbound_is_droplets_only(_fw(False), LAB_IDS)
     assert outbound_is_open(_fw(False))
     assert not outbound_is_open(_fw(True))
 
 
-def test_vpc_only_rejects_extra_destinations() -> None:
+@pytest.mark.parametrize("extra", [
+    {"addresses": ["1.1.1.1"]},
+    {"addresses": [CIDR]},  # the VPC CIDR reaches the VPC resolver
+    {"tags": ["something"]},
+    {"load_balancer_uids": ["lb"]},
+    {"kubernetes_ids": ["k8s"]},
+])
+def test_droplets_only_rejects_any_extra_destination(extra: dict[str, Any]) -> None:
     fw = _fw(True)
-    fw["outbound_rules"][0]["destinations"]["addresses"].append("1.1.1.1")
-    assert not outbound_is_vpc_only(fw, CIDR)
-    fw = _fw(True)
-    fw["outbound_rules"][1]["destinations"]["tags"] = ["something"]
-    assert not outbound_is_vpc_only(fw, CIDR)
+    fw["outbound_rules"][1]["destinations"].update(extra)
+    assert not outbound_is_droplets_only(fw, LAB_IDS)
 
 
-def test_vpc_only_requires_all_three_protocols_and_the_exact_cidr() -> None:
+def test_droplets_only_rejects_cidr_shape() -> None:
+    fw = _fw(True)
+    for rule in fw["outbound_rules"]:
+        rule["destinations"] = {"addresses": [CIDR]}
+    assert not outbound_is_droplets_only(fw, LAB_IDS)
+
+
+def test_droplets_only_requires_all_three_protocols() -> None:
     fw = _fw(True)
     fw["outbound_rules"].pop()
-    assert not outbound_is_vpc_only(fw, CIDR)
-    assert not outbound_is_vpc_only(_fw(True, "10.99.0.0/24"), CIDR)
-    assert not outbound_is_vpc_only({"outbound_rules": []}, CIDR)
+    assert not outbound_is_droplets_only(fw, LAB_IDS)
+    assert not outbound_is_droplets_only({"outbound_rules": []}, LAB_IDS)
+
+
+def test_droplets_only_requires_the_exact_lab_droplet_set() -> None:
+    assert not outbound_is_droplets_only(_fw(True), {"111", "222"})
+    assert not outbound_is_droplets_only(_fw(True), {"999"})
+    assert not outbound_is_droplets_only(_fw(True), set())
+    fw = _fw(True)
+    fw["outbound_rules"][0]["destinations"]["droplet_ids"] = [111, 222]
+    assert not outbound_is_droplets_only(fw, LAB_IDS)
+    fw = _fw(True)
+    fw["droplet_ids"] = [111, 222]  # attached to a droplet outside the lab
+    assert not outbound_is_droplets_only(fw, LAB_IDS)
+
+
+def test_grants_egress_beyond_counts_vpc_cidr_addresses() -> None:
+    fw = _foreign("vpc-cidr")
+    for rule in fw["outbound_rules"]:
+        rule["destinations"] = {"addresses": [CIDR]}
+    assert grants_egress_beyond(fw, LAB_IDS)
+    assert not grants_egress_beyond(_fw(True), LAB_IDS)
 
 
 # ---- isolate ---------------------------------------------------------------
@@ -176,7 +214,7 @@ def test_isolate_flips_var_applies_and_verifies(resolved, state_dir, fakes) -> N
     assert [s.name for s in run.steps] == [
         "preflight", "set-egress-isolated", "tofu-apply", "verify-firewall",
     ]
-    assert str(CIDR) in run.summary
+    assert "own Droplets" in run.summary
 
 
 def test_isolate_preserves_every_other_tfvar(resolved, state_dir, fakes) -> None:
@@ -411,3 +449,37 @@ def test_connect_does_not_check_foreign_firewalls(resolved, state_dir, fakes) ->
     fakes.listing_ok = False
     run, _ = _run(execute_connect, resolved, state_dir)
     assert run.status == "succeeded"
+
+
+def test_foreign_firewall_with_vpc_cidr_addresses_fails_isolate(resolved, state_dir, fakes) -> None:
+    fw = _foreign("cidr-fw", tags=["playground"])
+    for rule in fw["outbound_rules"]:
+        rule["destinations"] = {"addresses": [CIDR]}
+    fakes.firewalls = [fw]
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert diags[0].id == "runtime.isolate.foreign_firewall"
+
+
+def test_own_firewall_with_addresses_fails_verify(resolved, state_dir, fakes) -> None:
+    bad = _fw(True)
+    bad["outbound_rules"][0]["destinations"]["addresses"] = [CIDR]
+    fakes.api = [bad]
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert diags[0].id == "runtime.isolate.verify_failed"
+
+
+def test_own_firewall_with_different_droplet_set_fails_verify(resolved, state_dir, fakes) -> None:
+    fakes.droplets.append({"id": 222, "name": "n2", "tags": ["playground", f"lab:{LAB}"]})
+    # apply "succeeded" but the firewall only covers droplet 111
+    fakes.api = [_fw(True)]
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert diags[0].id == "runtime.isolate.verify_failed"
+
+
+def test_verify_inconclusive_when_lab_droplets_cannot_be_listed(resolved, state_dir, fakes) -> None:
+    fakes.listing_ok = False
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed" and diags[0].id == "runtime.isolate.verify_failed"

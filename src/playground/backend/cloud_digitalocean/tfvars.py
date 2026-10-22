@@ -56,7 +56,7 @@ def render_do_tfvars(
         from disk and passes it here; keeping it a parameter keeps this
         function pure and testable.
     :param egress_isolated: Whether the lab firewall's outbound rules are
-        narrowed to the VPC.  A normal apply renders ``False``; only
+        narrowed to the lab's own droplets.  A normal apply renders ``False``; only
         ``playground isolate`` flips it (by editing the last-applied tfvars
         file, not by re-rendering).
     """

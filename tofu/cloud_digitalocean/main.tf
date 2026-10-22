@@ -8,12 +8,6 @@ locals {
   # internet. Doctor (Slice 5) emits a warning for this case; it is valid for
   # scratch / smoke labs where the exact client IP is unknown.
   ssh_inbound = length(var.firewall_ssh_cidrs) > 0 ? var.firewall_ssh_cidrs : ["0.0.0.0/0", "::/0"]
-
-  # Outbound destinations for the lab firewall. Normally the whole internet;
-  # `playground isolate` flips var.egress_isolated so the only reachable
-  # destination is the lab's own VPC (VM-to-VM). DO Cloud Firewalls are
-  # stateful, so replies to inbound SSH still flow while isolated.
-  egress_destinations = var.egress_isolated ? [var.vpc_cidr] : ["0.0.0.0/0", "::/0"]
 }
 
 # One VPC per lab, sized by the lab network's CIDR. Droplets get a private
@@ -62,10 +56,15 @@ resource "digitalocean_droplet" "node" {
 # tag, so it would apply this lab's rules to every other lab's Droplets (and
 # DO unions allow rules across firewalls, defeating egress isolation).
 # Inbound: SSH from local.ssh_inbound, plus all TCP/UDP/ICMP from the lab VPC
-# CIDR (VM-to-VM on any port). The VPC CIDR is used rather than source_tags
-# because it is exactly the set the isolated outbound rule can still reach.
-# Outbound: TCP/UDP/ICMP to local.egress_destinations (open so VMs can reach
-# apt/docker registries, or VPC-only while the lab is isolated).
+# CIDR (VM-to-VM on any port).
+# Outbound: TCP/UDP/ICMP, open to the internet normally. While
+# var.egress_isolated the destinations are the lab's own Droplets BY ID, not
+# the VPC CIDR: DigitalOcean serves each VPC droplet a resolver at an address
+# INSIDE the VPC range (e.g. 10.97.0.254 for 10.97.0.0/24) which forwards
+# outside lookups, so allowing the CIDR would still let outside names resolve.
+# Droplet-id destinations cover VM-to-VM on any port but not that resolver.
+# Cloud Firewalls do NOT filter the link-local metadata service
+# (169.254.169.254; verified live) - it stays reachable while isolated.
 resource "digitalocean_firewall" "lab" {
   name = "${var.name_prefix}-fw"
 
@@ -97,19 +96,22 @@ resource "digitalocean_firewall" "lab" {
   }
 
   outbound_rule {
-    protocol              = "tcp"
-    port_range            = "1-65535"
-    destination_addresses = local.egress_destinations
+    protocol                = "tcp"
+    port_range              = "1-65535"
+    destination_addresses   = var.egress_isolated ? [] : ["0.0.0.0/0", "::/0"]
+    destination_droplet_ids = var.egress_isolated ? digitalocean_droplet.node[*].id : []
   }
 
   outbound_rule {
-    protocol              = "udp"
-    port_range            = "1-65535"
-    destination_addresses = local.egress_destinations
+    protocol                = "udp"
+    port_range              = "1-65535"
+    destination_addresses   = var.egress_isolated ? [] : ["0.0.0.0/0", "::/0"]
+    destination_droplet_ids = var.egress_isolated ? digitalocean_droplet.node[*].id : []
   }
 
   outbound_rule {
-    protocol              = "icmp"
-    destination_addresses = local.egress_destinations
+    protocol                = "icmp"
+    destination_addresses   = var.egress_isolated ? [] : ["0.0.0.0/0", "::/0"]
+    destination_droplet_ids = var.egress_isolated ? digitalocean_droplet.node[*].id : []
   }
 }

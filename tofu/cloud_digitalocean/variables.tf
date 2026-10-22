@@ -64,7 +64,7 @@ variable "vpc_cidr" {
 }
 
 variable "egress_isolated" {
-  description = "When true, the lab firewall's outbound rules only allow the VPC CIDR (no internet, no outside DNS). Flipped by `playground isolate` / `playground connect`; false for a normal apply."
+  description = "When true, the lab firewall's outbound rules only allow the lab's own Droplets by id (no internet, no outside DNS, not even the VPC resolver; the link-local metadata service is NOT blocked). Flipped by `playground isolate` / `playground connect`; false for a normal apply."
   type        = bool
   default     = false
 }

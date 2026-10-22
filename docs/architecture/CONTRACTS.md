@@ -964,13 +964,28 @@ connections therefore time out instead of failing fast. The CLI says so.
 ### Backend: cloud-digitalocean (isolation)
 
 - Mechanism: the lab Cloud Firewall's outbound rules switch from
-  `0.0.0.0/0, ::/0` to the lab VPC CIDR, driven by the tofu variable
+  `0.0.0.0/0, ::/0` to the lab's own droplets BY ID
+  (`destination_droplet_ids`, no addresses), driven by the tofu variable
   `egress_isolated` (default false) so HCL and tofu state stay the single
-  source of truth. DO firewalls are stateful, so replies to inbound SSH
-  still flow.
-- **UNVERIFIED:** whether DO Cloud Firewalls filter the metadata service
-  (`169.254.169.254`). Do not claim the metadata service is blocked until
-  it has been tested live.
+  source of truth. The VPC CIDR is deliberately NOT used: DO serves each
+  VPC droplet a resolver at an address inside the VPC range (e.g.
+  `10.97.0.254` for `10.97.0.0/24`) that forwards outside lookups, so a
+  CIDR destination would leave outside names resolving. Droplet-id
+  destinations keep VM-to-VM traffic on any port working and block that
+  resolver (verified live). DO firewalls are stateful, so replies to
+  inbound SSH still flow.
+- **Metadata service is NOT blocked** (verified live): `169.254.169.254`
+  is link-local, served by the hypervisor, and outside Cloud Firewall's
+  reach, so it stays reachable while isolated.
+- Verification reads the API, not tofu: our `<lab>-fw` must be attached to
+  exactly the lab droplets (listed by tag `lab:<lab>`) and every outbound
+  rule must have exactly those droplet ids and no addresses/tags/LBs/k8s.
+  Any OTHER firewall that applies to a lab droplet (by `droplet_ids` or a
+  `tags` overlap) and allows any other outbound destination, including
+  addresses inside the VPC CIDR, fails isolate with
+  `runtime.isolate.foreign_firewall` (DO unions allow rules).
+- The firewall must never set `tags`: a firewall's tags SELECT its target
+  droplets and the lab tags include the account-wide `playground`.
 - TODO(lead): fill in the VPC/inbound-rule details, the tfvars flip, the
   API verification step and the pre-existing-lab upgrade note from the
   DO networking slice.
