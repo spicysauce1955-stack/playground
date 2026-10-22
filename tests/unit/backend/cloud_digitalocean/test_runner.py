@@ -247,6 +247,8 @@ def _install_shims(
     monkeypatch.setattr(f"{MOD}.list_droplets_by_tag", fake_list_droplets_by_tag)
     # Teardown's best-effort vpc-sweep: no VPC left behind, and no real HTTP.
     monkeypatch.setattr(f"{MOD}.find_vpc", lambda token, name: (None, [], True))
+    # Preflight VPC conflict listing: empty account, and no real HTTP.
+    monkeypatch.setattr(f"{MOD}.list_vpcs", lambda token: ([], [], True))
     monkeypatch.setattr(f"{MOD}.schedule_workloads", fake_schedule_workloads)
     monkeypatch.setattr(f"{MOD}.stage_workload_files", fake_stage_workload_files)
 
@@ -1402,3 +1404,140 @@ def test_apply_with_size_check_warning_proceeds_to_tofu_init(
     assert "tofu-apply" in steps_called
     diag_ids = [d.id for d in diags]
     assert "runtime.cloud.size_unavailable_in_region" not in diag_ids
+
+
+# ===========================================================================
+# VPC conflict + pre-VPC lab preflight (both before any tofu step)
+# ===========================================================================
+
+
+_MOD = "playground.backend.cloud_digitalocean.runner"
+
+
+def _apply(tmp_path, resolved, source_root, ansible_dir, fn=execute_apply):
+    return fn(
+        resolved=resolved,
+        state_dir=tmp_path / ".playground",
+        tofu_dir=source_root,
+        ansible_dir=ansible_dir,
+        config_dir=CONFIG_DIR,
+        bus=EventBus(),
+    )
+
+
+def _vpc(name, ip_range, region="nyc3"):
+    return {"id": f"id-{name}", "name": name, "ip_range": ip_range, "region": region}
+
+
+@pytest.mark.parametrize(
+    "vpc",
+    [
+        _vpc("cloud-smoke-vpc", "10.99.0.0/24", region="sfo3"),  # same name, other range
+        _vpc("other", "10.60.0.0/16", region="ams3"),  # overlaps 10.60.0.0/24
+    ],
+)
+def test_apply_vpc_conflict_fails_before_tofu(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir, vpc,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    monkeypatch.setattr(f"{_MOD}.list_vpcs", lambda token: ([vpc], [], True))
+
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+
+    assert run is not None and run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.cloud.vpc_conflict"]
+    assert "tofu-init" not in steps_called
+    assert "tofu-apply" not in steps_called
+
+
+def test_resume_vpc_conflict_fails_before_tofu(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    from playground.backend.cloud_digitalocean.runner import execute_resume
+
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    monkeypatch.setattr(
+        f"{_MOD}.list_vpcs", lambda token: ([_vpc("x", "10.60.0.0/24")], [], True)
+    )
+    run, diags = _apply(
+        tmp_path, resolved_cloud_smoke, source_root, ansible_dir, fn=execute_resume
+    )
+    assert run is not None and run.status == "failed"
+    assert diags[0].id == "runtime.cloud.vpc_conflict"
+    assert "tofu-init" not in steps_called
+
+
+def test_apply_own_vpc_is_not_a_conflict(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    monkeypatch.setattr(
+        f"{_MOD}.list_vpcs",
+        lambda token: ([_vpc("cloud-smoke-vpc", "10.60.0.0/24")], [], True),
+    )
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert "runtime.cloud.vpc_conflict" not in [d.id for d in diags]
+    assert "tofu-init" in steps_called
+
+
+def test_apply_vpc_list_failure_degrades_to_warning(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    monkeypatch.setattr(f"{_MOD}.list_vpcs", lambda token: ([], [], False))
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert "runtime.cloud.vpc_conflict" not in [d.id for d in diags]
+    assert "tofu-init" in steps_called
+
+
+def _write_state(tmp_path: Path, types: list[str]) -> None:
+    d = tmp_path / ".playground" / "state" / "cloud-digitalocean" / "cloud-smoke"
+    d.mkdir(parents=True)
+    (d / "terraform.tfstate").write_text(
+        json.dumps({"resources": [{"type": t, "name": "x"} for t in types]})
+    )
+
+
+@pytest.mark.parametrize("which", ["apply", "resume"])
+def test_pre_vpc_lab_refused_before_tofu(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir, which,
+) -> None:
+    from playground.backend.cloud_digitalocean import runner as r
+
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    _write_state(tmp_path, ["digitalocean_droplet", "digitalocean_firewall"])
+    fn = r.execute_apply if which == "apply" else r.execute_resume
+
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir, fn=fn)
+
+    assert run is not None and run.status == "failed"
+    assert diags[0].id == "runtime.apply.pre_vpc_lab"
+    assert "playground destroy cloud-smoke" in (diags[0].suggestion or "")
+    assert "tofu-init" not in steps_called
+    assert "tofu-apply" not in steps_called
+
+
+def test_lab_with_vpc_in_state_is_not_pre_vpc(
+    tmp_path, monkeypatch, resolved_cloud_smoke, source_root, ansible_dir,
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", FAKE_TOKEN)
+    steps_called = _install_shims(monkeypatch)
+    _write_state(tmp_path, ["digitalocean_droplet", "digitalocean_vpc"])
+    run, diags = _apply(tmp_path, resolved_cloud_smoke, source_root, ansible_dir)
+    assert "runtime.apply.pre_vpc_lab" not in [d.id for d in diags]
+    assert "tofu-init" in steps_called
+
+
+def test_check_vpc_conflicts_ignores_unrelated_vpc() -> None:
+    from playground.backend.cloud_digitalocean.do import check_vpc_conflicts
+
+    out = check_vpc_conflicts(
+        [_vpc("elsewhere", "10.70.0.0/24")],
+        lab_name="cloud-smoke", vpc_name="cloud-smoke-vpc", vpc_cidr="10.60.0.0/24",
+    )
+    assert out == []

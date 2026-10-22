@@ -55,7 +55,10 @@ def _net(cidr: str, name: str = "net") -> str:
 
 def _do_diags(committed_load: LoadedConfig, lab: Lab):
     committed_load.labs[lab.metadata.name] = lab
-    return [d for d in validate(committed_load) if d.id.startswith("config.network.do_")]
+    return [
+        d for d in validate(committed_load)
+        if d.id.startswith("config.network.do_") and d.id != "config.network.do_cidr_overlap"
+    ]
 
 
 def test_valid_lab_is_silent(committed_load: LoadedConfig) -> None:

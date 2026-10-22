@@ -2525,3 +2525,20 @@ def test_render_status_human_shows_public_ip_when_set(capsys) -> None:
     out = capsys.readouterr().out
     assert "ip=10.0.0.4  public_ip=203.0.113.9" in out
     assert "ip=192.168.1.5\n" in out
+
+
+def test_render_status_human_marks_running_vms_active(capsys) -> None:
+    from playground.cli.main import _render_status_human
+    from playground.models.status import LabStatus, VmStatus
+
+    status = LabStatus(
+        lab="l", backend="cloud-digitalocean", expected_vms=2, provisioned_vms=1,
+        vms=[
+            VmStatus(name="up", role="r", state="running"),
+            VmStatus(name="gone", role="r", state="missing"),
+        ],
+    )
+    _render_status_human(status)
+    out = capsys.readouterr().out
+    assert "+ up" in out
+    assert "- gone" in out

@@ -1249,3 +1249,31 @@ def test_do_size_below_resources_skips_unparseable_slug(
           "provider_overrides": {"cloud-digitalocean": {"size": "custom-slug"}}}],
     )
     assert not _do_diags(committed_load, "config.backend.do_size_below_resources")
+
+
+def _make_do_lab(committed_load: LoadedConfig, name: str, cidr: str, backend="cloud-digitalocean"):
+    lab = committed_load.labs["cloud-smoke"]
+    net = lab.spec.networks[0].model_copy(update={"cidr": cidr})
+    committed_load.labs[name] = lab.model_copy(
+        update={
+            "metadata": lab.metadata.model_copy(update={"name": name}),
+            "spec": lab.spec.model_copy(update={"networks": [net], "backend": backend}),
+        }
+    )
+
+
+def test_do_cidr_overlap_warns_between_two_do_labs(committed_load: LoadedConfig) -> None:
+    _make_do_lab(committed_load, "cloud-b", "10.60.0.0/24")
+    diags = validate(committed_load, lab="cloud-b")
+    hits = [d for d in diags if d.id == "config.network.do_cidr_overlap"]
+    assert len(hits) == 1
+    assert hits[0].severity == "warning"
+    assert "cloud-smoke" in hits[0].message
+
+
+def test_do_cidr_overlap_silent_for_disjoint_or_non_do(committed_load: LoadedConfig) -> None:
+    _make_do_lab(committed_load, "cloud-b", "10.90.0.0/24")
+    _make_do_lab(committed_load, "local-b", "10.60.0.0/24", backend="local-libvirt")
+    for name in ("cloud-b", "cloud-smoke", "local-b"):
+        diags = validate(committed_load, lab=name)
+        assert not [d for d in diags if d.id == "config.network.do_cidr_overlap"]

@@ -1706,7 +1706,7 @@ def _render_status_human(status: LabStatus) -> None:
     )
     typer.echo("")
     for vm in status.vms:
-        marker = "+" if vm.state == "provisioned" else "-"
+        marker = "+" if vm.state in ("provisioned", "running") else "-"
         ip = vm.ip or "—"
         addrs = f"ip={ip}"
         if vm.public_ip:
@@ -1741,6 +1741,28 @@ def _render_status_human(status: LabStatus) -> None:
                 )
 
 
+# Validator errors that only guard NEW applies. Teardown must still run on a lab
+# that predates them (main-era DO lab with 2 networks, out-of-range CIDR), or it
+# would keep billing with no way to stop it.
+_TEARDOWN_DOWNGRADED_IDS = frozenset(
+    {
+        "config.network.do_single_network",
+        "config.network.do_vpc_cidr_invalid",
+        "config.backend.do_vm_size_invalid",
+    }
+)
+
+
+def _validate_for_teardown(loaded: LoadedConfig, lab: str) -> list[Diagnostic]:
+    """Validate for destroy/suspend/reset: apply-only DO errors become warnings."""
+    return [
+        d.model_copy(update={"severity": "warning"})
+        if d.severity == "error" and d.id in _TEARDOWN_DOWNGRADED_IDS
+        else d
+        for d in validate_loaded_config(loaded, lab=lab)
+    ]
+
+
 @app.command("destroy")
 def destroy_command(
     lab: Annotated[str, typer.Argument(help="Lab name to tear down.")],
@@ -1767,7 +1789,7 @@ def destroy_command(
     """Destroy ``lab``: render the same vars apply uses, then `tofu destroy`."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(_validate_for_teardown(loaded, lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1851,7 +1873,7 @@ def reset_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(_validate_for_teardown(loaded, lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1922,7 +1944,7 @@ def suspend_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(_validate_for_teardown(loaded, lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 

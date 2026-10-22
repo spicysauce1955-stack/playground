@@ -669,7 +669,7 @@ def plan_provider_summary(
     if len(counts) > 1:
         size_summary = ", ".join(f"{s} x{n}" for s, n in counts.items())
     else:
-        size_summary = plan.size
+        size_summary = next(iter(counts), plan.size)
 
     return {
         "region": plan.region,

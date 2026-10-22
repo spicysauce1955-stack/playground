@@ -24,6 +24,8 @@ Diagnostic IDs:
   classes from ``requirements.md`` §5.13 are tracked for a later slice)
 - ``config.backend.per_vm_resources_unsupported`` (warning; today's
   ``local-libvirt`` backend applies global ``var.vm_memory`` / ``var.vm_vcpu``)
+- ``config.network.do_cidr_overlap`` (warning; two cloud-digitalocean labs
+  declare overlapping network CIDRs)
 - ``config.backend.do_vm_size_invalid`` (error; a per-VM
   ``provider_overrides.cloud-digitalocean.size`` that is not a string slug)
 - ``config.backend.do_size_below_resources`` (warning; a VM's effective
@@ -356,6 +358,7 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
     diagnostics.extend(_check_digitalocean_network(lab, source))
+    diagnostics.extend(_check_do_cidr_overlap(lab, loaded, source))
     diagnostics.extend(_check_dns_domain(lab, source))
     diagnostics.extend(_check_devices(lab, source, loaded))
 
@@ -601,6 +604,69 @@ def _check_network_ips(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
 _RFC1918_NETS = tuple(
     ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
+
+
+def _lab_networks(lab: Lab) -> list[Any]:
+    nets = []
+    for net in lab.spec.networks:
+        try:
+            nets.append((net.name, ipaddress.ip_network(net.cidr, strict=False)))
+        except ValueError:
+            continue
+    return nets
+
+
+def _check_do_cidr_overlap(
+    lab: Lab, loaded: LoadedConfig, source: SourceLocation,
+) -> list[Diagnostic]:
+    """Warn when another cloud-digitalocean lab declares an overlapping CIDR.
+
+    ``config.network.do_cidr_overlap`` (warning): each lab gets its own VPC,
+    and DigitalOcean rejects a VPC whose ``ip_range`` overlaps another VPC in
+    the account, so the two labs cannot be applied at the same time.
+    """
+    if lab.spec.backend != "cloud-digitalocean":
+        return []
+    mine = _lab_networks(lab)
+    diagnostics: list[Diagnostic] = []
+    for other in loaded.labs.values():
+        if other.metadata.name == lab.metadata.name:
+            continue
+        if other.spec.backend != "cloud-digitalocean":
+            continue
+        for my_name, my_net in mine:
+            clash = next(
+                (
+                    (o_name, o_net)
+                    for o_name, o_net in _lab_networks(other)
+                    if o_net.version == my_net.version
+                    and o_net.overlaps(my_net)
+                ),
+                None,
+            )
+            if clash is None:
+                continue
+            diagnostics.append(
+                Diagnostic(
+                    id="config.network.do_cidr_overlap",
+                    severity="warning",
+                    message=(
+                        f"lab {lab.metadata.name!r} network {my_name!r} "
+                        f"({my_net}) overlaps lab {other.metadata.name!r} "
+                        f"network {clash[0]!r} ({clash[1]}); both use "
+                        "cloud-digitalocean, so they cannot be applied at "
+                        "the same time in one account"
+                    ),
+                    source=source,
+                    key_path="spec.networks",
+                    suggestion=(
+                        "give each cloud-digitalocean lab a distinct CIDR "
+                        "(e.g. 10.60.0.0/24, 10.61.0.0/24)"
+                    ),
+                )
+            )
+            break
+    return diagnostics
 
 
 def _check_digitalocean_network(lab: Lab, source: SourceLocation) -> list[Diagnostic]:

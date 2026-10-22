@@ -32,11 +32,13 @@ from typing import Any
 from playground.backend.cloud_digitalocean.do import (
     CONSOLE_URL,
     check_size_region_availability,
+    check_vpc_conflicts,
     delete_droplet,
     delete_vpc,
     droplet_summary,
     find_vpc,
     list_droplets_by_tag,
+    list_vpcs,
     read_token,
     token_env_name,
     verify_token,
@@ -528,6 +530,50 @@ def _provision(
                     f"{', '.join(repr(s) for s in plan.distinct_sizes)} not "
                     f"all available in region {plan.region!r} for lab "
                     f"{lab!r}",
+                )
+
+            # Upgrade/VPC safety, both BEFORE any tofu step: tofu can destroy
+            # Droplets before it hits a 422 or a forced replacement.
+            net_errors = _pre_vpc_lab_diagnostics(per_lab_dir, lab, operation)
+            if not net_errors:
+                vpcs, vpc_list_diags, vpc_list_ok = list_vpcs(preflight_token)
+                if vpc_list_ok:
+                    net_errors = check_vpc_conflicts(
+                        vpcs,
+                        lab_name=lab,
+                        vpc_name=f"{plan.name_prefix}-vpc",
+                        vpc_cidr=plan.vpc_cidr,
+                    )
+                else:
+                    # Like the size check: an API blip must not block apply.
+                    for d in vpc_list_diags:
+                        bus.publish(
+                            run.run_id, "log_line",
+                            {
+                                "step": "cloud-preflight",
+                                "line": f"WARNING: {d.message}; VPC conflict "
+                                "check skipped",
+                            },
+                        )
+            if net_errors:
+                preflight_log.write_text(
+                    f"# cloud-preflight: status={preflight_status}\n"
+                    + "\n".join(f"# {d.message}" for d in net_errors)
+                    + "\n"
+                )
+                preflight_step = _step(
+                    "cloud-preflight", exit_code=1, log_path=preflight_log,
+                    started=_iso_now(),
+                )
+                steps.append(preflight_step)
+                bus.publish(
+                    run.run_id, "step_finished",
+                    {"step": "cloud-preflight", "exit_code": 1},
+                )
+                return _finalize_failure(
+                    run, run_dir, steps, bus, net_errors,
+                    f"network preflight failed for lab {lab!r}: "
+                    f"{net_errors[0].id}",
                 )
 
             preflight_log.write_text(
@@ -1252,6 +1298,45 @@ def _noop_step(name: str, log_path: Path) -> StepResult:
         started_at=now,
         finished_at=now,
     )
+
+
+def _pre_vpc_lab_diagnostics(
+    per_lab_dir: Path, lab: str, operation: str,
+) -> list[Diagnostic]:
+    """Refuse apply/resume on a lab provisioned before per-lab VPCs.
+
+    If the per-lab tfstate holds ``digitalocean_droplet`` resources but no
+    ``digitalocean_vpc``, applying would add ``vpc_uuid`` to every Droplet,
+    which forces replacement and loses disk state.  An unreadable or absent
+    state file is not a pre-VPC lab.
+    """
+    state_file = per_lab_dir / "terraform.tfstate"
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    resources = state.get("resources") if isinstance(state, dict) else None
+    if not isinstance(resources, list):
+        return []
+    types = {r.get("type") for r in resources if isinstance(r, dict)}
+    if "digitalocean_droplet" not in types or "digitalocean_vpc" in types:
+        return []
+    return [
+        Diagnostic(
+            id="runtime.apply.pre_vpc_lab",
+            severity="error",
+            message=(
+                f"lab {lab!r} was provisioned before per-lab VPCs; "
+                f"`{operation}` would replace every Droplet (adding "
+                "vpc_uuid forces replacement) and lose their disk state"
+            ),
+            source=SourceLocation(path=str(state_file)),
+            suggestion=(
+                f"run `playground destroy {lab}` then `playground apply "
+                f"{lab}` to recreate it with a VPC"
+            ),
+        )
+    ]
 
 
 def _finalize_failure(

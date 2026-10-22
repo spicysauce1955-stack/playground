@@ -227,7 +227,7 @@ class PlaygroundTui(App[None]):
             f"  {status.provisioned_vms} of {status.expected_vms} VMs provisioned",
         ]
         for vm in status.vms:
-            marker = "+" if vm.state == "provisioned" else "-"
+            marker = "+" if vm.state in ("provisioned", "running") else "-"
             ip = vm.ip or "—"
             addrs = f"ip={ip}"
             if vm.public_ip:

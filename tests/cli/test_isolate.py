@@ -180,3 +180,67 @@ def test_destroy_surfaces_filter_cleanup_warnings(
     assert result.exit_code == 0, result.output
     assert "filter cleanup warning" in result.output
     assert cli_main.app is app
+
+
+# ---------------------------------------------------------------------------
+# Teardown must not be blocked by apply-only DigitalOcean validator errors
+# ---------------------------------------------------------------------------
+
+
+def _do_config_with_legacy_lab(tmp_path: Path) -> Path:
+    """Copy config/ and give cloud-smoke a second network + a bad CIDR + a
+    non-string size override: all three apply-only DO validator errors."""
+    import shutil
+
+    dest = tmp_path / "config"
+    shutil.copytree(CONFIG_DIR, dest)
+    lab = dest / "labs" / "cloud-smoke.yaml"
+    text = lab.read_text()
+    text = text.replace(
+        "      cidr: 10.60.0.0/24\n",
+        "      cidr: 8.8.8.0/24\n    - name: extra-net\n      profile: nat\n"
+        "      cidr: 10.61.0.0/24\n",
+    )
+    text = text.replace(
+        "      networks: [lab-net]\n",
+        "      networks: [lab-net]\n      provider_overrides:\n"
+        "        cloud-digitalocean:\n          size: 4\n",
+    )
+    lab.write_text(text)
+    return dest
+
+
+@pytest.mark.parametrize("verb", ["destroy", "suspend", "reset"])
+def test_teardown_proceeds_despite_do_validator_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str,
+) -> None:
+    from playground.backend import cloud_digitalocean as do_backend
+    from playground.config.loader import load_config
+    from playground.validation import validate
+
+    config_dir = _do_config_with_legacy_lab(tmp_path)
+
+    # Sanity: the plain validator does flag all three as errors.
+    loaded, _ = load_config(config_dir)
+    ids = {d.id for d in validate(loaded, lab="cloud-smoke") if d.severity == "error"}
+    assert {
+        "config.network.do_single_network",
+        "config.network.do_vpc_cidr_invalid",
+        "config.backend.do_vm_size_invalid",
+    } <= ids
+
+    seen: list[str] = []
+
+    def fake(**kwargs: Any):
+        seen.append(verb)
+        return _run(verb, kwargs["resolved"].lab_name), []
+
+    monkeypatch.setattr(do_backend, f"execute_{verb}", fake)
+    result = CliRunner().invoke(
+        app,
+        [verb, "cloud-smoke", "--config-dir", str(config_dir),
+         "--state-dir", str(tmp_path / "state")],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == [verb]
+    assert "do_single_network" in result.output  # still reported, as a warning

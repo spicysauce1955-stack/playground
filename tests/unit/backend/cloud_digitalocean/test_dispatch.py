@@ -458,3 +458,22 @@ def test_plan_provider_summary_uniform_size_is_bare_slug(
     summary = dispatch.plan_provider_summary(_resolved("cloud-smoke"))
     assert summary is not None
     assert summary["size"] == "s-1vcpu-2gb"
+
+
+def test_plan_provider_summary_all_vms_overriding_to_same_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(do_backend, "merge_provider_settings", _fake_merge)
+    resolved = _resolved("cloud-smoke")
+    vms = [
+        v.model_copy(
+            update={
+                "name": f"n{i}",
+                "provider_overrides": {"cloud-digitalocean": {"size": "s-2vcpu-4gb"}},
+            }
+        )
+        for i, v in enumerate([resolved.vms[0]] * 3)
+    ]
+    summary = dispatch.plan_provider_summary(resolved.model_copy(update={"vms": vms}))
+    assert summary is not None
+    assert summary["size"] == "s-2vcpu-4gb"

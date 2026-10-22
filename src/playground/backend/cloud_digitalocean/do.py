@@ -11,6 +11,7 @@ can be monkeypatched in tests.  Tests never need a real network connection.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Any
 from urllib.parse import urlsplit
@@ -345,6 +346,85 @@ def find_vpc(
     return None, [], True
 
 
+def list_vpcs(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
+    """List every VPC in the account, all regions (``GET /v2/vpcs``).
+
+    Returns ``(vpcs, diagnostics, ok)``; ``ok`` False means the list is
+    incomplete and must not be read as "no conflicting VPC".
+    """
+    items, ok = _list_paged(token, "/v2/vpcs", "vpcs")
+    if not ok:
+        return [], [
+            _api_error(
+                "listing VPCs",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/vpc",
+            )
+        ], False
+    return items, [], True
+
+
+def check_vpc_conflicts(
+    vpcs: list[dict[str, Any]], *, lab_name: str, vpc_name: str, vpc_cidr: str,
+) -> list[Diagnostic]:
+    """Error diagnostics for VPCs that would make the lab's VPC create fail.
+
+    A VPC (any region) conflicts when it has the same name as ``vpc_name`` or
+    an ``ip_range`` overlapping ``vpc_cidr`` -- unless it is this lab's own
+    VPC (same name AND same range), which tofu manages in place.  Tofu can
+    destroy Droplets before hitting the resulting 422, so callers run this
+    before any tofu step.
+    """
+    try:
+        want = ipaddress.ip_network(vpc_cidr, strict=False)
+    except ValueError:
+        return []
+    out: list[Diagnostic] = []
+    for vpc in vpcs:
+        name = vpc.get("name")
+        rng = vpc.get("ip_range")
+        other: ipaddress.IPv4Network | ipaddress.IPv6Network | None
+        try:
+            other = (
+                ipaddress.ip_network(rng, strict=False)
+                if isinstance(rng, str) else None
+            )
+        except ValueError:
+            other = None
+        same_name = name == vpc_name
+        overlaps = (
+            other is not None
+            and other.version == want.version
+            and other.overlaps(want)
+        )
+        if same_name and other == want:
+            continue  # this lab's own VPC
+        if not (same_name or overlaps):
+            continue
+        why = (
+            f"has the same name {vpc_name!r}"
+            if same_name
+            else f"has ip_range {rng} overlapping {vpc_cidr}"
+        )
+        out.append(
+            Diagnostic(
+                id="runtime.cloud.vpc_conflict",
+                severity="error",
+                message=(
+                    f"lab {lab_name!r}: existing VPC {name!r} "
+                    f"(region {vpc.get('region')!r}, id {vpc.get('id')}) "
+                    f"{why}; creating the lab VPC would fail"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "delete the unused VPC, or change the lab network CIDR "
+                    "so it does not overlap any VPC in the account"
+                ),
+            )
+        )
+    return out
+
+
 def delete_vpc(token: str, vpc_id: str) -> list[Diagnostic]:
     """DELETE /v2/vpcs/<id>.  204 and 404 are success; anything else warns.
 
@@ -632,6 +712,7 @@ __all__ = [
     "DEFAULT_TOKEN_ENV",
     "check_size_region_availability",
     "delete_droplet",
+    "check_vpc_conflicts",
     "delete_vpc",
     "droplet_summary",
     "find_firewall",
@@ -639,6 +720,7 @@ __all__ = [
     "find_vpc",
     "list_droplets_by_tag",
     "list_firewalls",
+    "list_vpcs",
     "read_token",
     "token_env_name",
     "token_present",
