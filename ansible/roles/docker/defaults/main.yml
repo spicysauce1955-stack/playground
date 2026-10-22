@@ -1,3 +1,6 @@
 ---
 docker_admin_user: "{{ ansible_user | default('ubuntu') }}"
 docker_apt_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+# RedHat family only: venv holding the Python deps community.docker needs
+# (see tasks/redhat.yml).
+docker_python_venv: /opt/playground/docker-venv

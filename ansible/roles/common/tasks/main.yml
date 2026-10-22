@@ -2,20 +2,28 @@
 # Idempotent baseline: timezone, time sync, minimal QoL packages.
 # Re-running `playground apply` on a converged VM reports
 # `changed=0`.
+#
+# Distro-neutral tasks live here; package manager and time daemon differ
+# per OS family (facts come from the first play in site.yml). Debian is
+# the original, unchanged path; RedHat covers Rocky/Alma 8 and 9.
 
 - name: Set timezone
   community.general.timezone:
     name: "{{ common_timezone }}"
 
-- name: Ensure systemd-timesyncd is enabled and running
-  ansible.builtin.systemd:
-    name: systemd-timesyncd
-    state: started
-    enabled: yes
+- name: Baseline for the Debian family (apt + systemd-timesyncd)
+  ansible.builtin.include_tasks: debian.yml
+  when: ansible_os_family == 'Debian'
 
-- name: Install baseline packages
-  ansible.builtin.apt:
-    name: "{{ common_packages }}"
-    state: present
-    update_cache: yes
-    cache_valid_time: 3600
+- name: Baseline for the RedHat family (dnf + chronyd)
+  ansible.builtin.include_tasks: redhat.yml
+  when: ansible_os_family == 'RedHat'
+
+- name: Fail on an unsupported OS family
+  ansible.builtin.fail:
+    msg: >-
+      The common role supports the Debian and RedHat families; VM
+      {{ inventory_hostname }} reports ansible_os_family
+      {{ ansible_os_family }} ({{ ansible_distribution }}
+      {{ ansible_distribution_version }}).
+  when: ansible_os_family not in ['Debian', 'RedHat']

@@ -1,0 +1,13 @@
+---
+# Rocky/Alma ship no systemd-timesyncd; chronyd is the time daemon
+# (present in the cloud images, ensured here anyway).
+- name: Install baseline packages
+  ansible.builtin.dnf:
+    name: "{{ common_packages + ['chrony'] }}"
+    state: present
+
+- name: Ensure chronyd is enabled and running
+  ansible.builtin.systemd:
+    name: chronyd
+    state: started
+    enabled: yes
