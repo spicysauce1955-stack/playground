@@ -164,6 +164,64 @@ def test_systemd_degraded_is_accepted(
     assert sysd_diag == []
 
 
+def test_systemd_starting_is_polled_until_settled(
+    resolved_generic_infra, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`starting` means boot jobs are still queued (seen live on Rocky 8
+    after cloud-init finished); verify waits for it to settle."""
+    monkeypatch.setattr(verify_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(verify_mod, "_sleep", lambda _s: None)
+    states = iter(["starting\n", "starting\n", "degraded\n"])
+    calls: list[str] = []
+
+    def _stub(args: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        if "is-system-running" in args[-1]:
+            calls.append(args[-1])
+            return _completed(returncode=1, stdout=next(states))
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(verify_mod.subprocess, "run", _stub)
+    step, diagnostics = verify_lab(
+        resolved=resolved_generic_infra,
+        vm_ips={"node1": "10.0.0.10"},
+        log_path=tmp_path / "v.log",
+        bus=EventBus(),
+        run_id="r1",
+    )
+    assert len(calls) == 3
+    assert not [
+        d for d in diagnostics
+        if d.id == "runtime.apply.verify_failed"
+        and "is-system-running" in (d.message or "")
+    ]
+
+
+def test_systemd_still_starting_after_budget_fails(
+    resolved_generic_infra, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(verify_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(verify_mod, "_sleep", lambda _s: None)
+    clock = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(verify_mod, "_monotonic", lambda: float(next(clock)))
+
+    def _stub(args: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        if "is-system-running" in args[-1]:
+            return _completed(returncode=1, stdout="starting\n")
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(verify_mod.subprocess, "run", _stub)
+    step, diagnostics = verify_lab(
+        resolved=resolved_generic_infra,
+        vm_ips={"node1": "10.0.0.10"},
+        log_path=tmp_path / "v.log",
+        bus=EventBus(),
+        run_id="r1",
+    )
+    assert step.exit_code == 1
+    failed = [d for d in diagnostics if d.id == "runtime.apply.verify_failed"]
+    assert any("'starting'" in d.message for d in failed)
+
+
 def test_docker_ps_failure_emits_diagnostic(
     resolved_generic_infra, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
