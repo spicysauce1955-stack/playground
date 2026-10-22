@@ -11,8 +11,10 @@ can be monkeypatched in tests.  Tests never need a real network connection.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -66,6 +68,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     timeout: float = 15,
+    json: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one HTTP request against the DigitalOcean API.
 
@@ -86,6 +89,7 @@ def _request(
                 method,
                 path,
                 params=params,
+                json=json,
                 headers={"Authorization": f"Bearer {token}"},
             )
             try:
@@ -192,6 +196,315 @@ def delete_droplet(
     ]
 
 
+_API_ORIGIN = ("https", "api.digitalocean.com")
+
+
+def _is_api_url(url: str) -> bool:
+    """True only for an https URL on the DigitalOcean API host.
+
+    ``links.pages.next`` is followed with the bearer token attached, so it
+    must never lead anywhere but the API itself.
+    """
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme, parts.hostname or "") == _API_ORIGIN and parts.port in (None, 443)
+    except ValueError:
+        return False
+
+
+_MAX_LIST_PAGES = 25
+"""Page cap for :func:`_list_paged` (bounds a looping ``links.pages.next``)."""
+
+
+def _list_paged(
+    token: str, path: str, key: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    """GET a paginated collection, following ``links.pages.next``.
+
+    Returns ``(items, ok)``.  ``ok`` is False on any transport/HTTP failure,
+    malformed body, or page-cap hit; callers must not read an empty list as
+    "absent" unless ``ok`` is True.
+    """
+    items: list[dict[str, Any]] = []
+    url = path
+    params: dict[str, Any] | None = {"per_page": 200}
+    for _ in range(_MAX_LIST_PAGES):
+        status, body = _request("GET", url, token, params=params)
+        if status == 0 or status >= 300:
+            return items, False
+        page = body.get(key)
+        if not isinstance(page, list):
+            return items, False
+        items.extend(i for i in page if isinstance(i, dict))
+        next_url: str | None = None
+        links = body.get("links")
+        if isinstance(links, dict):
+            pages = links.get("pages")
+            if isinstance(pages, dict):
+                candidate = pages.get("next")
+                if isinstance(candidate, str) and candidate:
+                    next_url = candidate
+        if next_url is None:
+            return items, True
+        if not _is_api_url(next_url):
+            return items, False  # never send the token to another origin
+        url, params = next_url, None
+    return items, False
+
+
+def _api_error(what: str, suggestion: str) -> Diagnostic:
+    """Warning diagnostic for a failed read of ``what``; never carries the token."""
+    return Diagnostic(
+        id="runtime.cloud.api_error",
+        severity="warning",
+        message=f"DigitalOcean API request failed while {what}",
+        source=SourceLocation(path="DigitalOcean API"),
+        suggestion=suggestion,
+    )
+
+
+def list_firewalls(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
+    """List every Cloud Firewall in the account (``GET /v2/firewalls``).
+
+    Returns ``(firewalls, diagnostics, ok)``; ``ok`` False means the list is
+    incomplete and must not be read as "no firewalls".
+    """
+    items, ok = _list_paged(token, "/v2/firewalls", "firewalls")
+    if not ok:
+        return [], [
+            _api_error(
+                "listing firewalls",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/firewalls",
+            )
+        ], False
+    return items, [], True
+
+
+def get_firewall(
+    token: str, firewall_id: str,
+) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
+    """``GET /v2/firewalls/<id>``: look a firewall up BY ID (names are not unique).
+
+    Returns ``(firewall_or_None, diagnostics, ok)``.  404 is ``(None, [], True)``
+    (definitively absent); any other failure is ``ok`` False.  The firewall
+    dict carries ``status`` and ``pending_changes`` for settle polling.
+    """
+    status, body = _request("GET", f"/v2/firewalls/{firewall_id}", token)
+    if status == 404:
+        return None, [], True
+    fw = body.get("firewall") if isinstance(body, dict) else None
+    if status == 0 or status >= 300 or not isinstance(fw, dict):
+        return None, [
+            _api_error(
+                f"reading firewall {firewall_id}",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/firewalls",
+            )
+        ], False
+    return fw, [], True
+
+
+def put_firewall(
+    token: str, firewall_id: str, body: dict[str, Any],
+) -> tuple[bool, list[Diagnostic]]:
+    """``PUT /v2/firewalls/<id>``: replace a firewall BY ID.
+
+    DigitalOcean's PUT needs the FULL body (``name``, ``inbound_rules``,
+    ``outbound_rules``, ``droplet_ids``, ``tags``).  Returns ``(ok, diags)``.
+    """
+    status, resp = _request("PUT", f"/v2/firewalls/{firewall_id}", token, json=body)
+    if status == 0 or status >= 300 or not isinstance(resp.get("firewall"), dict):
+        return False, [
+            _api_error(
+                f"updating firewall {firewall_id} (status {status})",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/firewalls",
+            )
+        ]
+    return True, []
+
+
+def find_vpc(
+    token: str, name: str,
+) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
+    """Find the VPC called ``name`` via ``GET /v2/vpcs``.
+
+    Returns ``(vpc_or_None, diagnostics, ok)``.  ``ok`` False means the
+    listing failed, so ``None`` does not mean "absent".
+    """
+    items, ok = _list_paged(token, "/v2/vpcs", "vpcs")
+    if not ok:
+        return None, [
+            _api_error(
+                f"listing VPCs (looking for {name!r})",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/vpc",
+            )
+        ], False
+    for vpc in items:
+        if vpc.get("name") == name:
+            return vpc, [], True
+    return None, [], True
+
+
+def list_vpcs(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
+    """List every VPC in the account, all regions (``GET /v2/vpcs``).
+
+    Returns ``(vpcs, diagnostics, ok)``; ``ok`` False means the list is
+    incomplete and must not be read as "no conflicting VPC".
+    """
+    items, ok = _list_paged(token, "/v2/vpcs", "vpcs")
+    if not ok:
+        return [], [
+            _api_error(
+                "listing VPCs",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/vpc",
+            )
+        ], False
+    return items, [], True
+
+
+VPC_CONSOLE_URL = "https://cloud.digitalocean.com/networking/vpc"
+
+
+def check_vpc_conflicts(
+    vpcs: list[dict[str, Any]],
+    *,
+    lab_name: str,
+    vpc_name: str,
+    vpc_cidr: str,
+    own_vpc_id: str | None = None,
+) -> list[Diagnostic]:
+    """Error diagnostics for VPCs that would make the lab's VPC create fail.
+
+    A VPC (any region) conflicts when it has the same name as ``vpc_name`` or
+    an ``ip_range`` overlapping ``vpc_cidr`` -- unless it is this lab's own
+    VPC: its id equals ``own_vpc_id`` (the ``digitalocean_vpc`` id in the
+    per-lab tfstate) and it still has the same name and range, so tofu
+    manages it in place.  A same-name, same-range VPC that tofu does not
+    manage is an orphan (typically from a failed destroy) and a conflict.
+    Tofu can destroy Droplets before hitting the resulting 422, so callers
+    run this before any tofu step.
+    """
+    try:
+        want = ipaddress.ip_network(vpc_cidr, strict=False)
+    except ValueError:
+        return []
+    out: list[Diagnostic] = []
+    for vpc in vpcs:
+        name = vpc.get("name")
+        rng = vpc.get("ip_range")
+        other: ipaddress.IPv4Network | ipaddress.IPv6Network | None
+        try:
+            other = (
+                ipaddress.ip_network(rng, strict=False)
+                if isinstance(rng, str) else None
+            )
+        except ValueError:
+            other = None
+        same_name = name == vpc_name
+        overlaps = (
+            other is not None
+            and other.version == want.version
+            and other.overlaps(want)
+        )
+        is_own = (
+            own_vpc_id is not None
+            and str(vpc.get("id")) == str(own_vpc_id)
+            and same_name
+            and other == want
+        )
+        if is_own:
+            continue  # tofu manages this one in place
+        if not (same_name or overlaps):
+            continue
+        orphan = same_name and other == want
+        if orphan:
+            why = (
+                f"has the same name {vpc_name!r} and range but is not in this "
+                "lab's OpenTofu state; it is likely an orphan from a failed destroy"
+            )
+        elif same_name:
+            why = f"has the same name {vpc_name!r}"
+        else:
+            why = f"has ip_range {rng} overlapping {vpc_cidr}"
+        out.append(
+            Diagnostic(
+                id="runtime.cloud.vpc_conflict",
+                severity="error",
+                message=(
+                    f"lab {lab_name!r}: existing VPC {name!r} "
+                    f"(region {vpc.get('region')!r}, id {vpc.get('id')}) "
+                    f"{why}; creating the lab VPC would fail"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    f"delete the unused VPC (id {vpc.get('id')}) at "
+                    f"{VPC_CONSOLE_URL}, or change the lab network CIDR "
+                    "so it does not overlap any VPC in the account"
+                ),
+            )
+        )
+    return out
+
+
+def check_vpc_would_be_default(
+    vpcs: list[dict[str, Any]], *, lab_name: str, region: str,
+) -> list[Diagnostic]:
+    """Warn when ``region`` has no VPC yet, so the lab's VPC may become its default.
+
+    DigitalOcean may make the first VPC created in a region that region's
+    default, and a default VPC cannot be deleted (so ``destroy`` would leave
+    it behind).  ``vpcs`` is the full account listing already fetched.
+    """
+    if any(v.get("region") == region for v in vpcs):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.cloud.vpc_would_be_default",
+            severity="warning",
+            message=(
+                f"lab {lab_name!r}: the account has no VPC in region {region!r}; "
+                "DigitalOcean may make this lab's VPC the region's default, and "
+                "a default VPC cannot be deleted, so destroy would leave it behind"
+            ),
+            source=SourceLocation(path="DigitalOcean API"),
+            suggestion=(
+                f"create any resource in {region!r} first, or pick a region "
+                "that already has a default VPC"
+            ),
+        )
+    ]
+
+
+def delete_vpc(token: str, vpc_id: str) -> list[Diagnostic]:
+    """DELETE /v2/vpcs/<id>.  204 and 404 are success; anything else warns.
+
+    DigitalOcean refuses to delete a VPC that still has members, so a
+    non-2xx right after a Droplet delete can be transient.
+    """
+    status, _ = _request("DELETE", f"/v2/vpcs/{vpc_id}", token)
+    if status in (204, 404):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.cloud.api_error",
+            severity="warning",
+            message=(
+                f"DigitalOcean API returned status {status} when deleting "
+                f"VPC {vpc_id}; it may still exist"
+            ),
+            source=SourceLocation(path=f"vpc/{vpc_id}"),
+            suggestion=(
+                "delete it at https://cloud.digitalocean.com/networking/vpc "
+                "(an orphaned VPC is free but blocks re-creating its CIDR)"
+            ),
+        )
+    ]
+
+
 _MAX_SIZE_PAGES = 25
 """Page cap for :func:`_fetch_all_sizes`.
 
@@ -250,6 +563,8 @@ def _fetch_all_sizes(
 
         if next_url is None:
             return sizes, True, None, status
+        if not _is_api_url(next_url):
+            return sizes, False, "status_error", status
 
         # `next_url` is an absolute URL that already carries its own query
         # string (DigitalOcean's pagination convention); passing it as
@@ -267,6 +582,7 @@ def check_size_region_availability(
     lab_name: str,
     size: str,
     region: str,
+    catalogue: tuple[list[dict[str, Any]], bool, str | None, int] | None = None,
 ) -> list[Diagnostic]:
     """Preflight check: is ``size`` currently available in ``region``?
 
@@ -298,9 +614,14 @@ def check_size_region_availability(
       "not found" is reported as a hard error; any inconclusive result
       degrades to a warning and lets the apply proceed.
 
+    ``catalogue`` is an already-fetched :func:`_fetch_all_sizes` result; pass
+    it to check several slugs against ONE paginated fetch.
+
     The token value is never logged or included in any Diagnostic.
     """
-    sizes, complete, incomplete_reason, status = _fetch_all_sizes(token)
+    sizes, complete, incomplete_reason, status = (
+        catalogue if catalogue is not None else _fetch_all_sizes(token)
+    )
 
     match: dict[str, Any] | None = None
     for entry in sizes:
@@ -420,34 +741,48 @@ def verify_token(token: str) -> int:
 
 
 def droplet_summary(d: dict[str, Any]) -> dict[str, Any]:
-    """Extract ``{name, id, status, public_ipv4}`` from a raw droplet dict.
+    """Extract ``{name, id, status, public_ipv4, private_ipv4}`` from a raw
+    droplet dict.
 
-    ``public_ipv4`` is the first ``networks.v4`` entry whose ``type`` is
-    ``"public"``, or ``None`` when no public IPv4 is present.
+    ``public_ipv4`` / ``private_ipv4`` are the first ``networks.v4`` entries
+    whose ``type`` is ``"public"`` / ``"private"`` (the private one is the
+    VPC address), or ``None`` when absent.
     """
     networks_v4: list[dict[str, Any]] = (
         (d.get("networks") or {}).get("v4") or []
     )
     public_ipv4: str | None = None
+    private_ipv4: str | None = None
     for net in networks_v4:
-        if net.get("type") == "public":
+        if public_ipv4 is None and net.get("type") == "public":
             public_ipv4 = net.get("ip_address")
-            break
+        elif private_ipv4 is None and net.get("type") == "private":
+            private_ipv4 = net.get("ip_address")
     return {
         "name": d.get("name"),
         "id": d.get("id"),
         "status": d.get("status"),
         "public_ipv4": public_ipv4,
+        "private_ipv4": private_ipv4,
     }
 
 
 __all__ = [
     "CONSOLE_URL",
     "DEFAULT_TOKEN_ENV",
+    "VPC_CONSOLE_URL",
     "check_size_region_availability",
+    "check_vpc_would_be_default",
+    "put_firewall",
     "delete_droplet",
+    "check_vpc_conflicts",
+    "delete_vpc",
     "droplet_summary",
+    "get_firewall",
+    "find_vpc",
     "list_droplets_by_tag",
+    "list_firewalls",
+    "list_vpcs",
     "read_token",
     "token_env_name",
     "token_present",

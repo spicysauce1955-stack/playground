@@ -40,12 +40,13 @@ from playground.backend.dispatch import (
     execute_destroy,
     query_status,
 )
+from playground.cli.tolerant_validation import validate_tolerant
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
 from playground.events import EventBus, OperationEvent
+from playground.models.diagnostic import Diagnostic
 from playground.planner import render_plan
 from playground.runs import OperationRun
-from playground.validation import validate as validate_loaded_config
 
 
 class _ConfirmScreen(ModalScreen[bool]):
@@ -189,7 +190,7 @@ class PlaygroundTui(App[None]):
 
     def _render_lab(self, name: str) -> None:
         loaded, parse_diagnostics = load_config(self.config_dir)
-        validation_diagnostics = validate_loaded_config(loaded)
+        validation_diagnostics = validate_tolerant(loaded)
         if name not in loaded.labs:
             self._set_detail(f"Lab {name!r} disappeared from disk.")
             return
@@ -226,9 +227,12 @@ class PlaygroundTui(App[None]):
             f"  {status.provisioned_vms} of {status.expected_vms} VMs provisioned",
         ]
         for vm in status.vms:
-            marker = "+" if vm.state == "provisioned" else "-"
+            marker = "+" if vm.state in ("provisioned", "running") else "-"
             ip = vm.ip or "—"
-            lines.append(f"  {marker} {vm.name}  role={vm.role}  ip={ip}")
+            addrs = f"ip={ip}"
+            if vm.public_ip:
+                addrs += f"  public_ip={vm.public_ip}"
+            lines.append(f"  {marker} {vm.name}  role={vm.role}  {addrs}")
         lines += ["", "## Plan"]
         for action in plan.actions:
             lines.append(f"  + {action.resource_type:<8}  {action.name}  {action.summary}")
@@ -295,7 +299,7 @@ class PlaygroundTui(App[None]):
             loaded, _ = load_config(self.config_dir)
             resolved = resolve_lab(loaded, lab)
             bus = self._build_bus()
-            run, _diags = execute_apply(
+            run, diags = execute_apply(
                 resolved=resolved,
                 state_dir=self.state_dir,
                 tofu_dir=self.tofu_dir,
@@ -303,7 +307,7 @@ class PlaygroundTui(App[None]):
                 config_dir=self.config_dir,
                 bus=bus,
             )
-            self.call_from_thread(self._finish_operation, run)
+            self.call_from_thread(self._finish_operation, run, diags)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -340,12 +344,18 @@ class PlaygroundTui(App[None]):
         bus.subscribe(bridge)
         return bus
 
-    def _finish_operation(self, run: OperationRun | None) -> None:
+    def _finish_operation(
+        self, run: OperationRun | None, diags: list[Diagnostic] | None = None,
+    ) -> None:
         self._busy = False
         self.last_run = run
         pane = self.query_one("#log-pane", _LogPane)
         if run is None:
-            pane.append("--- aborted before run: pre-flight failed ---")
+            reason = next((d.message for d in diags or [] if d.severity == "error"), None)
+            pane.append(
+                f"--- aborted before run: {reason} ---"
+                if reason else "--- aborted before run: pre-flight failed ---"
+            )
             return
         pane.append(
             f"--- finished: {run.run_id} (status={run.status}) ---"

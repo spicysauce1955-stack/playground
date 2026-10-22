@@ -133,23 +133,31 @@ def query_status(resolved: ResolvedLab) -> tuple[LabStatus, list[Diagnostic]]:
         if vm_summary is not None:
             do_status = vm_summary.get("status")
             state: VmState = "running" if do_status == "active" else "provisioned"
-            raw_ip = vm_summary.get("public_ipv4")
-            ip: str | None = str(raw_ip) if raw_ip is not None else None
+            # `ip` is the PRIVATE VPC address and never falls back to the
+            # public one; `public_ip` / `ssh_host` are the public address.
+            raw_priv = vm_summary.get("private_ipv4")
+            ip: str | None = str(raw_priv) if raw_priv is not None else None
+            raw_pub = vm_summary.get("public_ipv4")
+            public_ip: str | None = (
+                str(raw_pub) if raw_pub is not None else None
+            )
             raw_id = vm_summary.get("id")
             provider_id: str | None = str(raw_id) if raw_id is not None else None
         else:
             state = "missing"
             ip = None
+            public_ip = None
             provider_id = None
         vm_statuses.append(
             VmStatus(
                 name=vm.name,
                 role=vm.role,
                 ip=ip,
+                public_ip=public_ip,
                 state=state,
                 provider_id=provider_id,
-                ssh_host=ip if ip is not None else None,
-                ssh_port=22 if ip is not None else None,
+                ssh_host=public_ip,
+                ssh_port=22 if public_ip is not None else None,
             )
         )
 

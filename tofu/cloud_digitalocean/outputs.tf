@@ -21,3 +21,16 @@ output "droplet_ids" {
     name => digitalocean_droplet.node[idx].id
   }
 }
+
+output "vm_private_ips" {
+  description = "Map of VM name -> private (VPC) IPv4 address. Keys are the bare VM names. `vm_ips` remains the public address and is the SSH/inventory contract."
+  value = {
+    for idx, name in var.vm_names :
+    name => digitalocean_droplet.node[idx].ipv4_address_private
+  }
+}
+
+output "firewall_id" {
+  description = "ID of the lab Cloud Firewall. DigitalOcean firewall names are not unique, so isolate/connect identify and verify the firewall by this id, never by name."
+  value       = digitalocean_firewall.lab.id
+}

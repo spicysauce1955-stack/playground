@@ -98,7 +98,11 @@ def test_query_status_active_droplet_is_running(
     lab_status, diags = query_status(resolved_cloud_smoke)
     vm_status = next(v for v in lab_status.vms if v.name == vm_name)
     assert vm_status.state == "running"
-    assert vm_status.ip == "1.2.3.4"
+    # No private network on this fake droplet: `ip` stays None and must
+    # NOT fall back to the public address.
+    assert vm_status.ip is None
+    assert vm_status.public_ip == "1.2.3.4"
+    assert vm_status.ssh_host == "1.2.3.4"
     assert vm_status.provider_id == "99"
 
 
@@ -475,3 +479,79 @@ def test_query_status_api_failure_not_silently_missing(
     assert not any(d.severity == "error" for d in diags_ok), (
         "Genuine empty should not produce error diagnostics"
     )
+
+
+# ---------------------------------------------------------------------------
+# Private VPC address -> ip; public address -> public_ip / ssh_host
+# ---------------------------------------------------------------------------
+
+
+def _list_returning(monkeypatch, resolved, networks_v4, status="active"):
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "tok")
+    vm_name = resolved.vms[0].name
+
+    def fake_list(token, tag):
+        return [
+            {
+                "id": 7,
+                "name": f"{resolved.lab_name}-{vm_name}",
+                "status": status,
+                "networks": {"v4": networks_v4},
+            }
+        ], [], True
+
+    monkeypatch.setattr(status_module, "list_droplets_by_tag", fake_list)
+    lab_status, _ = query_status(resolved)
+    return next(v for v in lab_status.vms if v.name == vm_name)
+
+
+def test_query_status_ip_is_private_and_public_ip_is_public(
+    resolved_cloud_smoke, monkeypatch
+):
+    vm = _list_returning(
+        monkeypatch,
+        resolved_cloud_smoke,
+        [
+            {"type": "private", "ip_address": "10.60.0.4"},
+            {"type": "public", "ip_address": "203.0.113.9"},
+        ],
+    )
+    assert vm.ip == "10.60.0.4"
+    assert vm.public_ip == "203.0.113.9"
+    assert vm.ssh_host == "203.0.113.9"
+    assert vm.ssh_port == 22
+
+
+def test_query_status_private_only_has_no_ssh_endpoint(
+    resolved_cloud_smoke, monkeypatch
+):
+    vm = _list_returning(
+        monkeypatch,
+        resolved_cloud_smoke,
+        [{"type": "private", "ip_address": "10.60.0.4"}],
+    )
+    assert vm.ip == "10.60.0.4"
+    assert vm.public_ip is None
+    assert vm.ssh_host is None
+    assert vm.ssh_port is None
+
+
+def test_query_status_json_includes_public_ip(resolved_cloud_smoke, monkeypatch):
+    vm = _list_returning(
+        monkeypatch,
+        resolved_cloud_smoke,
+        [
+            {"type": "private", "ip_address": "10.60.0.4"},
+            {"type": "public", "ip_address": "203.0.113.9"},
+        ],
+    )
+    dumped = vm.model_dump(mode="json", exclude_none=True)
+    assert dumped["ip"] == "10.60.0.4"
+    assert dumped["public_ip"] == "203.0.113.9"
+
+
+def test_vm_status_local_backend_json_has_no_public_ip():
+    from playground.models.status import VmStatus
+
+    vm = VmStatus(name="a", role="r", ip="192.168.1.5", state="provisioned")
+    assert "public_ip" not in vm.model_dump(mode="json", exclude_none=True)

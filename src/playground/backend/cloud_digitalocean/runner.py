@@ -7,9 +7,10 @@ Apply/resume steps:
   ``tofu-init`` → ``tofu-apply`` → ``fetch-vm-ips`` → ``render-inventory`` →
   ``wait-for-vms-ready`` → ``ansible-playbook`` → ``verify-lab`` (warning-only).
 
-Destroy/suspend steps: ``tofu-destroy`` → ``tag-sweep``.
+Destroy/suspend steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep``.
 
-Reset steps: ``tofu-destroy`` → ``tag-sweep`` → ``clean-state-files``.
+Reset steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep`` →
+``clean-state-files``.  ``vpc-sweep`` is best-effort (warnings only).
 
 Droplets have routable public IPs so the configure half uses ``ssh_port=22``
 (no NAT port-forward); same backend-neutral code the libvirt/vbox adapters use.
@@ -23,16 +24,23 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from playground.backend.cloud_digitalocean.do import (
     CONSOLE_URL,
+    _fetch_all_sizes,
     check_size_region_availability,
+    check_vpc_conflicts,
+    check_vpc_would_be_default,
     delete_droplet,
+    delete_vpc,
     droplet_summary,
+    find_vpc,
     list_droplets_by_tag,
+    list_vpcs,
     read_token,
     token_env_name,
     verify_token,
@@ -242,6 +250,19 @@ def execute_reset(
         bus.publish(run.run_id, "operation_finished", {"status": "failed"})
         return finished, all_diagnostics
 
+    # ---- Step 2b: vpc-sweep (best-effort; warnings only) ----
+    bus.publish(run.run_id, "step_started", {"step": "vpc-sweep"})
+    vpc_step, vpc_diags = _vpc_sweep(
+        operation="reset", resolved=resolved,
+        log_path=logs_dir / "vpc-sweep.log",
+    )
+    steps.append(vpc_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "vpc-sweep", "exit_code": vpc_step.exit_code},
+    )
+    all_diagnostics.extend(vpc_diags)
+
     # ---- Step 3: clean-state-files (only when teardown is confirmed clean) ----
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
@@ -313,6 +334,12 @@ def _provision(
     per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
     source_root = tofu_dir / "cloud_digitalocean"
     var_file = (per_lab_dir / f"{lab}.tfvars.json").resolve()
+
+    # Defense in depth for a lost isolation record: the per-lab tfvars written
+    # by the last apply/isolate is the source of truth, so refuse on it before
+    # any run or tofu step (a re-render would silently reopen egress).
+    if _tfvars_say_isolated(var_file):
+        return None, [_tfvars_isolated_diagnostic(operation, lab, var_file)]
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
 
     runs_dir = state_dir / "runs"
@@ -334,6 +361,7 @@ def _provision(
         )
 
     steps: list[StepResult] = []
+    preflight_warnings: list[Diagnostic] = []
 
     # ---- Step 0: cloud-preflight (credential check before any tofu run) ----
     bus.publish(run.run_id, "step_started", {"step": "cloud-preflight"})
@@ -468,12 +496,20 @@ def _provision(
             # API response must NOT block the apply — it degrades to a
             # warning (see check_size_region_availability) so a DigitalOcean
             # API blip never breaks an otherwise-valid apply.
-            size_diags = check_size_region_availability(
-                preflight_token,
-                lab_name=lab,
-                size=plan.size,
-                region=plan.region,
-            )
+            # Per-VM sizing: every DISTINCT size in use is checked.
+            size_diags: list[Diagnostic] = []
+            # One paginated catalogue fetch serves every distinct slug.
+            catalogue = _fetch_all_sizes(preflight_token) if plan.distinct_sizes else None
+            for distinct_size in plan.distinct_sizes:
+                size_diags.extend(
+                    check_size_region_availability(
+                        preflight_token,
+                        lab_name=lab,
+                        size=distinct_size,
+                        region=plan.region,
+                        catalogue=catalogue,
+                    )
+                )
             size_errors = [d for d in size_diags if d.severity == "error"]
             size_warnings = [d for d in size_diags if d.severity != "error"]
             for d in size_warnings:
@@ -502,9 +538,68 @@ def _provision(
                 )
                 return _finalize_failure(
                     run, run_dir, steps, bus, size_errors,
-                    f"credential preflight failed: size {plan.size!r} is "
-                    f"not available in region {plan.region!r} for lab "
+                    f"credential preflight failed: size(s) "
+                    f"{', '.join(repr(s) for s in plan.distinct_sizes)} not "
+                    f"all available in region {plan.region!r} for lab "
                     f"{lab!r}",
+                )
+
+            # Upgrade/VPC safety, both BEFORE any tofu step: tofu can destroy
+            # Droplets before it hits a 422 or a forced replacement.
+            net_errors = _pre_vpc_lab_diagnostics(per_lab_dir, lab, operation)
+            if not net_errors:
+                vpcs, vpc_list_diags, vpc_list_ok = list_vpcs(preflight_token)
+                if vpc_list_ok:
+                    state_file = per_lab_dir / "terraform.tfstate"
+                    own_vpc_ids = tfstate_instance_ids(state_file, "digitalocean_vpc")
+                    net_errors = check_vpc_conflicts(
+                        vpcs,
+                        lab_name=lab,
+                        vpc_name=f"{plan.name_prefix}-vpc",
+                        vpc_cidr=plan.vpc_cidr,
+                        own_vpc_id=own_vpc_ids[0] if own_vpc_ids else None,
+                    )
+                    for d in check_vpc_would_be_default(
+                        vpcs, lab_name=lab, region=plan.region,
+                    ):
+                        preflight_warnings.append(d)
+                        bus.publish(
+                            run.run_id, "log_line",
+                            {
+                                "step": "cloud-preflight",
+                                "line": f"WARNING: {d.message}",
+                            },
+                        )
+                else:
+                    # Like the size check: an API blip must not block apply.
+                    for d in vpc_list_diags:
+                        bus.publish(
+                            run.run_id, "log_line",
+                            {
+                                "step": "cloud-preflight",
+                                "line": f"WARNING: {d.message}; VPC conflict "
+                                "check skipped",
+                            },
+                        )
+            if net_errors:
+                preflight_log.write_text(
+                    f"# cloud-preflight: status={preflight_status}\n"
+                    + "\n".join(f"# {d.message}" for d in net_errors)
+                    + "\n"
+                )
+                preflight_step = _step(
+                    "cloud-preflight", exit_code=1, log_path=preflight_log,
+                    started=_iso_now(),
+                )
+                steps.append(preflight_step)
+                bus.publish(
+                    run.run_id, "step_finished",
+                    {"step": "cloud-preflight", "exit_code": 1},
+                )
+                return _finalize_failure(
+                    run, run_dir, steps, bus, net_errors,
+                    f"network preflight failed for lab {lab!r}: "
+                    f"{net_errors[0].id}",
                 )
 
             preflight_log.write_text(
@@ -694,7 +789,7 @@ def _provision(
         ),
     )
     bus.publish(run.run_id, "operation_finished", {"status": "succeeded"})
-    return finished, downgraded_verify
+    return finished, [*preflight_warnings, *downgraded_verify]
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +905,19 @@ def _teardown(
         )
         bus.publish(run.run_id, "operation_finished", {"status": "failed"})
         return finished, all_diagnostics
+
+    # ---- Step 3: vpc-sweep (best-effort; warnings only, never fails) ----
+    bus.publish(run.run_id, "step_started", {"step": "vpc-sweep"})
+    vpc_step, vpc_diags = _vpc_sweep(
+        operation=operation, resolved=resolved,
+        log_path=logs_dir / "vpc-sweep.log",
+    )
+    steps.append(vpc_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "vpc-sweep", "exit_code": vpc_step.exit_code},
+    )
+    all_diagnostics.extend(vpc_diags)
 
     finished = finish_run(
         run, run_dir, status="succeeded", steps=steps,
@@ -1048,6 +1156,103 @@ def _tag_sweep(
     )
 
 
+_VPC_DELETE_ATTEMPTS = 3
+_VPC_RETRY_SECONDS = 5.0
+
+
+def _vpc_sweep(
+    *,
+    operation: str,
+    resolved: ResolvedLab,
+    log_path: Path,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Best-effort delete of an orphaned ``<lab>-vpc`` after the Droplet sweep.
+
+    Normally ``tofu destroy`` already removed the VPC and this only confirms
+    it is gone.  An orphan appears when destroy failed or state was lost; a
+    leftover VPC is free but blocks re-creating its CIDR/name.  This step
+    never fails the teardown: every problem is a warning diagnostic and the
+    step exit code is always 0.  DigitalOcean refuses to delete a VPC that
+    still has members, so the delete is retried a few times to ride out
+    Droplets that are still shutting down.
+    """
+    lab = resolved.lab_name
+    name = f"{lab}-vpc"
+    started = _iso_now()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# vpc-sweep for lab {lab!r} (vpc={name!r})"]
+    diagnostics: list[Diagnostic] = []
+
+    def done() -> tuple[StepResult, list[Diagnostic]]:
+        log_path.write_text("\n".join(lines) + "\n")
+        return (
+            _step("vpc-sweep", exit_code=0, log_path=log_path, started=started),
+            diagnostics,
+        )
+
+    token = read_token(resolved)
+    if not token:
+        lines.append("token absent -- vpc-sweep skipped")
+        return done()
+
+    vpc, find_diags, ok = find_vpc(token, name)
+    if not ok:
+        lines.append("could not list VPCs -- vpc-sweep inconclusive")
+        diagnostics.extend(find_diags)
+        diagnostics.append(
+            Diagnostic(
+                id=f"runtime.{operation}.vpc_sweep_inconclusive",
+                severity="warning",
+                message=(
+                    f"could not check whether VPC {name!r} was removed "
+                    "(API/transport error)"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "check https://cloud.digitalocean.com/networking/vpc and "
+                    "delete it if it is still there"
+                ),
+            )
+        )
+        return done()
+    if vpc is None:
+        lines.append("no VPC present")
+        return done()
+
+    vpc_id = str(vpc.get("id"))
+    last: list[Diagnostic] = []
+    for attempt in range(1, _VPC_DELETE_ATTEMPTS + 1):
+        last = delete_vpc(token, vpc_id)
+        lines.append(
+            f"delete VPC {name!r} (id={vpc_id}) attempt {attempt}: "
+            f"{'ok' if not last else 'refused'}"
+        )
+        if not last:
+            return done()
+        if attempt < _VPC_DELETE_ATTEMPTS:
+            time.sleep(_VPC_RETRY_SECONDS)
+    diagnostics.extend(last)
+    default_note = (
+        "; it may be the region's default VPC, which DigitalOcean does not "
+        "allow deleting"
+        if vpc.get("default") is True
+        else ""
+    )
+    diagnostics.append(
+        Diagnostic(
+            id=f"runtime.{operation}.orphaned_vpc",
+            severity="warning",
+            message=(
+                f"VPC {name!r} (id={vpc_id}) could not be deleted; it is free "
+                f"but blocks re-creating this lab's network{default_note}"
+            ),
+            source=SourceLocation(path=f"vpc/{vpc_id}"),
+            suggestion="delete it at https://cloud.digitalocean.com/networking/vpc",
+        )
+    )
+    return done()
+
+
 def _sweep_failed(operation: str, sweep_diags: list[Diagnostic]) -> bool:
     """Return True if a tag-sweep result means the teardown must be failed.
 
@@ -1125,6 +1330,107 @@ def _noop_step(name: str, log_path: Path) -> StepResult:
         started_at=now,
         finished_at=now,
     )
+
+
+def tfstate_resources(state_path: Path, rtype: str) -> list[dict[str, Any]]:
+    """Managed resources of type ``rtype`` in a tfstate file.
+
+    The one tfstate parser: an absent, unreadable or malformed file yields
+    ``[]`` (callers must treat that as "not recorded", never as an error).
+    """
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    resources = state.get("resources") if isinstance(state, dict) else None
+    return [
+        r for r in (resources if isinstance(resources, list) else [])
+        if isinstance(r, dict)
+        and r.get("type") == rtype
+        and r.get("mode", "managed") == "managed"
+    ]
+
+
+def tfstate_instance_ids(
+    state_path: Path, rtype: str, *, name: str | None = None,
+) -> list[str]:
+    """Instance ``id`` attributes (as strings) of ``rtype`` resources in a tfstate.
+
+    ``name`` restricts to the resource of that tofu name (e.g. ``"lab"``).
+    """
+    ids: list[str] = []
+    for res in tfstate_resources(state_path, rtype):
+        if name is not None and res.get("name") != name:
+            continue
+        for inst in res.get("instances") or []:
+            attrs = inst.get("attributes") if isinstance(inst, dict) else None
+            rid = attrs.get("id") if isinstance(attrs, dict) else None
+            if rid not in (None, ""):
+                ids.append(str(rid))
+    return ids
+
+
+def _tfvars_say_isolated(var_file: Path) -> bool:
+    """True when the per-lab tfvars record ``egress_isolated: true``."""
+    try:
+        loaded = json.loads(var_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(loaded, dict) and loaded.get("egress_isolated") is True
+
+
+def _tfvars_isolated_diagnostic(operation: str, lab: str, var_file: Path) -> Diagnostic:
+    """``runtime.apply.lab_isolated`` (the id dispatch uses) from the tfvars signal.
+
+    Built here, not imported from dispatch: dispatch imports this package.
+    """
+    return Diagnostic(
+        id="runtime.apply.lab_isolated",
+        severity="error",
+        message=(
+            f"lab {lab!r}: its per-lab tfvars say egress_isolated=true; refusing to "
+            f"{operation}: provisioning needs internet access and a re-render must "
+            "not silently reopen egress"
+        ),
+        source=SourceLocation(path=str(var_file)),
+        suggestion=(
+            f"run `playground connect {lab}` first, then `playground {operation} "
+            f"{lab}`, then `playground isolate {lab}` again"
+        ),
+    )
+
+
+def _pre_vpc_lab_diagnostics(
+    per_lab_dir: Path, lab: str, operation: str,
+) -> list[Diagnostic]:
+    """Refuse apply/resume on a lab provisioned before per-lab VPCs.
+
+    If the per-lab tfstate holds ``digitalocean_droplet`` resources but no
+    ``digitalocean_vpc``, applying would add ``vpc_uuid`` to every Droplet,
+    which forces replacement and loses disk state.  An unreadable or absent
+    state file is not a pre-VPC lab.
+    """
+    state_file = per_lab_dir / "terraform.tfstate"
+    if not tfstate_resources(state_file, "digitalocean_droplet") or tfstate_resources(
+        state_file, "digitalocean_vpc"
+    ):
+        return []
+    return [
+        Diagnostic(
+            id="runtime.apply.pre_vpc_lab",
+            severity="error",
+            message=(
+                f"lab {lab!r} was provisioned before per-lab VPCs; "
+                f"`{operation}` would replace every Droplet (adding "
+                "vpc_uuid forces replacement) and lose their disk state"
+            ),
+            source=SourceLocation(path=str(state_file)),
+            suggestion=(
+                f"run `playground destroy {lab}` then `playground apply "
+                f"{lab}` to recreate it with a VPC"
+            ),
+        )
+    ]
 
 
 def _finalize_failure(

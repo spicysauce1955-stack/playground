@@ -27,6 +27,11 @@ from playground.models.base import StrictModel
 
 RunStatus = Literal["running", "succeeded", "failed"]
 
+Operation = Literal[
+    "apply", "destroy", "reset", "stop", "suspend", "resume", "capture",
+    "isolate", "connect",
+]
+
 
 class StepResult(StrictModel):
     """One subprocess invocation within an operation run."""
@@ -43,7 +48,7 @@ class OperationRun(StrictModel):
     """JSON-serialized lifecycle marker for one mutating command."""
 
     run_id: str
-    operation: Literal["apply", "destroy", "reset", "stop", "suspend", "resume", "capture"]
+    operation: Operation
     lab: str
     status: RunStatus
     started_at: str
@@ -65,7 +70,7 @@ def allocate_run_id(operation: str, lab: str, now: datetime | None = None) -> st
 
 def start_run(
     runs_dir: Path,
-    operation: Literal["apply", "destroy", "reset", "stop", "suspend", "resume", "capture"],
+    operation: Operation,
     lab: str,
     run_id: str | None = None,
 ) -> tuple[OperationRun, Path]:
@@ -136,6 +141,7 @@ def _write(path: Path, run: OperationRun) -> None:
 
 
 __all__ = [
+    "Operation",
     "OperationRun",
     "RunStatus",
     "StepResult",

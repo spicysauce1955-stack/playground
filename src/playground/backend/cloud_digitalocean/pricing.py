@@ -42,11 +42,24 @@ def estimate_cost(size: str, vm_count: int) -> CostEstimate | None:
     :param size: DigitalOcean Droplet size slug, e.g. ``"s-1vcpu-1gb"``.
     :param vm_count: Number of Droplets of that size in the lab.
     """
-    unit_price = DROPLET_PRICES.get(size)
-    if unit_price is None:
+    if size not in DROPLET_PRICES:
         return None
+    return estimate_cost_for_sizes([size] * vm_count)
 
-    monthly = unit_price * vm_count
+
+def estimate_cost_for_sizes(sizes: list[str]) -> CostEstimate | None:
+    """Return an advisory :class:`CostEstimate` for one Droplet per entry of
+    ``sizes`` (the per-VM size slugs), or ``None`` when ANY slug is missing
+    from ``DROPLET_PRICES`` -- a partial sum would understate the bill.
+
+    :param sizes: One DigitalOcean size slug per Droplet.
+    """
+    monthly = 0.0
+    for size in sizes:
+        unit_price = DROPLET_PRICES.get(size)
+        if unit_price is None:
+            return None
+        monthly += unit_price
     hourly = round(monthly / _HOURS_PER_MONTH, 5)
     return CostEstimate(
         hourly_usd=hourly,
@@ -56,4 +69,4 @@ def estimate_cost(size: str, vm_count: int) -> CostEstimate | None:
     )
 
 
-__all__ = ["DROPLET_PRICES", "estimate_cost"]
+__all__ = ["DROPLET_PRICES", "estimate_cost", "estimate_cost_for_sizes"]

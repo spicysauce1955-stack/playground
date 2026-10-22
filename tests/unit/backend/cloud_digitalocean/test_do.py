@@ -465,3 +465,30 @@ def test_verify_token_return_value_is_int_not_token(monkeypatch):
     result = verify_token(secret)
     assert isinstance(result, int)
     assert secret not in str(result)
+
+
+def test_droplet_summary_extracts_private_ipv4():
+    d = {
+        "id": 3,
+        "name": "x",
+        "status": "active",
+        "networks": {
+            "v4": [
+                {"type": "private", "ip_address": "10.60.0.4"},
+                {"type": "public", "ip_address": "203.0.113.9"},
+            ]
+        },
+    }
+    summary = droplet_summary(d)
+    assert summary["private_ipv4"] == "10.60.0.4"
+    assert summary["public_ipv4"] == "203.0.113.9"
+
+
+def test_droplet_summary_private_ipv4_none_when_absent():
+    d = {
+        "id": 4,
+        "name": "x",
+        "status": "active",
+        "networks": {"v4": [{"type": "public", "ip_address": "203.0.113.9"}]},
+    }
+    assert droplet_summary(d)["private_ipv4"] is None

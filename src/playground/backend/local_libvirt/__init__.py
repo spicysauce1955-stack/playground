@@ -16,6 +16,11 @@ from playground.backend.local_libvirt.inventory import (
     fetch_vm_ips,
     render_inventory,
 )
+from playground.backend.local_libvirt.isolation import (
+    execute_connect,
+    execute_isolate,
+    remove_isolation_filter,
+)
 from playground.backend.local_libvirt.runner import (
     execute_apply,
     execute_destroy,
@@ -29,11 +34,14 @@ from playground.backend.local_libvirt.wait import VmTarget, wait_for_vms_ready
 __all__ = [
     "VmTarget",
     "execute_apply",
+    "execute_connect",
     "execute_destroy",
+    "execute_isolate",
     "execute_reset",
     "fetch_vm_ips",
     "query_status",
     "render_inventory",
+    "remove_isolation_filter",
     "render_tfvars",
     "run_ansible_playbook",
     "run_tofu_apply",

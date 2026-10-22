@@ -18,6 +18,12 @@ variable "size" {
   type        = string
 }
 
+variable "vm_sizes" {
+  description = "Per-VM Droplet size slug overrides keyed by VM name. A VM absent from the map uses var.size. Set from spec.vms[].provider_overrides.cloud-digitalocean.size."
+  type        = map(string)
+  default     = {}
+}
+
 variable "image" {
   description = "DigitalOcean image slug or ID used as the Droplet base image (e.g. 'ubuntu-24-04-x64'). Set via the provider config or per-lab override."
   type        = string
@@ -35,7 +41,7 @@ variable "ssh_key_fingerprints" {
 }
 
 variable "tags" {
-  description = "Ownership tags applied to every Droplet and the firewall. Used by status / suspend / destroy to tag-sweep for orphaned, still-billing resources."
+  description = "Ownership tags applied to every Droplet (NOT the firewall: firewall tags select targets). Used by status / suspend / destroy to tag-sweep for orphaned, still-billing resources."
   type        = list(string)
   default     = []
 }
@@ -50,4 +56,15 @@ variable "dns_domain" {
   description = "Per-lab DNS domain used for the cloud-init hostname/fqdn, mirroring the `dns_domain` variable in the libvirt root. Set via `spec.dns_domain` in the lab YAML (default: <lab-name>.lab)."
   type        = string
   default     = "playground.lab"
+}
+
+variable "vpc_cidr" {
+  description = "IPv4 CIDR of the per-lab VPC (the lab network's cidr; RFC1918, /16 to /28). Droplets get their private address from it and the lab firewall allows all inbound traffic from it. Must not overlap another VPC in the same DigitalOcean account."
+  type        = string
+}
+
+variable "egress_isolated" {
+  description = "When true, the lab firewall's outbound rules only allow the lab's own Droplets by id (no internet, no outside DNS, not even the VPC resolver; the link-local metadata service is NOT blocked). Flipped by `playground isolate` / `playground connect`; false for a normal apply."
+  type        = bool
+  default     = false
 }

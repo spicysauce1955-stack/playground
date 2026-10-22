@@ -191,3 +191,14 @@ def test_render_do_tfvars_is_pure_no_side_effects(cloud_smoke_plan) -> None:
     r1 = render_do_tfvars(cloud_smoke_plan, ssh_public_key=_SSH_KEY)
     r2 = render_do_tfvars(cloud_smoke_plan, ssh_public_key=_SSH_KEY)
     assert r1 == r2
+
+
+def test_rendered_vm_sizes_covers_every_vm(cloud_smoke_plan, rendered) -> None:
+    assert rendered["vm_sizes"] == {
+        name: "s-1vcpu-1gb" for name in cloud_smoke_plan.vm_names
+    }
+
+
+def test_main_tf_looks_up_per_vm_size() -> None:
+    main_tf = (VARIABLES_TF.parent / "main.tf").read_text(encoding="utf-8")
+    assert "lookup(var.vm_sizes, var.vm_names[count.index], var.size)" in main_tf

@@ -24,6 +24,12 @@ Diagnostic IDs:
   classes from ``requirements.md`` §5.13 are tracked for a later slice)
 - ``config.backend.per_vm_resources_unsupported`` (warning; today's
   ``local-libvirt`` backend applies global ``var.vm_memory`` / ``var.vm_vcpu``)
+- ``config.network.do_cidr_overlap`` (warning; two cloud-digitalocean labs
+  declare overlapping network CIDRs)
+- ``config.backend.do_vm_size_invalid`` (error; a per-VM
+  ``provider_overrides.cloud-digitalocean.size`` that is not a string slug)
+- ``config.backend.do_size_below_resources`` (warning; a VM's effective
+  Droplet slug is smaller than its declared vcpu/memory)
 - ``config.backend.capability_unsupported`` (warning; a VmRole capability
   the chosen backend's ProviderConfig declares ``false``)
 - ``config.network.ip_not_in_cidr`` (per-VM pinned IP outside the lab
@@ -351,6 +357,8 @@ def _check_lab(lab: Lab, loaded: LoadedConfig) -> list[Diagnostic]:
     diagnostics.extend(_check_backend_capability(lab, loaded, source))
     diagnostics.extend(_check_role_provider_capabilities(lab, loaded, source))
     diagnostics.extend(_check_network_ips(lab, source))
+    diagnostics.extend(_check_digitalocean_network(lab, source))
+    diagnostics.extend(_check_do_cidr_overlap(lab, loaded, source))
     diagnostics.extend(_check_dns_domain(lab, source))
     diagnostics.extend(_check_devices(lab, source, loaded))
 
@@ -590,6 +598,157 @@ def _check_network_ips(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
                 )
                 continue
             seen[key] = vm.name
+    return diagnostics
+
+
+_RFC1918_NETS = tuple(
+    ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def _lab_networks(lab: Lab) -> list[Any]:
+    nets = []
+    for net in lab.spec.networks:
+        try:
+            nets.append((net.name, ipaddress.ip_network(net.cidr, strict=False)))
+        except ValueError:
+            continue
+    return nets
+
+
+def _check_do_cidr_overlap(
+    lab: Lab, loaded: LoadedConfig, source: SourceLocation,
+) -> list[Diagnostic]:
+    """Warn when another cloud-digitalocean lab declares an overlapping CIDR.
+
+    ``config.network.do_cidr_overlap`` (warning): each lab gets its own VPC,
+    and DigitalOcean rejects a VPC whose ``ip_range`` overlaps another VPC in
+    the account, so the two labs cannot be applied at the same time.
+    """
+    if lab.spec.backend != "cloud-digitalocean":
+        return []
+    mine = _lab_networks(lab)
+    diagnostics: list[Diagnostic] = []
+    for other in loaded.labs.values():
+        if other.metadata.name == lab.metadata.name:
+            continue
+        if other.spec.backend != "cloud-digitalocean":
+            continue
+        for my_name, my_net in mine:
+            clash = next(
+                (
+                    (o_name, o_net)
+                    for o_name, o_net in _lab_networks(other)
+                    if o_net.version == my_net.version
+                    and o_net.overlaps(my_net)
+                ),
+                None,
+            )
+            if clash is None:
+                continue
+            diagnostics.append(
+                Diagnostic(
+                    id="config.network.do_cidr_overlap",
+                    severity="warning",
+                    message=(
+                        f"lab {lab.metadata.name!r} network {my_name!r} "
+                        f"({my_net}) overlaps lab {other.metadata.name!r} "
+                        f"network {clash[0]!r} ({clash[1]}); both use "
+                        "cloud-digitalocean, so they cannot be applied at "
+                        "the same time in one account"
+                    ),
+                    source=source,
+                    key_path="spec.networks",
+                    suggestion=(
+                        "give each cloud-digitalocean lab a distinct CIDR "
+                        "(e.g. 10.60.0.0/24, 10.61.0.0/24)"
+                    ),
+                )
+            )
+            break
+    return diagnostics
+
+
+def _check_digitalocean_network(lab: Lab, source: SourceLocation) -> list[Diagnostic]:
+    """cloud-digitalocean maps the lab's network to ONE per-lab VPC.
+
+    - ``config.network.do_single_network`` (error): exactly one network must
+      be declared; the backend creates a single ``digitalocean_vpc`` from it.
+    - ``config.network.do_vpc_cidr_invalid`` (error): the CIDR must be IPv4
+      RFC1918 with a prefix between /16 and /28 (DigitalOcean's VPC API
+      limit), otherwise apply would fail late with a 422.
+    - ``config.network.do_ip_pin_ignored`` (warning): DigitalOcean assigns
+      each Droplet's VPC address itself, so a pinned per-VM IP is ignored.
+    """
+    if lab.spec.backend != "cloud-digitalocean":
+        return []
+    diagnostics: list[Diagnostic] = []
+
+    if len(lab.spec.networks) != 1:
+        diagnostics.append(
+            Diagnostic(
+                id="config.network.do_single_network",
+                severity="error",
+                message=(
+                    f"lab {lab.metadata.name!r} uses cloud-digitalocean and "
+                    f"declares {len(lab.spec.networks)} networks; exactly one "
+                    "is required (it becomes the lab's VPC)"
+                ),
+                source=source,
+                key_path="spec.networks",
+                suggestion="declare a single network with an RFC1918 cidr",
+            )
+        )
+
+    for idx, net in enumerate(lab.spec.networks):
+        problem: str | None = None
+        try:
+            cidr = ipaddress.ip_network(net.cidr, strict=False)
+        except ValueError:
+            problem = "is not a valid CIDR"
+        else:
+            if cidr.version != 4 or not any(
+                cidr.subnet_of(r) for r in _RFC1918_NETS  # type: ignore[arg-type]
+            ):
+                problem = "is not an RFC1918 IPv4 range (10/8, 172.16/12, 192.168/16)"
+            elif not 16 <= cidr.prefixlen <= 28:
+                problem = (
+                    f"has prefix /{cidr.prefixlen}; DigitalOcean VPCs need /16 to /28"
+                )
+        if problem is not None:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.network.do_vpc_cidr_invalid",
+                    severity="error",
+                    message=(
+                        f"network {net.name!r} cidr {net.cidr!r} {problem}"
+                    ),
+                    source=source,
+                    key_path=f"spec.networks[{idx}].cidr",
+                    suggestion="use a private range such as 10.60.0.0/24",
+                )
+            )
+
+    for vm_idx, vm in enumerate(lab.spec.vms):
+        for net_idx, vm_net in enumerate(vm.networks):
+            if vm_net.ip is not None:
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.network.do_ip_pin_ignored",
+                        severity="warning",
+                        message=(
+                            f"VM {vm.name!r} pins {vm_net.name!r} to "
+                            f"{vm_net.ip!r}, but cloud-digitalocean assigns "
+                            "VPC addresses itself; the pin is ignored"
+                        ),
+                        source=source,
+                        key_path=f"spec.vms[{vm_idx}].networks[{net_idx}].ip",
+                        suggestion=(
+                            "remove the pin; read the private address from "
+                            "`playground status`"
+                        ),
+                    )
+                )
     return diagnostics
 
 
@@ -892,14 +1051,149 @@ def _check_backend_capability(
     """Warn when the lab declares intent the chosen backend can't honor.
 
     ``local-libvirt``: ``tofu/main.tf`` applies a single global
-    ``var.vm_memory`` / ``var.vm_vcpu`` to every domain. ``cloud-digitalocean``
-    has the same limitation for a different reason: ``_TFVARS_KEYS`` in
-    ``src/playground/backend/cloud_digitalocean/tfvars.py`` carries a single
-    scalar ``size``, so one Droplet size applies to every VM in the lab.
-    Either way, a lab with heterogeneous per-VM resources will not be
-    reproduced accurately on apply. Permissive per engineering principle
-    #10 — warn, don't block.
+    ``var.vm_memory`` / ``var.vm_vcpu`` to every domain, so a lab with
+    heterogeneous per-VM resources will not be reproduced accurately on
+    apply. ``cloud-digitalocean`` honors a per-VM Droplet size through
+    ``spec.vms[].provider_overrides.cloud-digitalocean.size`` (see
+    :func:`_check_do_vm_sizes`); declared ``resources`` never select a size
+    by themselves. Permissive per engineering principle #10 — warn, don't
+    block.
     """
+    diagnostics: list[Diagnostic] = []
+    if lab.spec.backend == "cloud-digitalocean":
+        diagnostics.extend(_check_do_vm_sizes(lab, loaded, source))
+    diagnostics.extend(_check_heterogeneous_resources(lab, loaded, source))
+    return diagnostics
+
+
+_DO_SLUG_RE = re.compile(r"(\d+)vcpu-(\d+)gb")
+
+
+def _do_size_override(vm: LabVm) -> Any:
+    """Raw ``provider_overrides.cloud-digitalocean.size`` of a VM, or ``None``."""
+    block = vm.provider_overrides.get("cloud-digitalocean")
+    if isinstance(block, dict):
+        return block.get("size")
+    return None
+
+
+def _check_do_vm_sizes(
+    lab: Lab,
+    loaded: LoadedConfig,
+    source: SourceLocation,
+) -> list[Diagnostic]:
+    """Validate per-VM DigitalOcean size overrides.
+
+    - ``config.backend.do_vm_size_invalid`` (error): a
+      ``provider_overrides.cloud-digitalocean.size`` that is not a non-empty
+      string slug, or a ``cloud-digitalocean`` override block that is not a
+      mapping.
+    - ``config.backend.do_size_below_resources`` (warning): the VM's
+      effective slug (override > lab/provider ``size`` > ``DEFAULT_SIZE``) provides fewer vCPUs
+      or less memory than the VM's declared resources. Slugs that do not
+      parse as ``<n>vcpu-<m>gb`` are skipped.
+    """
+    diagnostics: list[Diagnostic] = []
+    lab_size: str | None = None
+    raw_lab_size = (lab.spec.providers.get("cloud-digitalocean") or {}).get("size")
+    if isinstance(raw_lab_size, str) and raw_lab_size.strip():
+        lab_size = raw_lab_size.strip()
+    else:
+        provider_cfg = loaded.providers.get("cloud-digitalocean")
+        if provider_cfg is not None:
+            try:
+                cfg_size = provider_cfg.spec.model_dump().get("size")
+            except Exception:  # noqa: BLE001
+                cfg_size = None
+            if isinstance(cfg_size, str) and cfg_size.strip():
+                lab_size = cfg_size.strip()
+    if lab_size is None:
+        # Lazy import: the backend package imports the validator's siblings.
+        from playground.backend.cloud_digitalocean.plan import DEFAULT_SIZE
+
+        lab_size = DEFAULT_SIZE
+
+    for idx, vm in enumerate(lab.spec.vms):
+        size = lab_size
+        key_path = f"spec.vms[{idx}].provider_overrides.cloud-digitalocean"
+        block = vm.provider_overrides.get("cloud-digitalocean")
+        if block is not None and not isinstance(block, dict):
+            diagnostics.append(
+                Diagnostic(
+                    id="config.backend.do_vm_size_invalid",
+                    severity="error",
+                    message=(
+                        f"VM {vm.name!r} in lab {lab.metadata.name!r}: "
+                        "provider_overrides.cloud-digitalocean must be a "
+                        f"mapping, got {type(block).__name__}"
+                    ),
+                    source=source,
+                    key_path=key_path,
+                    suggestion="use `cloud-digitalocean: {size: s-1vcpu-2gb}`",
+                )
+            )
+        elif isinstance(block, dict) and "size" in block:
+            raw = block["size"]
+            if isinstance(raw, str) and raw.strip():
+                size = raw.strip()
+            else:
+                diagnostics.append(
+                    Diagnostic(
+                        id="config.backend.do_vm_size_invalid",
+                        severity="error",
+                        message=(
+                            f"VM {vm.name!r} in lab {lab.metadata.name!r}: "
+                            "provider_overrides.cloud-digitalocean.size "
+                            f"must be a non-empty string slug, got {raw!r}"
+                        ),
+                        source=source,
+                        key_path=f"{key_path}.size",
+                        suggestion="use a Droplet slug such as `s-1vcpu-2gb`",
+                    )
+                )
+
+        resources = _resources_for_vm(loaded, vm)
+        match = _DO_SLUG_RE.search(size) if size else None
+        if resources is None or match is None:
+            continue
+        slug_vcpu, slug_gb = int(match.group(1)), int(match.group(2))
+        short: list[str] = []
+        if resources.vcpu > slug_vcpu:
+            short.append(f"{resources.vcpu} vCPU declared vs {slug_vcpu}")
+        if resources.memory_mb > slug_gb * 1024:
+            short.append(
+                f"{resources.memory_mb} MiB declared vs {slug_gb * 1024}"
+            )
+        if short:
+            diagnostics.append(
+                Diagnostic(
+                    id="config.backend.do_size_below_resources",
+                    severity="warning",
+                    message=(
+                        f"VM {vm.name!r} in lab {lab.metadata.name!r} gets "
+                        f"Droplet size {size!r}, which is smaller than its "
+                        f"declared resources ({'; '.join(short)}). "
+                        "Advisory: the slug, not `resources`, decides what "
+                        "is provisioned."
+                    ),
+                    source=source,
+                    key_path=f"spec.vms[{idx}].resources",
+                    suggestion=(
+                        "set spec.vms[].provider_overrides.cloud-digitalocean"
+                        ".size to a larger slug, or lower the declared "
+                        "resources"
+                    ),
+                )
+            )
+    return diagnostics
+
+
+def _check_heterogeneous_resources(
+    lab: Lab,
+    loaded: LoadedConfig,
+    source: SourceLocation,
+) -> list[Diagnostic]:
+    """Warn on heterogeneous per-VM resources the backend can't reproduce."""
     if lab.spec.backend not in ("local-libvirt", "cloud-digitalocean"):
         return []
 
@@ -913,13 +1207,25 @@ def _check_backend_capability(
         return []
 
     if lab.spec.backend == "cloud-digitalocean":
+        # DO honors per-VM size through the override; only VMs WITHOUT one
+        # fall back to the lab-wide slug, so only they trigger this warning.
+        lacking = [
+            vm.name
+            for vm in lab.spec.vms
+            if not isinstance(_do_size_override(vm), str)
+        ]
+        if not lacking:
+            return []
         detail = (
-            "the cloud-digitalocean backend applies a single Droplet `size` "
-            "slug to every VM in the lab"
+            "the cloud-digitalocean backend picks each Droplet by `size` "
+            "slug, not by `resources`; VMs without a per-VM size override "
+            f"({', '.join(lacking)}) all get the lab-wide size"
         )
         suggestion = (
-            "set spec.providers.cloud-digitalocean.size to a slug that fits "
-            "the largest VM; per-VM resources are advisory on this backend"
+            "set spec.vms[].provider_overrides.cloud-digitalocean.size per "
+            "VM (e.g. `s-1vcpu-2gb`), or spec.providers.cloud-digitalocean"
+            ".size for the whole lab; per-VM resources are advisory on this "
+            "backend"
         )
     else:
         detail = (

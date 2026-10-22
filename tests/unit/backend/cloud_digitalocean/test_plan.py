@@ -271,3 +271,59 @@ def test_do_plan_is_frozen(resolved_cloud_smoke) -> None:
 def test_do_plan_vm_count_matches_vm_names_length(resolved_cloud_smoke) -> None:
     plan = build_do_plan(resolved_cloud_smoke, provider_settings={})
     assert plan.vm_count == len(plan.vm_names)
+
+
+# ---------------------------------------------------------------------------
+# build_do_plan — per-VM sizing
+# ---------------------------------------------------------------------------
+
+
+def _with_vms(resolved, overrides_by_vm):
+    """Clone cloud-smoke's single VM into one VM per entry of
+    ``overrides_by_vm`` (name -> provider_overrides)."""
+    base = resolved.vms[0]
+    vms = [
+        base.model_copy(update={"name": name, "provider_overrides": ov})
+        for name, ov in overrides_by_vm.items()
+    ]
+    return resolved.model_copy(update={"vms": vms})
+
+
+def test_vm_sizes_default_to_lab_size_for_every_vm(resolved_cloud_smoke) -> None:
+    resolved = _with_vms(resolved_cloud_smoke, {"a": {}, "b": {}})
+    plan = build_do_plan(resolved, provider_settings={"size": "s-1vcpu-2gb"})
+    assert plan.vm_sizes == {"a": "s-1vcpu-2gb", "b": "s-1vcpu-2gb"}
+
+
+def test_vm_sizes_fall_back_to_default_size(resolved_cloud_smoke) -> None:
+    resolved = _with_vms(resolved_cloud_smoke, {"a": {}})
+    plan = build_do_plan(resolved, provider_settings={})
+    assert plan.vm_sizes == {"a": DEFAULT_SIZE}
+
+
+def test_vm_override_beats_lab_size(resolved_cloud_smoke) -> None:
+    resolved = _with_vms(
+        resolved_cloud_smoke,
+        {
+            "a": {"cloud-digitalocean": {"size": "s-2vcpu-4gb"}},
+            "b": {},
+            "c": {"local-libvirt": {"size": "ignored"}},
+        },
+    )
+    plan = build_do_plan(resolved, provider_settings={"size": "s-1vcpu-2gb"})
+    assert plan.vm_sizes == {
+        "a": "s-2vcpu-4gb",
+        "b": "s-1vcpu-2gb",
+        "c": "s-1vcpu-2gb",
+    }
+    assert plan.size == "s-1vcpu-2gb"
+    assert plan.distinct_sizes == ["s-2vcpu-4gb", "s-1vcpu-2gb"]
+
+
+def test_malformed_override_is_ignored_by_plan(resolved_cloud_smoke) -> None:
+    resolved = _with_vms(
+        resolved_cloud_smoke,
+        {"a": {"cloud-digitalocean": {"size": 4}}, "b": {"cloud-digitalocean": "x"}},
+    )
+    plan = build_do_plan(resolved, provider_settings={"size": "s-1vcpu-2gb"})
+    assert plan.vm_sizes == {"a": "s-1vcpu-2gb", "b": "s-1vcpu-2gb"}
