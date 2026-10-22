@@ -309,3 +309,14 @@ def test_render_plan_does_not_compute_cost_estimate_itself(
     plan = render_plan(resolved_generic_infra)
 
     assert plan.cost_estimate is None
+
+
+def test_render_plan_vm_images_override_only_the_named_vms(
+    resolved_generic_infra,
+) -> None:
+    plan = render_plan(resolved_generic_infra, vm_images={"docker1": "rockylinux-8-x64"})
+    vms = {a.name: a for a in plan.actions if a.resource_type == "vm"}
+    assert vms["docker1"].details["image"] == "rockylinux-8-x64"
+    assert "docker-host on rockylinux-8-x64 (" in vms["docker1"].summary
+    others = [a for name, a in vms.items() if name != "docker1"]
+    assert others and all(a.details["image"] == "ubuntu-noble" for a in others)

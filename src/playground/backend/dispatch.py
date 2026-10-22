@@ -745,6 +745,30 @@ def plan_provider_summary(
     return summary
 
 
+def plan_vm_images(
+    resolved: ResolvedLab,
+    *,
+    config_dir: Path | None = None,
+    loaded: LoadedConfig | None = None,
+) -> dict[str, str] | None:
+    """Per-VM image the backend will boot, for the plan's VM lines.
+
+    ``cloud-digitalocean`` maps each VM to its effective slug / ID (a custom
+    image shows as its ``img-<hash>`` key, as in the provider summary); the
+    ``VmRole.image`` (``ubuntu-noble``) is a libvirt artifact name that this
+    backend never uses. Local backends return ``None``.
+    """
+    if resolved.backend != DIGITALOCEAN:
+        return None
+    provider_settings = cloud_digitalocean.merge_provider_settings(
+        resolved, config_dir=config_dir, loaded=loaded,
+    )
+    plan = cloud_digitalocean.build_do_plan(
+        resolved, provider_settings=provider_settings
+    )
+    return {name: plan.vm_images[name] for name in plan.vm_names}
+
+
 def _count_summary(values: list[str], fallback: str) -> str:
     """The single value, or ``"a x5, b x1"`` (first-seen order) when they differ."""
     counts = {v: values.count(v) for v in dict.fromkeys(values)}
@@ -769,6 +793,7 @@ __all__ = [
     "is_supported",
     "lab_isolated_diagnostic",
     "plan_provider_summary",
+    "plan_vm_images",
     "query_status",
     "unsupported_backend_diagnostic",
     "verb_not_supported_diagnostic",

@@ -27,6 +27,7 @@ from playground.backend.dispatch import (
     execute_resume,
     execute_suspend,
     plan_provider_summary,
+    plan_vm_images,
     query_status,
     unsupported_backend_diagnostic,
 )
@@ -430,10 +431,14 @@ def plan_command(
         warnings = warnings + cloud_warnings
 
     # Pass the already-loaded config to avoid parsing the config tree a second
-    # and third time inside estimate_cost / plan_provider_summary.
+    # and third time inside estimate_cost / plan_provider_summary /
+    # plan_vm_images.
     cost = estimate_cost(resolved, loaded=loaded)
     provider_summary = plan_provider_summary(resolved, loaded=loaded)
-    plan = render_plan(resolved, warnings=warnings, cost_estimate=cost)
+    plan = render_plan(
+        resolved, warnings=warnings, cost_estimate=cost,
+        vm_images=plan_vm_images(resolved, loaded=loaded),
+    )
 
     if output is OutputFormat.json:
         payload = plan.model_dump(mode="json")

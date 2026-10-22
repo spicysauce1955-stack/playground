@@ -516,3 +516,33 @@ def test_summary_for_the_central_lab(monkeypatch, resolved) -> None:
     assert summary["ssh_key"].startswith("central:")
     assert "destroy keeps it" in summary["ssh_key"]
     assert summary["package_upgrade"].startswith("off for central")
+
+
+# ---------------------------------------------------------------------------
+# plan VM lines (dispatch.plan_vm_images -> render_plan)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_vm_lines_show_the_droplet_image_not_the_role_image(
+    monkeypatch, resolved,
+) -> None:
+    """The VmRole image (`ubuntu-noble`, a libvirt artifact) is never what a
+    Droplet boots; the plan's VM lines show the per-VM DO image instead."""
+    from playground.planner import render_plan
+
+    monkeypatch.setattr(do_backend, "merge_provider_settings", _fake_merge)
+    lab = _central_lab(resolved)
+    images = dispatch.plan_vm_images(lab)
+    assert images is not None
+    assert images["central"] == custom_image_key(ROCKY_URL)
+    assert images["n0"] == DEFAULT_IMAGE
+
+    plan = render_plan(lab, vm_images=images)
+    by_name = {a.name: a for a in plan.actions if a.resource_type == "vm"}
+    assert by_name["central"].details["image"] == custom_image_key(ROCKY_URL)
+    assert f"on {DEFAULT_IMAGE} (" in by_name["n0"].summary
+
+
+def test_plan_vm_images_is_none_for_local_backends(resolved) -> None:
+    local = resolved.model_copy(update={"backend": "local-libvirt"})
+    assert dispatch.plan_vm_images(local) is None
