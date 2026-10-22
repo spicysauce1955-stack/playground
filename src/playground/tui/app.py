@@ -38,6 +38,7 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static
 from playground.backend.dispatch import (
     execute_apply,
     execute_destroy,
+    plan_vm_images,
     query_status,
 )
 from playground.cli.tolerant_validation import validate_tolerant
@@ -202,7 +203,10 @@ class PlaygroundTui(App[None]):
             return
 
         warnings = [d for d in validation_diagnostics if d.severity == "warning"]
-        plan = render_plan(resolved, warnings=warnings)
+        plan = render_plan(
+            resolved, warnings=warnings,
+            vm_images=plan_vm_images(resolved, loaded=loaded),
+        )
         # `_render_lab` never displays `status.devices`, so this passes
         # `include_devices=False` -- the explicit opt-out -- rather than
         # omitting `self.state_dir` (that gates nothing: `state_dir` is

@@ -30,6 +30,13 @@ Diagnostic IDs:
   ``provider_overrides.cloud-digitalocean.size`` that is not a string slug)
 - ``config.backend.do_size_below_resources`` (warning; a VM's effective
   Droplet slug is smaller than its declared vcpu/memory)
+- ``config.backend.do_vm_image_invalid`` (error; a cloud-digitalocean
+  ``image`` that is not a non-empty slug / positive ID, an ``image_url``
+  that is not ``https://``, ``image`` and ``image_url`` on one VM, an
+  ``image_distribution`` that is empty, set without ``image_url``, not a
+  value the OpenTofu provider accepts, or different for VMs sharing a URL)
+- ``config.backend.do_package_upgrade_invalid`` (error; a cloud-digitalocean
+  ``package_upgrade`` that is not a bool, at provider or VM level)
 - ``config.backend.capability_unsupported`` (warning; a VmRole capability
   the chosen backend's ProviderConfig declares ``false``)
 - ``config.network.ip_not_in_cidr`` (per-VM pinned IP outside the lab
@@ -1062,7 +1069,235 @@ def _check_backend_capability(
     diagnostics: list[Diagnostic] = []
     if lab.spec.backend == "cloud-digitalocean":
         diagnostics.extend(_check_do_vm_sizes(lab, loaded, source))
+        diagnostics.extend(_check_do_vm_images(lab, loaded, source))
+        diagnostics.extend(_check_do_package_upgrade(lab, loaded, source))
     diagnostics.extend(_check_heterogeneous_resources(lab, loaded, source))
+    return diagnostics
+
+
+def _do_provider_level(
+    lab: Lab, loaded: LoadedConfig, source: SourceLocation, key: str,
+) -> tuple[bool, Any, SourceLocation, str]:
+    """Where a provider-level ``cloud-digitalocean`` key comes from.
+
+    Returns ``(present, value, source, key_path)``: the lab's
+    ``spec.providers.cloud-digitalocean.<key>`` when the lab sets it (it
+    wins the merge), else the ProviderConfig's ``spec.<key>``.
+    """
+    lab_block = lab.spec.providers.get("cloud-digitalocean")
+    if isinstance(lab_block, dict) and key in lab_block:
+        return True, lab_block[key], source, f"spec.providers.cloud-digitalocean.{key}"
+    provider_cfg = loaded.providers.get("cloud-digitalocean")
+    if provider_cfg is not None:
+        try:
+            spec = provider_cfg.spec.model_dump()
+        except Exception:  # noqa: BLE001
+            spec = {}
+        if key in spec:
+            return (
+                True,
+                spec[key],
+                _source_for(loaded, "ProviderConfig", "cloud-digitalocean"),
+                f"spec.{key}",
+            )
+    return False, None, source, ""
+
+
+def _check_do_vm_images(
+    lab: Lab,
+    loaded: LoadedConfig,
+    source: SourceLocation,
+) -> list[Diagnostic]:
+    """Validate cloud-digitalocean image choices (``config.backend.do_vm_image_invalid``).
+
+    - provider-level ``image`` (lab ``spec.providers`` or the ProviderConfig;
+      ``null`` means unset) and per-VM ``image``: a non-empty string slug or
+      numeric ID, or a positive integer ID;
+    - per-VM ``image_url``: an ``https://`` URL, never together with
+      ``image`` on the same VM;
+    - per-VM ``image_distribution``: a non-empty string, only with
+      ``image_url``, one of the labels the OpenTofu provider accepts (it
+      rejects others before any API call), and the same for every VM that
+      imports the same URL (they share one import).
+
+    A non-mapping override block is reported by :func:`_check_do_vm_sizes`.
+    """
+    # Lazy import: the backend package imports the validator's siblings.
+    from playground.backend.cloud_digitalocean.plan import (
+        DEFAULT_IMAGE_DISTRIBUTION,
+        PROVIDER_IMAGE_DISTRIBUTIONS,
+        normalise_image,
+    )
+
+    diagnostics: list[Diagnostic] = []
+    name = lab.metadata.name
+
+    def invalid(message: str, key_path: str, suggestion: str, src: SourceLocation) -> None:
+        diagnostics.append(
+            Diagnostic(
+                id="config.backend.do_vm_image_invalid",
+                severity="error",
+                message=message,
+                source=src,
+                key_path=key_path,
+                suggestion=suggestion,
+            )
+        )
+
+    image_suggestion = (
+        "use an image slug such as `rockylinux-8-x64` or a positive numeric "
+        "image ID such as `123456789`"
+    )
+    present, raw, src, key_path = _do_provider_level(lab, loaded, source, "image")
+    if present and raw is not None and normalise_image(raw) is None:
+        invalid(
+            f"lab {name!r}: cloud-digitalocean `image` must be a non-empty "
+            f"string slug or a positive integer image ID, got {raw!r}",
+            key_path, image_suggestion, src,
+        )
+
+    url_distribution: dict[str, tuple[str, str]] = {}
+    for idx, vm in enumerate(lab.spec.vms):
+        block = vm.provider_overrides.get("cloud-digitalocean")
+        if not isinstance(block, dict):
+            continue
+        base = f"spec.vms[{idx}].provider_overrides.cloud-digitalocean"
+        who = f"VM {vm.name!r} in lab {name!r}"
+        has_image, has_url = "image" in block, "image_url" in block
+
+        if has_image and normalise_image(block["image"]) is None:
+            invalid(
+                f"{who}: provider_overrides.cloud-digitalocean.image must be a "
+                "non-empty string slug or a positive integer image ID, got "
+                f"{block['image']!r}",
+                f"{base}.image", image_suggestion, source,
+            )
+
+        url: str | None = None
+        if has_url:
+            raw_url = block["image_url"]
+            if isinstance(raw_url, str) and raw_url.strip().lower().startswith("https://") \
+                    and len(raw_url.strip()) > len("https://"):
+                url = raw_url.strip()
+            else:
+                invalid(
+                    f"{who}: provider_overrides.cloud-digitalocean.image_url must "
+                    f"be an https:// URL DigitalOcean can download, got {raw_url!r}",
+                    f"{base}.image_url",
+                    "use the https:// URL of a qcow2/raw/vmdk/vhdx image",
+                    source,
+                )
+
+        if has_image and has_url:
+            invalid(
+                f"{who}: provider_overrides.cloud-digitalocean sets both `image` "
+                "and `image_url`; they are mutually exclusive",
+                base,
+                "keep `image` to boot an existing slug/ID, or `image_url` to "
+                "import a custom image",
+                source,
+            )
+
+        distribution = DEFAULT_IMAGE_DISTRIBUTION
+        if "image_distribution" in block:
+            raw_dist = block["image_distribution"]
+            dist_path = f"{base}.image_distribution"
+            if not (isinstance(raw_dist, str) and raw_dist.strip()):
+                invalid(
+                    f"{who}: provider_overrides.cloud-digitalocean."
+                    f"image_distribution must be a non-empty string, got {raw_dist!r}",
+                    dist_path, "omit it (defaults to `Unknown`) or use e.g. `CentOS`",
+                    source,
+                )
+            elif not has_url:
+                invalid(
+                    f"{who}: provider_overrides.cloud-digitalocean."
+                    "image_distribution only applies to a custom image, but "
+                    "`image_url` is not set",
+                    dist_path, "set `image_url`, or remove `image_distribution`",
+                    source,
+                )
+            elif raw_dist.strip() not in PROVIDER_IMAGE_DISTRIBUTIONS:
+                invalid(
+                    f"{who}: image_distribution {raw_dist!r} is not accepted by "
+                    "the OpenTofu digitalocean provider (it rejects it before "
+                    "any API call, even where the DigitalOcean API would accept "
+                    "it); accepted: " + ", ".join(PROVIDER_IMAGE_DISTRIBUTIONS),
+                    dist_path,
+                    "omit it (defaults to `Unknown`); the label is cosmetic",
+                    source,
+                )
+            else:
+                distribution = raw_dist.strip()
+
+        if url is not None and not has_image:
+            first = url_distribution.setdefault(url, (distribution, vm.name))
+            if first[0] != distribution:
+                invalid(
+                    f"{who}: imports the same image_url as VM {first[1]!r} but "
+                    f"with image_distribution {distribution!r} instead of "
+                    f"{first[0]!r}; VMs sharing a URL share one import",
+                    f"{base}.image_distribution",
+                    "use the same image_distribution (or none) on every VM "
+                    "with this image_url",
+                    source,
+                )
+    return diagnostics
+
+
+def _check_do_package_upgrade(
+    lab: Lab,
+    loaded: LoadedConfig,
+    source: SourceLocation,
+) -> list[Diagnostic]:
+    """``config.backend.do_package_upgrade_invalid``: a non-bool ``package_upgrade``.
+
+    Checked at provider level (lab ``spec.providers`` or the ProviderConfig)
+    and per VM.  A non-mapping override block is reported by
+    :func:`_check_do_vm_sizes`.
+    """
+    diagnostics: list[Diagnostic] = []
+    name = lab.metadata.name
+    suggestion = "use `package_upgrade: false` (or true, the default)"
+
+    present, raw, src, key_path = _do_provider_level(
+        lab, loaded, source, "package_upgrade",
+    )
+    if present and not isinstance(raw, bool):
+        diagnostics.append(
+            Diagnostic(
+                id="config.backend.do_package_upgrade_invalid",
+                severity="error",
+                message=(
+                    f"lab {name!r}: cloud-digitalocean `package_upgrade` must be "
+                    f"true or false, got {raw!r}"
+                ),
+                source=src,
+                key_path=key_path,
+                suggestion=suggestion,
+            )
+        )
+    for idx, vm in enumerate(lab.spec.vms):
+        block = vm.provider_overrides.get("cloud-digitalocean")
+        if not isinstance(block, dict) or "package_upgrade" not in block:
+            continue
+        raw = block["package_upgrade"]
+        if isinstance(raw, bool):
+            continue
+        diagnostics.append(
+            Diagnostic(
+                id="config.backend.do_package_upgrade_invalid",
+                severity="error",
+                message=(
+                    f"VM {vm.name!r} in lab {name!r}: provider_overrides."
+                    "cloud-digitalocean.package_upgrade must be true or false, "
+                    f"got {raw!r}"
+                ),
+                source=source,
+                key_path=f"spec.vms[{idx}].provider_overrides.cloud-digitalocean.package_upgrade",
+                suggestion=suggestion,
+            )
+        )
     return diagnostics
 
 

@@ -20,19 +20,76 @@ resource "digitalocean_vpc" "lab" {
   description = "playground lab ${var.name_prefix}"
 }
 
+# Custom images imported from a URL, one per distinct URL (keyed
+# img-<sha256(url)[:10]>). tofu destroy -- and so suspend -- deletes them;
+# resume re-imports, which takes minutes. The teardown image-sweep catches
+# any left behind.
+resource "digitalocean_custom_image" "lab" {
+  for_each = var.custom_images
+
+  name         = "${var.name_prefix}-${each.key}"
+  url          = each.value.url
+  regions      = [var.region]
+  distribution = each.value.distribution
+  description  = "playground lab ${var.name_prefix}"
+  # Image tags are labels only (the image-sweep matches lab:<lab>); unlike a
+  # firewall's tags they select nothing.
+  tags = var.tags
+
+  # Measured live: importing the Rocky 8.8 GenericCloud qcow2 (1.8 GB
+  # download, 3.06 GB image) took ~17 minutes (NEW -> pending -> available).
+  # Explicit so the wait never depends on the provider's default.
+  timeouts {
+    create = "60m"
+  }
+
+  # DigitalOcean normalises the label it stores (seen live: "Unknown" comes
+  # back as "Unknown OS"), which would plan an in-place update on every
+  # apply -- and make `playground isolate` (firewall-only plans) refuse the
+  # lab. The label is cosmetic, so drift on it is ignored.
+  lifecycle {
+    ignore_changes = [distribution]
+  }
+}
+
 # One Droplet per entry in var.vm_names. The Droplet name is prefixed so
 # resources from multiple concurrent labs are distinct in the DO console.
+#
+# image, ssh_keys and user_data all force replacement: for a VM with no
+# per-VM entries they must evaluate exactly as before those maps existed
+# (var.image, var.ssh_key_fingerprints, and the same rendered cloud-config).
 resource "digitalocean_droplet" "node" {
   count = length(var.vm_names)
 
   name   = "${var.name_prefix}-${var.vm_names[count.index]}"
   region = var.region
   size   = lookup(var.vm_sizes, var.vm_names[count.index], var.size)
-  image  = var.image
+  # The condition only reads input variables, so it is known at plan time
+  # and a VM without a custom image never waits on an unknown image_id.
+  image = (
+    contains(keys(var.vm_custom_images), var.vm_names[count.index])
+    ? tostring(digitalocean_custom_image.lab[var.vm_custom_images[var.vm_names[count.index]]].image_id)
+    : lookup(var.vm_images, var.vm_names[count.index], var.image)
+  )
 
-  # DO-registered keys attached at creation time (optional belt-and-braces;
-  # the cloud-init ssh_authorized_keys injection below is the primary path).
-  ssh_keys = var.ssh_key_fingerprints
+  # DO-registered keys attached at creation time. The cloud-init
+  # ssh_authorized_keys injection below is the primary SSH path; DO itself
+  # requires a key for custom and non-Ubuntu images, which var.vm_ssh_keys
+  # adds per VM (the preflight registers the lab key in the account and
+  # never deletes it: it is shared by every lab, public, and free).
+  ssh_keys = concat(
+    var.ssh_key_fingerprints,
+    lookup(var.vm_ssh_keys, var.vm_names[count.index], []),
+  )
+
+  # ssh_keys only matters at creation, and a change forces replacement. A
+  # lab that predates vm_ssh_keys and already runs a non-ubuntu-* image
+  # (the lab-wide `image` always allowed one) would otherwise lose every
+  # Droplet's disk on its next apply just because the lab key is now
+  # attached. Key changes therefore never replace a running Droplet.
+  lifecycle {
+    ignore_changes = [ssh_keys]
+  }
 
   tags = var.tags
 
@@ -43,10 +100,16 @@ resource "digitalocean_droplet" "node" {
   # Portable cloud-config consumed by cloud-init on first boot. Injects the
   # ubuntu user, SSH key, and hostname/fqdn — identical template variables to
   # the libvirt cloud_init.cfg so the same Ansible roles apply unchanged.
+  # package_upgrade defaults to true; false keeps a pinned point release
+  # (e.g. Rocky 8.8) from being upgraded to the latest minor on first boot.
+  # Every byte of cloud_init.cfg -- comments included -- is part of the
+  # rendered user_data, so editing that file replaces every Droplet;
+  # explain template inputs here instead.
   user_data = templatefile("${path.module}/cloud_init.cfg", {
-    vm_name        = var.vm_names[count.index]
-    dns_domain     = var.dns_domain
-    ssh_public_key = var.ssh_public_key
+    vm_name         = var.vm_names[count.index]
+    dns_domain      = var.dns_domain
+    ssh_public_key  = var.ssh_public_key
+    package_upgrade = lookup(var.vm_package_upgrade, var.vm_names[count.index], true)
   })
 }
 

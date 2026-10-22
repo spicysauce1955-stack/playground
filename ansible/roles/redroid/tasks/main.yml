@@ -23,6 +23,20 @@
 # ashmem_linux was removed from staging in kernels >= 5.18 and Redroid
 # uses memfd instead, so its modprobe is best-effort forever.
 
+# Debian-family only (apt). Fails fast with a message that names the
+# opt-in rather than dying later on a missing apt module.
+- name: Assert the host is Debian-family (this role is apt-based)
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family == 'Debian'
+    fail_msg: >-
+      Role redroid supports only Debian-family hosts (it needs apt and Ubuntu kernel module packages),
+      but VM {{ inventory_hostname }} is {{ ansible_distribution }}
+      {{ ansible_distribution_version }} ({{ ansible_os_family }}). The
+      VM's VmRole opts into the redroid provisioner; remove it from that
+      role's provisioners or run the VM on an Ubuntu image.
+    success_msg: "{{ ansible_distribution }} is supported by redroid"
+
 - name: Probe binder filesystem support in the running kernel
   ansible.builtin.command: grep -qw binder /proc/filesystems
   register: binder_check

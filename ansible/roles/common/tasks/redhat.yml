@@ -1,0 +1,24 @@
+---
+# Rocky/Alma ship no systemd-timesyncd; chronyd is the time daemon
+# (present in the cloud images, ensured here anyway).
+- name: Assert a supported RedHat-family release (8 or 9)
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution_major_version in ['8', '9']
+    fail_msg: >-
+      The common role supports RedHat-family 8 and 9 (Rocky, Alma, RHEL),
+      but VM {{ inventory_hostname }} is {{ ansible_distribution }}
+      {{ ansible_distribution_version }}. EL10 and Fedora are not supported
+      yet (the docker-ce repo path and the EL8 pip pin do not fit them).
+    quiet: true
+
+- name: Install baseline packages
+  ansible.builtin.dnf:
+    name: "{{ common_packages + ['chrony'] }}"
+    state: present
+
+- name: Ensure chronyd is enabled and running
+  ansible.builtin.systemd:
+    name: chronyd
+    state: started
+    enabled: yes
