@@ -548,6 +548,36 @@ def _dump(ctx: _Ctx, st: _Step, vm: str, *, inactive: bool) -> str | None:
     return result.stdout
 
 
+_VANISHED = object()
+"""Sentinel from :func:`_dump_tolerant`: the domain was undefined mid-run."""
+
+
+def _dump_tolerant(ctx: _Ctx, st: _Step, vm: str, *, inactive: bool) -> object | None:
+    """Like :func:`_dump`, but a vanished domain is logged and returns ``_VANISHED``."""
+    args = ["dumpxml", *(["--inactive"] if inactive else []), vm]
+    result = st.virsh(args)
+    if result.returncode == 0:
+        return result.stdout
+    if _has(result, _DOMAIN_NOT_FOUND):
+        st.log(f"{vm}: vanished while scanning; skipped")
+        return _VANISHED
+    _virsh_failed(ctx, st, result, " ".join(args))
+    return None
+
+
+def _filter_bound_live(st: _Step, name: str) -> bool | None:
+    """Is any running port bound to *name*? ``None`` when the query failed."""
+    result = st.virsh(["nwfilter-binding-list"])
+    if result.returncode != 0:
+        st.log("nwfilter-binding-list failed; scanning every running domain instead")
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == name:
+            return True
+    return False
+
+
 def _modes(ctx: _Ctx, vm: str) -> list[tuple[str, bool]]:
     """(update-device flag, dump --inactive?) pairs. Live first: it bites soonest."""
     modes = [("--live", False)] if vm in ctx.running else []
@@ -684,12 +714,26 @@ def _detach(ctx: _Ctx) -> bool:
     name = ctx.filter
     ok = True
     with _step(ctx, "detach-filter") as st:
+        # One cheap host-wide query: if no running port is bound to our
+        # filter, no live dump is needed at all. Unknown (query failed) means
+        # scan everything.
+        bound = _filter_bound_live(st, name)
+        gone: set[str] = set()
         for vm in ctx.present:
             for flag, inactive in _modes(ctx, vm):
-                xml = _dump(ctx, st, vm, inactive=inactive)
-                if xml is None:
+                if vm in gone:
+                    break
+                if not inactive and bound is False:
+                    st.log(f"{vm} {flag}: no live binding to {name} on the host; skip")
+                    continue
+                dumped = _dump_tolerant(ctx, st, vm, inactive=inactive)
+                if dumped is _VANISHED:
+                    gone.add(vm)
+                    continue
+                if dumped is None:
                     ok = False
                     continue
+                xml = str(dumped)
                 carrying = [i for i in network_interfaces(xml) if i.filter == name]
                 if not carrying:
                     st.log(f"{vm} {flag}: no interface carries {name}; skip")
@@ -698,6 +742,10 @@ def _detach(ctx: _Ctx) -> bool:
                     path = ctx.xml_dir / f"detach-{vm}{flag}-{n}.xml"
                     path.write_text(interface_xml_without_filter(iface))
                     result = st.virsh(["update-device", vm, str(path), flag])
+                    if result.returncode != 0 and _has(result, _DOMAIN_NOT_FOUND):
+                        st.log(f"{vm}: vanished before detach; skipped")
+                        gone.add(vm)
+                        break
                     if result.returncode != 0:
                         st.fail()
                         ok = False

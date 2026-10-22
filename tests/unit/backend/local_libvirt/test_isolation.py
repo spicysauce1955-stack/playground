@@ -9,6 +9,7 @@ refused, and ``--live`` on a shut-off domain fails.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
@@ -55,6 +56,7 @@ class FakeLibvirt:
         self.calls: list[list[str]] = []
         self.fail: dict[str, subprocess.CompletedProcess[str]] = {}
         self.prefixes: dict[str, str] = {}
+        self.vanish_on_dump: set[str] = set()
         self.running_list_calls = 0
         self.running_list_hooks: dict[int, object] = {}
 
@@ -113,6 +115,11 @@ class FakeLibvirt:
             )
         if cmd == "dumpxml":
             vm = args[-1]
+            if vm in self.vanish_on_dump:
+                self.vanish_on_dump.discard(vm)
+                self.cfg.pop(vm, None)
+                self.live.pop(vm, None)
+                self.running.discard(vm)
             if vm not in self.cfg:
                 return _cp(1, err="error: failed to get domain\nerror: Domain not found")
             if "--inactive" in args:
@@ -147,6 +154,15 @@ class FakeLibvirt:
             return _cp()
         if cmd == "update-device":
             return self._update(args)
+        if cmd == "nwfilter-binding-list":
+            rows = [
+                f"{(e.find('target') if e.find('target') is not None else e).get('dev', 'vnet?')}  "
+                f"{e.find('filterref').get('filter')}"  # type: ignore[union-attr]
+                for ifaces in self.live.values()
+                for e in ifaces
+                if e.find("filterref") is not None
+            ]
+            return _cp(out="\n".join(["Port Dev  Filter", "-" * 20, *rows]) + "\n")
         if cmd == "nwfilter-binding-dumpxml":
             dev = args[1]
             for ifaces in self.live.values():
@@ -228,7 +244,36 @@ def _connect(resolved, fake, tmp_path):
 
 def test_filter_name_sanitizes() -> None:
     assert filter_name("fleet") == "playground-isolate-fleet"
-    assert filter_name("my lab/x") == "playground-isolate-my-lab-x"
+    name = filter_name("my lab/x")
+    assert name.startswith("playground-isolate-my-lab-x-")
+    assert re.fullmatch(r"[0-9a-f]{8}", name.rsplit("-", 1)[1])
+
+
+@pytest.mark.parametrize("lab", ["fleet", "generic-infra", "a_b.c-1", "Lab9"])
+def test_filter_name_safe_names_unchanged(lab: str) -> None:
+    assert filter_name(lab) == f"playground-isolate-{lab}"
+
+
+def test_filter_name_colliding_sanitisations_differ() -> None:
+    labs = ["my lab", "my-lab", "my/lab", "my lab ", "myélab"]
+    names = [filter_name(lab) for lab in labs]
+    assert len(set(names)) == len(labs)
+    assert filter_name("my-lab") == "playground-isolate-my-lab"
+    for n in names:
+        assert re.fullmatch(r"[A-Za-z0-9_.-]+", n)
+        assert n.startswith("playground-isolate-")
+        assert filter_name(labs[names.index(n)]) == n  # deterministic
+
+
+def test_remove_filter_uses_hashed_name() -> None:
+    seen: list[list[str]] = []
+
+    def run(args):  # type: ignore[no-untyped-def]
+        seen.append(list(args))
+        return _cp()
+
+    assert remove_isolation_filter("my lab", virsh=run) == []
+    assert seen == [["nwfilter-undefine", filter_name("my lab")]]
 
 
 def test_render_filter_rules_and_priorities() -> None:
@@ -745,6 +790,47 @@ def test_connect_tolerates_missing_domains(resolved, tmp_path) -> None:
         ifaces.pop("router1", None)
     run, diags = _connect(resolved, fake, tmp_path)
     assert run.status == "succeeded", diags
+
+
+def test_connect_tolerates_domain_vanishing_mid_scan(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=ALL_RUNNING)
+    _isolate(resolved, fake, tmp_path)
+    # Vanishes between `list` and `dumpxml` (another lab undefining it).
+    fake.vanish_on_dump.add("router1")
+    run, diags = _connect(resolved, fake, tmp_path)
+    assert run.status == "succeeded", diags
+    assert not any(d.severity == "error" for d in diags)
+    assert FILTER not in fake.filters
+    for vm in ("node1", "docker1"):
+        assert set(fake.filter_refs(vm, live=True)) == {None}
+        assert set(fake.filter_refs(vm, live=False)) == {None}
+
+
+def test_connect_other_dump_failure_still_fails(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=ALL_RUNNING)
+    _isolate(resolved, fake, tmp_path)
+    fake.fail["dumpxml --inactive router1"] = _cp(1, err="error: internal error: boom")
+    run, diags = _connect(resolved, fake, tmp_path)
+    assert run.status == "failed"
+    assert any(d.id == "runtime.connect.virsh_failed" for d in diags)
+
+
+def test_connect_skips_live_dumps_when_nothing_bound(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=ALL_RUNNING)
+    fake.calls.clear()
+    run, _ = _connect(resolved, fake, tmp_path)
+    assert run.status == "succeeded"
+    assert ["nwfilter-binding-list"] in fake.calls
+    assert not [c for c in fake.calls if c[0] == "dumpxml" and "--inactive" not in c]
+
+
+def test_connect_falls_back_to_live_scan_when_binding_list_fails(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=ALL_RUNNING)
+    _isolate(resolved, fake, tmp_path)
+    fake.fail["nwfilter-binding-list"] = _cp(1, err="error: boom")
+    run, diags = _connect(resolved, fake, tmp_path)
+    assert run.status == "succeeded", diags
+    assert set(fake.filter_refs("node1", live=True)) == {None}
 
 
 def test_connect_leaves_foreign_filters_alone(resolved, tmp_path) -> None:

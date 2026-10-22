@@ -21,6 +21,7 @@ the host does not work while isolated; use an SSH tunnel instead.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 import xml.etree.ElementTree as ET
@@ -45,8 +46,18 @@ PRIO_DROP_REST = 900
 
 
 def filter_name(lab_name: str) -> str:
-    """``playground-isolate-<lab>`` with characters libvirt may dislike replaced."""
-    return FILTER_PREFIX + _UNSAFE.sub("-", lab_name)
+    """``playground-isolate-<lab>``; unchanged for lab names that are already safe.
+
+    Characters libvirt may dislike are replaced by ``-``. Because that is
+    lossy (``my lab`` and ``my-lab`` would collide), a sanitised name gets
+    ``-<first 8 hex of sha256(lab name)>`` appended so distinct labs never
+    share (and then undefine) one filter.
+    """
+    safe = _UNSAFE.sub("-", lab_name)
+    if safe == lab_name:
+        return FILTER_PREFIX + safe
+    digest = hashlib.sha256(lab_name.encode("utf-8")).hexdigest()[:8]
+    return f"{FILTER_PREFIX}{safe}-{digest}"
 
 
 def _dedupe(items: list[str]) -> list[str]:
