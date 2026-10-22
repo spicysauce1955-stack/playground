@@ -161,22 +161,17 @@ def _refuse_if_isolated(
     return [lab_isolated_diagnostic(verb, lab, record)]
 
 
-# A failed isolate normally keeps its record (fail closed: some VMs may be
-# filtered). These diagnostics prove the backend stopped before changing
-# anything, so the record is cleared instead of wedging the lab behind the
-# apply guard.
-_NOTHING_CHANGED_SUFFIXES = frozenset(
-    {".not_provisioned", ".needs_reapply", ".token_missing"}
-)
-_NOTHING_CHANGED_IDS = frozenset({"runtime.isolate.virsh_missing"})
+# Steps that mutate enforcement. A failed isolate that never ran one of these
+# changed nothing, whatever the exit codes of the other steps:
+#   - local-libvirt (local_libvirt/isolation.py): ``attach-filter``
+#   - cloud-digitalocean (cloud_digitalocean/isolation.py): ``tofu-apply``
+# Preflight, init, plan and plan-time refusals (unexpected_changes, token
+# missing, not provisioned, ...) all precede them.
+_MUTATING_STEPS = frozenset({"attach-filter", "tofu-apply"})
 
 
-def _nothing_changed(diagnostics: list[Diagnostic]) -> bool:
-    return any(
-        d.id in _NOTHING_CHANGED_IDS
-        or d.id.endswith(tuple(_NOTHING_CHANGED_SUFFIXES))
-        for d in diagnostics
-    )
+def _nothing_changed(run: OperationRun) -> bool:
+    return not any(step.name in _MUTATING_STEPS for step in run.steps)
 
 
 def execute_apply(
@@ -305,6 +300,13 @@ def execute_resume(
     return None, [verb_not_supported_diagnostic("resume", resolved.backend)]
 
 
+def _had_record(state_dir: Path, lab: str) -> bool:
+    try:
+        return read_isolation(state_dir, lab) is not None
+    except OSError:
+        return True  # unreadable: assume isolated, clean up the filter
+
+
 def _after_teardown(
     resolved: ResolvedLab,
     state_dir: Path,
@@ -319,8 +321,9 @@ def _after_teardown(
     """
     if run is None or run.status == "failed":
         return diagnostics
+    had_record = _had_record(state_dir, resolved.lab_name)
     clear_isolation(state_dir, resolved.lab_name)
-    if resolved.backend == LIBVIRT:
+    if resolved.backend == LIBVIRT and had_record:
         try:
             diagnostics = [
                 *diagnostics,
@@ -345,6 +348,22 @@ def _after_teardown(
                 ),
             ]
     return diagnostics
+
+
+def _partial_diagnostic(state_dir: Path, lab: str) -> Diagnostic:
+    return Diagnostic(
+        id="runtime.isolate.partially_isolated",
+        severity="warning",
+        message=(
+            f"isolate failed; lab {lab!r} may be partially isolated and "
+            "is still guarded against apply"
+        ),
+        source=SourceLocation(path=str(state_dir / "isolation")),
+        suggestion=(
+            f"run `playground connect {lab}` to undo, or "
+            f"`playground isolate {lab}` to retry"
+        ),
+    )
 
 
 def execute_isolate(
@@ -372,6 +391,19 @@ def execute_isolate(
 
     lab = resolved.lab_name
     cidrs = [n.cidr for n in resolved.networks]
+    try:
+        prior = read_isolation(state_dir, lab)
+    except OSError as exc:
+        return None, [Diagnostic(
+            id="runtime.isolate.record_write_failed",
+            severity="error",
+            message=(
+                f"could not read the isolation record for lab {lab!r}: {exc}; "
+                "not isolating, because the existing record must not be lost"
+            ),
+            source=SourceLocation(path=str(state_dir / "isolation")),
+            suggestion="fix permissions on the state directory and retry",
+        )]
     try:
         write_isolation(state_dir, IsolationRecord(
             lab=lab, backend=resolved.backend, isolated_at=now_iso(),
@@ -419,22 +451,20 @@ def execute_isolate(
             )]
         return run, diagnostics
 
-    if _nothing_changed(diagnostics):
+    changed = not _nothing_changed(run)
+    if prior is not None:
+        # The previous isolation is still in force: leave the record as it
+        # was before this run.
+        try:
+            write_isolation(state_dir, prior)
+        except OSError:
+            pass  # the overwriting "isolating" record still guards
+        if changed:
+            diagnostics = [*diagnostics, _partial_diagnostic(state_dir, lab)]
+    elif not changed:
         clear_isolation(state_dir, lab)
     else:
-        diagnostics = [*diagnostics, Diagnostic(
-            id="runtime.isolate.partially_isolated",
-            severity="warning",
-            message=(
-                f"isolate failed; lab {lab!r} may be partially isolated and "
-                "is still guarded against apply"
-            ),
-            source=SourceLocation(path=str(state_dir / "isolation")),
-            suggestion=(
-                f"run `playground connect {lab}` to undo, or "
-                f"`playground isolate {lab}` to retry"
-            ),
-        )]
+        diagnostics = [*diagnostics, _partial_diagnostic(state_dir, lab)]
     return run, diagnostics
 
 

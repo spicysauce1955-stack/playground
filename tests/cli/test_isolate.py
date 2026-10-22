@@ -14,14 +14,28 @@ from playground.cli import main as cli_main
 from playground.cli.main import app
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.runs import OperationRun
+from playground.runs.operation import StepResult
 from playground.state.isolation import IsolationRecord, read_isolation, write_isolation
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
 
 
-def _run(op: Any, lab: str, status: Any = "succeeded") -> OperationRun:
+def _run(
+    op: Any, lab: str, status: Any = "succeeded", steps: list[str] | None = None,
+) -> OperationRun:
+    # Failed isolate runs default to having reached the mutating step.
+    if steps is None:
+        steps = ["attach-filter"] if (op == "isolate" and status == "failed") else []
     return OperationRun(
+        steps=[
+            StepResult(
+                name=n, command=[n], exit_code=1, log_path="x",
+                started_at="2026-01-01T00:00:00+00:00",
+                finished_at="2026-01-01T00:00:01+00:00",
+            )
+            for n in steps
+        ],
         run_id=f"20260101T000000Z-{op}-{lab}", operation=op, lab=lab,
         status=status, started_at="2026-01-01T00:00:00+00:00",
         finished_at="2026-01-01T00:00:01+00:00",
@@ -169,6 +183,10 @@ def test_destroy_surfaces_filter_cleanup_warnings(
         return _run("destroy", kwargs["resolved"].lab_name), []
 
     monkeypatch.setattr(local_libvirt, "execute_destroy", fake_destroy)
+    write_isolation(tmp_path / "state", IsolationRecord(
+        lab="generic-infra", backend="local-libvirt",
+        isolated_at="2026-01-01T00:00:00+00:00", lab_cidrs=[], run_id="r0",
+    ))
     monkeypatch.setattr(
         local_libvirt, "remove_isolation_filter",
         lambda lab: [Diagnostic(
@@ -244,3 +262,70 @@ def test_teardown_proceeds_despite_do_validator_errors(
     assert result.exit_code == 0, result.output
     assert seen == [verb]
     assert "do_single_network" in result.output  # still reported, as a warning
+
+
+def test_suspend_surfaces_diagnostics_on_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import json
+
+    from playground.backend import cloud_digitalocean as do_backend
+
+    warn = Diagnostic(
+        id="runtime.suspend.orphaned_vpc", severity="warning",
+        message="vpc left behind", source=SourceLocation(path="x"),
+    )
+    monkeypatch.setattr(
+        do_backend, "execute_suspend",
+        lambda **kw: (_run("suspend", kw["resolved"].lab_name), [warn]),
+    )
+    args = ["suspend", "cloud-smoke", "--config-dir", str(CONFIG_DIR),
+            "--state-dir", str(tmp_path / "state")]
+    human = CliRunner().invoke(app, args)
+    assert human.exit_code == 0, human.output
+    assert "vpc left behind" in human.output
+    js = CliRunner().invoke(app, [*args, "-o", "json"])
+    assert js.exit_code == 0, js.output
+    payload = json.loads(js.stdout)
+    assert [d["id"] for d in payload["diagnostics"]] == ["runtime.suspend.orphaned_vpc"]
+
+
+def test_read_only_verbs_tolerate_do_validator_errors_but_apply_does_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    config_dir = _do_config_with_legacy_lab(tmp_path)
+    base = ["--config-dir", str(config_dir), "--state-dir", str(tmp_path / "state")]
+    for argv in (
+        ["status", "cloud-smoke"],
+        ["status"],
+        ["exec", "cloud-smoke", "--on", "pg-node-1", "--", "true"],
+        ["connect", "cloud-smoke"],
+        ["isolate", "cloud-smoke"],
+    ):
+        result = CliRunner().invoke(app, [*argv[:2], *base, *argv[2:]]
+                                    if len(argv) > 1 else [*argv, *base])
+        assert "do_single_network" in result.output, (argv, result.output)
+        assert "config.validation" not in result.output
+        # a warning, not a blocking error
+        assert "error: config.network.do_single_network" not in result.output, argv
+    strict = CliRunner().invoke(app, ["apply", "cloud-smoke", *base])
+    assert strict.exit_code == 1
+    assert "do_single_network" in strict.output
+
+
+def test_libvirt_isolate_failure_before_attach_keeps_prior_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Re-isolate of a live record failing early must not clear it (CLI path)."""
+    monkeypatch.setattr(
+        local_libvirt, "execute_isolate",
+        lambda **kw: (_run("isolate", kw["resolved"].lab_name, "failed", steps=[]), []),
+    )
+    state = tmp_path / "state"
+    write_isolation(state, IsolationRecord(
+        lab="generic-infra", backend="local-libvirt",
+        isolated_at="2026-01-01T00:00:00+00:00", lab_cidrs=[], run_id="r0",
+    ))
+    _invoke("isolate", "generic-infra", tmp_path)
+    rec = read_isolation(state, "generic-infra")
+    assert rec is not None and rec.run_id == "r0" and rec.state == "isolated"

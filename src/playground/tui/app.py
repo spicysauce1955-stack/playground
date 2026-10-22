@@ -40,13 +40,13 @@ from playground.backend.dispatch import (
     execute_destroy,
     query_status,
 )
+from playground.cli.tolerant_validation import validate_tolerant
 from playground.config.loader import load_config
 from playground.config.resolver import resolve_lab
 from playground.events import EventBus, OperationEvent
 from playground.models.diagnostic import Diagnostic
 from playground.planner import render_plan
 from playground.runs import OperationRun
-from playground.validation import validate as validate_loaded_config
 
 
 class _ConfirmScreen(ModalScreen[bool]):
@@ -190,7 +190,7 @@ class PlaygroundTui(App[None]):
 
     def _render_lab(self, name: str) -> None:
         loaded, parse_diagnostics = load_config(self.config_dir)
-        validation_diagnostics = validate_loaded_config(loaded)
+        validation_diagnostics = validate_tolerant(loaded)
         if name not in loaded.labs:
             self._set_detail(f"Lab {name!r} disappeared from disk.")
             return

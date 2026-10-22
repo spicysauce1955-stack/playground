@@ -39,6 +39,7 @@ from playground.backend.local_libvirt import (
 from playground.cli.app_commands import app_app
 from playground.cli.capture_commands import capture_app
 from playground.cli.device_commands import _write_profile, device_app
+from playground.cli.tolerant_validation import validate_tolerant
 from playground.config.loader import LoadedConfig, load_config
 from playground.config.resolver import resolve_lab
 from playground.devices.adb import AttachedDevice, list_attached
@@ -228,7 +229,7 @@ def list_labs(
     """List configured labs."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded))
+        diagnostics.extend(validate_tolerant(loaded))
     _exit_on_errors(diagnostics, output, json_errors=False)
     # lab list is a whole-config overview, so keep the provisioning warning.
     _print_warnings(diagnostics, keep_provisioning=True)
@@ -269,7 +270,7 @@ def show_lab(
     """Show a resolved lab definition."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=name))
+        diagnostics.extend(validate_tolerant(loaded, lab=name))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1041,7 +1042,7 @@ def exec_command(
 
     loaded, diagnostics = _load_config_or_exit(config_dir, OutputFormat.human)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, OutputFormat.human, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1215,7 +1216,7 @@ def adb_command(
     # firewall rule: the cloud backend deliberately opens port 22 only.
     loaded, diagnostics = _load_config_or_exit(config_dir, OutputFormat.human)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, OutputFormat.human, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1505,7 +1506,7 @@ def cp_command(
 
     loaded, diagnostics = _load_config_or_exit(config_dir, OutputFormat.human)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab_name))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab_name))
     _exit_on_errors(diagnostics, OutputFormat.human, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1640,7 +1641,7 @@ def status_command(
     """Show observed state of ``lab`` — or every lab when ``lab`` is omitted."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1741,28 +1742,6 @@ def _render_status_human(status: LabStatus) -> None:
                 )
 
 
-# Validator errors that only guard NEW applies. Teardown must still run on a lab
-# that predates them (main-era DO lab with 2 networks, out-of-range CIDR), or it
-# would keep billing with no way to stop it.
-_TEARDOWN_DOWNGRADED_IDS = frozenset(
-    {
-        "config.network.do_single_network",
-        "config.network.do_vpc_cidr_invalid",
-        "config.backend.do_vm_size_invalid",
-    }
-)
-
-
-def _validate_for_teardown(loaded: LoadedConfig, lab: str) -> list[Diagnostic]:
-    """Validate for destroy/suspend/reset: apply-only DO errors become warnings."""
-    return [
-        d.model_copy(update={"severity": "warning"})
-        if d.severity == "error" and d.id in _TEARDOWN_DOWNGRADED_IDS
-        else d
-        for d in validate_loaded_config(loaded, lab=lab)
-    ]
-
-
 @app.command("destroy")
 def destroy_command(
     lab: Annotated[str, typer.Argument(help="Lab name to tear down.")],
@@ -1789,7 +1768,7 @@ def destroy_command(
     """Destroy ``lab``: render the same vars apply uses, then `tofu destroy`."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(_validate_for_teardown(loaded, lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1873,7 +1852,7 @@ def reset_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(_validate_for_teardown(loaded, lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1944,7 +1923,7 @@ def suspend_command(
     """
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(_validate_for_teardown(loaded, lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 
@@ -1973,9 +1952,14 @@ def suspend_command(
         raise typer.Exit(code=1)
 
     if output is OutputFormat.json:
-        _print_json(finished.model_dump(mode="json", exclude_none=True))
+        payload = finished.model_dump(mode="json", exclude_none=True)
+        if diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in diagnostics]
+        _print_json(payload)
         return
 
+    if diagnostics:
+        _print_diagnostics(diagnostics, err=True)
     typer.echo(f"suspended lab {lab!r}")
     typer.echo("  note: Droplets were destroyed to stop billing; disk state is not preserved")
     typer.echo(f"  run: {finished.run_id}")
@@ -2157,7 +2141,7 @@ def _run_isolation_verb(
     """Shared body of ``isolate`` / ``connect`` (modelled on ``suspend``)."""
     loaded, diagnostics = _load_config_or_exit(config_dir, output)
     if not _has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     _exit_on_errors(diagnostics, output, json_errors=False)
     _print_warnings(diagnostics)
 

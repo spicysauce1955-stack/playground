@@ -53,9 +53,9 @@ from playground.android.transport import (
     require_guest,
 )
 from playground.backend.dispatch import query_status
+from playground.cli.tolerant_validation import validate_tolerant
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.ssh.argv import build_scp_argv, build_ssh_argv
-from playground.validation import validate as validate_loaded_config
 
 
 def _main() -> Any:  # noqa: ANN401 - deferred cross-module import, see module docstring
@@ -170,7 +170,7 @@ def _resolve(
         config_dir, cli_main.OutputFormat.human
     )
     if not cli_main._has_errors(diagnostics):
-        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+        diagnostics.extend(validate_tolerant(loaded, lab=lab))
     cli_main._exit_on_errors(diagnostics, cli_main.OutputFormat.human, json_errors=False)
     cli_main._print_warnings(diagnostics)
 

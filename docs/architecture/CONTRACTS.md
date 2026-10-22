@@ -958,11 +958,12 @@ without calling the backend.
 
 | Event | Record |
 | --- | --- |
-| `isolate` starts | written as `isolating` (overwritten on re-isolate) |
+| `isolate` starts | the prior record (if any) is read first, then `isolating` is written (overwritten on re-isolate) |
 | `isolate` run `succeeded` | updated to `isolated` (new run id and time); an update failure is only a warning (`runtime.isolate.record_update_failed`), the `isolating` record still guards |
-| `isolate` run `failed` | kept (lab may be partially isolated; warning `runtime.isolate.partially_isolated` names `connect` / `isolate`), EXCEPT cleared when a diagnostic proves nothing changed: id ending `.not_provisioned`, `.needs_reapply`, `.token_missing`, or `runtime.isolate.virsh_missing` |
+| `isolate` run `failed`, no prior record | cleared when the run contains no mutating step (`attach-filter` on libvirt, `tofu-apply` on DO; whatever the exit codes), so preflight / init / plan / plan-time refusals change nothing; otherwise kept as `isolating` (lab may be partially isolated; warning `runtime.isolate.partially_isolated` names `connect` / `isolate`) |
+| `isolate` run `failed`, prior record | the prior record is restored exactly as it was (the previous isolation is still in force); `partially_isolated` is only added when a mutating step ran |
 | `connect` run `succeeded` | cleared |
-| `destroy` / `reset` / `suspend` run not `failed` | cleared (the resources carrying the enforcement are gone; resume is a fresh, connected apply) |
+| `destroy` / `reset` / `suspend` run not `failed` | cleared (the resources carrying the enforcement are gone; resume is a fresh, connected apply); on libvirt the nwfilter is removed only if a record existed before the teardown |
 | `connect` / `destroy` / `reset` / `suspend` run `failed` | untouched |
 
 An unreadable (corrupt) record counts as isolated: the guard must fail

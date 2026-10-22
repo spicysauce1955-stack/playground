@@ -14,6 +14,7 @@ from playground.config.resolver import resolve_lab
 from playground.events import EventBus
 from playground.models.diagnostic import Diagnostic, SourceLocation
 from playground.runs import OperationRun
+from playground.runs.operation import StepResult
 from playground.state.isolation import (
     IsolationRecord,
     read_isolation,
@@ -72,7 +73,10 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
     def make(backend: str, verb: str):
         def fake(**kwargs: Any):
             rec.log.append((backend, verb, kwargs))
-            return _run(verb, kwargs["resolved"].lab_name, rec.status), []
+            run = _run(verb, kwargs["resolved"].lab_name, rec.status)
+            if verb == "isolate" and rec.status == "failed":
+                run = _with_steps(run, "attach-filter", "tofu-apply")
+            return run, []
         return fake
 
     for verb in ("apply", "isolate", "connect", "destroy", "reset"):
@@ -166,28 +170,96 @@ def test_isolate_prewrite_failure_aborts_without_calling_backend(
     assert calls.verbs() == []
 
 
+def _failed(lab: str, *steps: str) -> OperationRun:
+    return _with_steps(_run("isolate", lab, "failed"), *steps)
+
+
+def _with_steps(run: OperationRun, *steps: str) -> OperationRun:
+    return run.model_copy(update={"steps": [
+        StepResult(
+            name=n, command=[n], exit_code=1, log_path="x",
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+        )
+        for n in steps
+    ]})
+
+
 @pytest.mark.parametrize(
-    "diag_id",
+    ("lab", "backend_mod", "step"),
     [
-        "runtime.isolate.not_provisioned",
-        "runtime.isolate.needs_reapply",
-        "runtime.cloud.token_missing",
-        "runtime.isolate.virsh_missing",
+        (LIBVIRT_LAB, local_libvirt, "attach-filter"),
+        (DO_LAB, cloud_digitalocean, "tofu-apply"),
     ],
 )
-def test_isolate_failure_with_nothing_changed_clears_record(
-    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch, diag_id: str,
+def test_isolate_failure_without_mutating_step_clears_new_record(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
+    lab: str, backend_mod: Any, step: str,
 ) -> None:
     monkeypatch.setattr(
-        local_libvirt, "execute_isolate",
-        lambda **kw: (_run("isolate", LIBVIRT_LAB, "failed"), [_warn(diag_id)]),
+        backend_mod, "execute_isolate",
+        lambda **kw: (_failed(lab, "preflight", "tofu-plan"), [_warn("x.fail")]),
     )
     run, diags = dispatch.execute_isolate(
-        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, bus=EventBus(),
+        resolved=_resolved(lab), state_dir=tmp_path, bus=EventBus(),
     )
     assert run is not None and run.status == "failed"
-    assert read_isolation(tmp_path, LIBVIRT_LAB) is None
+    assert read_isolation(tmp_path, lab) is None
     assert all(d.id != "runtime.isolate.partially_isolated" for d in diags)
+
+
+@pytest.mark.parametrize(
+    ("lab", "backend_mod", "step"),
+    [
+        (LIBVIRT_LAB, local_libvirt, "attach-filter"),
+        (DO_LAB, cloud_digitalocean, "tofu-apply"),
+    ],
+)
+def test_isolate_failure_after_mutating_step_keeps_isolating(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
+    lab: str, backend_mod: Any, step: str,
+) -> None:
+    monkeypatch.setattr(
+        backend_mod, "execute_isolate",
+        lambda **kw: (_failed(lab, "preflight", step), []),
+    )
+    _, diags = dispatch.execute_isolate(
+        resolved=_resolved(lab), state_dir=tmp_path, bus=EventBus(),
+    )
+    rec = read_isolation(tmp_path, lab)
+    assert rec is not None and rec.state == "isolating"
+    assert "runtime.isolate.partially_isolated" in [d.id for d in diags]
+
+
+@pytest.mark.parametrize("steps", [[], ["attach-filter"]])
+def test_reisolate_failure_restores_prior_isolated_record(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch,
+    steps: list[str],
+) -> None:
+    prior = _record(LIBVIRT_LAB, "local-libvirt")
+    write_isolation(tmp_path, prior)
+    monkeypatch.setattr(
+        local_libvirt, "execute_isolate",
+        lambda **kw: (_failed(LIBVIRT_LAB, *steps), []),
+    )
+    _, diags = dispatch.execute_isolate(
+        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path, bus=EventBus(),
+    )
+    assert read_isolation(tmp_path, LIBVIRT_LAB) == prior
+    partial = "runtime.isolate.partially_isolated" in [d.id for d in diags]
+    assert partial == bool(steps)
+
+
+def test_teardown_of_never_isolated_lab_skips_filter_removal(
+    tmp_path: Path, calls: Calls,
+) -> None:
+    run, diags = dispatch.execute_destroy(
+        resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path,
+        tofu_dir=Path("t"), bus=EventBus(),
+    )
+    assert run is not None and run.status == "succeeded"
+    assert ("libvirt", "remove_filter") not in calls.verbs()
+    assert diags == []
 
 
 def test_isolate_success_record_update_failure_keeps_guard(
@@ -392,6 +464,7 @@ def test_filter_cleanup_exception_becomes_warning(
         raise NotImplementedError
 
     monkeypatch.setattr(local_libvirt, "remove_isolation_filter", boom)
+    write_isolation(tmp_path, _record(LIBVIRT_LAB, "local-libvirt"))
     run, diags = dispatch.execute_destroy(
         resolved=_resolved(LIBVIRT_LAB), state_dir=tmp_path,
         tofu_dir=Path("t"), bus=EventBus(),
