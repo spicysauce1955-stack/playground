@@ -447,10 +447,27 @@ class _CloudInitResult:
 
 
 CLOUD_INIT_WAIT_COMMAND = (
-    "if sudo -n true 2>/dev/null; then sudo -n cloud-init status --wait; "
-    "else cloud-init status --wait; fi"
+    "s() { if sudo -n true 2>/dev/null; then sudo -n cloud-init status --wait; "
+    "else cloud-init status --wait; fi; }; "
+    "i=0; while :; do "
+    "{ err=$(s 2>&1 1>&3); } 3>&1; rc=$?; "
+    "case $err in *Traceback*) i=$((i+1)); "
+    "if [ $i -lt 30 ]; then sleep 10; continue; fi;; esac; "
+    "printf '%s' \"$err\" >&2; exit $rc; done"
 )
-"""Remote command for the cloud-init gate; see ``_wait_cloud_init``."""
+"""Remote command for the cloud-init gate; see ``_wait_cloud_init``.
+
+``cloud-init status --wait`` runs under ``sudo -n`` when passwordless sudo
+works (Rocky 8's cloud-init 23.4 crashes with exit 1 when ``status`` runs
+as a non-root user), with the plain form as the fallback. A *crash of the
+status command itself* (a Python traceback on stderr) is retried every
+10 s, up to 30 times, instead of being reported as cloud-init's verdict:
+seen live on a stock Rocky 8.10 Droplet, the first-boot ``dnf upgrade``
+re-executes systemd, ``status`` dies on the D-Bus disconnect while
+cloud-init is still running, and the gate used to let Ansible race the
+upgrade. stdout passes through; stderr is captured to look for the
+traceback and re-emitted on exit.
+"""
 
 
 def _wait_cloud_init(

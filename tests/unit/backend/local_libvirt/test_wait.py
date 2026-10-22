@@ -369,6 +369,65 @@ def test_wait_cloud_init_passes_ssh_options(
     assert "else cloud-init status --wait" in cmd
 
 
+_FAKE_CLOUD_INIT = """#!/bin/bash
+n=$(cat "$STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STATE"
+case "$MODE" in
+  crash2) if [ $n -le 2 ]; then echo "Traceback (most recent call last):" >&2; exit 1; fi
+          echo "status: done"; exit 0;;
+  error) echo "status: error"; echo "a module failed" >&2; exit 1;;
+  degraded) echo "status: done"; exit 2;;
+  crashforever) echo "Traceback (most recent call last):" >&2; exit 1;;
+esac
+"""
+
+
+@pytest.mark.parametrize(
+    "mode,rc,calls,stdout,stderr",
+    [
+        # A crash of `status` itself (seen live: systemd re-exec during a
+        # Rocky 8.10 first-boot dnf upgrade) is retried, not reported.
+        ("crash2", 0, 3, "status: done", ""),
+        # cloud-init's own verdicts pass straight through, first call.
+        ("error", 1, 1, "status: error", "a module failed"),
+        ("degraded", 2, 1, "status: done", ""),
+        # A crash that never clears gives up after 30 tries with its stderr.
+        ("crashforever", 1, 30, "", "Traceback"),
+    ],
+)
+def test_cloud_init_wait_command_retries_only_status_crashes(
+    tmp_path: Path, mode: str, rc: int, calls: int, stdout: str, stderr: str,
+) -> None:
+    """Run the real remote command under bash against fake binaries."""
+    import os
+    import shutil
+
+    if shutil.which("bash") is None:
+        pytest.skip("needs bash")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "cloud-init").write_text(_FAKE_CLOUD_INIT)
+    (bindir / "sudo").write_text('#!/bin/bash\n[ "$1" = -n ] && shift; exec "$@"\n')
+    for tool in bindir.iterdir():
+        tool.chmod(0o755)
+    state = tmp_path / "calls"
+    command = wait_mod.CLOUD_INIT_WAIT_COMMAND.replace("sleep 10", "sleep 0")
+    assert command != wait_mod.CLOUD_INIT_WAIT_COMMAND
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "STATE": str(state),
+        "MODE": mode,
+    }
+    result = subprocess.run(
+        ["bash", "-c", command], capture_output=True, text=True, env=env,
+        timeout=60, check=False,
+    )
+    assert result.returncode == rc
+    assert int(state.read_text()) == calls
+    assert result.stdout.strip() == stdout
+    assert stderr in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # SSH auth readiness gate (the vbox NAT-port-forward fix)
 # ---------------------------------------------------------------------------
