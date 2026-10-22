@@ -135,6 +135,8 @@ playground runs list                             # browse past operations
 playground runs show <run-id>                    # inspect events.jsonl timeline
 playground destroy generic-infra                 # tear down via tofu
 playground reset generic-infra                   # scrub-by-name when destroy fails
+playground isolate generic-infra                 # cut VM egress outside the lab network (libvirt, DigitalOcean)
+playground connect generic-infra                 # undo isolate; required before re-apply
 playground tui                                   # Textual UI over everything above
 ```
 

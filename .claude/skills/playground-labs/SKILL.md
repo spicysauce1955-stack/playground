@@ -68,6 +68,8 @@ playground destroy generic-infra
 | `playground destroy <lab>` | `tofu destroy` the lab. | Clean teardown when apply state is consistent. |
 | `playground suspend <lab>` | (cloud backends only) Destroy Droplets to stop billing; config preserved. | Pausing a cloud lab to cut costs; disk state is NOT preserved. |
 | `playground resume <lab>` | (cloud backends only) Rebuild Droplets from config after a suspend. | Resuming a suspended cloud lab. |
+| `playground isolate <lab>` | (local-libvirt, cloud-digitalocean) Cut lab VM egress to anything outside the lab's own networks; VM-to-VM and SSH from this machine keep working. Idempotent. | Running untrusted/offline workloads. libvirt drops (outside connections time out) and also drops guest DNS via the lab gateway, so use IPs. `apply`/`resume` refuse an isolated lab. |
+| `playground connect <lab>` | Undo `isolate`. Idempotent; fine on a never-isolated lab. | Before re-running `apply`; then `isolate` again. |
 | `playground reset <lab>` | Scrub-by-name (works even when tofu state is corrupted). | When `destroy` fails or state is wedged. |
 | `playground runs list` | Past `apply` / `destroy` runs. | After a failed run, to find the run id. |
 | `playground runs show <id>` | One run's steps, exit codes, log paths. | Diagnosing why a run failed. |
@@ -191,7 +193,8 @@ consumer agent will hit:
 | `runtime.apply.verify_failed` | Apply succeeded but the post-verify probe found something off (warning-only — the lab is still up). | Investigate; lab may still be usable. |
 | `runtime.apply.not_idempotent` | Apply twice changed state on the second pass. | Report to the platform team — likely a role bug. |
 | `runtime.backend.unsupported` | The lab's `spec.backend` value isn't a backend you have installed. | Pick a different lab or install the backend. |
-| `runtime.backend.verb_not_supported` | `suspend`/`resume` called on a local backend (local-libvirt or local-vbox). | Use `destroy`/`apply` instead; suspend/resume are cloud-only. |
+| `runtime.backend.verb_not_supported` | `suspend`/`resume` called on a local backend, or `isolate`/`connect` called on local-vbox. | Use `destroy`/`apply` instead (suspend/resume are cloud-only); isolation is libvirt and DigitalOcean only. |
+| `runtime.apply.lab_isolated` | `apply`/`resume` on an egress-isolated lab. | `playground connect <lab>`, then apply, then `isolate` again. |
 | `runtime.doctor.cloud_token_missing` | `$DIGITALOCEAN_TOKEN` not set when using `cloud-digitalocean`. | `export DIGITALOCEAN_TOKEN=<token>` and re-run. |
 | `config.reference.*` | YAML refers to something that doesn't exist (role, network, command). | Fix the lab YAML, re-validate. |
 | `config.backend.tcg_mode_slow` | Lab opts into TCG (qemu) mode — boots 10-100× slower. | Expect long apply, raise `wait_*_timeout_seconds` if needed. |

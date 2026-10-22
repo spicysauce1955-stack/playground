@@ -866,6 +866,115 @@ resolve the serial through the registry or refuse
 (`config.device.note_serial_required`): writing it under the profile
 name produced a note that was saved and then permanently invisible.
 
+## Lab egress isolation (isolate / connect)
+
+`playground isolate <lab>` cuts, after provisioning, every lab VM's egress
+to anything outside the lab's own network(s); `playground connect <lab>`
+undoes it. The cut is enforced OUTSIDE the guests (a VM cannot undo it) and
+holds across a DHCP renewal and a reboot. Implemented for `local-libvirt`
+and `cloud-digitalocean`; `local-vbox` is unsupported.
+
+### Intent (backend-neutral)
+
+- **Blocked:** TCP/UDP/ICMP from lab VMs to anything outside the lab
+  networks: the internet, the cloud metadata service (see the DO caveat
+  below), and DNS forwarded to outside resolvers. A lookup of an outside
+  name from a VM must fail.
+- **Kept:** all VM-to-VM traffic on any port, and SSH from this machine to
+  every VM (`exec` / `cp` / SSH tunnels / `adb`).
+
+### Dispatch, not backend, owns the record
+
+`backend/dispatch.py` routes `execute_isolate` / `execute_connect` (same
+kwarg style as the other verbs; `tofu_dir` / `config_dir` are accepted for
+a uniform signature and unused). Backend entry points live in
+`local_libvirt/isolation.py` and `cloud_digitalocean/isolation.py`, take
+`(resolved, state_dir, bus)`, never raise, and return an `OperationRun`
+(`operation` = `isolate` / `connect`) plus diagnostics under
+`runtime.isolate.*` / `runtime.connect.*`. **They never read or write the
+isolation record**; dispatch does.
+
+The record is `<state_dir>/isolation/<lab>.json`
+(`state/isolation.py`: `lab`, `backend`, `isolated_at` ISO UTC,
+`lab_cidrs`, `run_id`), written atomically:
+
+| Event | Record |
+| --- | --- |
+| `isolate` run `succeeded` | written (overwritten on re-isolate) |
+| `connect` run `succeeded` | cleared |
+| `destroy` / `reset` / `suspend` run not `failed` | cleared (the resources carrying the enforcement are gone; resume is a fresh, connected apply) |
+| any run `failed` | untouched |
+
+An unreadable (corrupt) record counts as isolated: the guard must fail
+closed. A failed record write is only a warning
+(`runtime.isolate.record_write_failed`), because the isolation itself
+succeeded; the consequence is that `apply` is no longer refused.
+
+### The apply guard: `runtime.apply.lab_isolated`
+
+`execute_apply` and `execute_resume` return `(None, [error])` while the
+record exists, before any backend code runs. The suggestion names
+`playground connect <lab>`. Reasons: Ansible needs internet, and
+re-rendering the DO tfvars must never silently reopen egress. The
+operator workflow is `connect`, `apply`, `isolate`. The CLI and TUI
+already treat a `None` run as "pre-flight rejected", so no extra
+presentation code is needed. The guard is backend-independent (it also
+covers `local-vbox`, which can never have a record).
+
+### Idempotency
+
+`isolate` on an already-isolated lab succeeds; `connect` on a lab that was
+never isolated succeeds. `isolate` on an unprovisioned lab fails with
+`runtime.isolate.not_provisioned`.
+
+### local-vbox: unsupported
+
+Both verbs return `(None, [runtime.backend.verb_not_supported])`.
+`verb_not_supported_diagnostic` has a dedicated wording for these verbs
+(no egress-isolation mechanism implemented); its suspend/resume wording
+("only cloud backends do") must not be reused for them.
+
+### DNS caveat (local-libvirt)
+
+While isolated, guest DNS queries to the lab gateway (libvirt's dnsmasq)
+are dropped: dnsmasq forwards upstream and libvirt cannot switch that off
+on a live network. Consequence: lab-internal names served by dnsmasq
+also stop resolving while isolated; use IPs or `extra_hosts`. VM-to-VM DNS
+(a VM running its own resolver) is not blocked.
+
+### Drop, not reject (local-libvirt)
+
+The nwfilter rules sit at the ebtables layer (`<ip>` / `<ipv6>` rules),
+which can only DROP. iptables-level nwfilter rules were avoided on
+purpose (they need `br_netfilter`, which is not guaranteed). Outside
+connections therefore time out instead of failing fast. The CLI says so.
+
+### Backend: local-libvirt (isolation)
+
+- Mechanism: a libvirt nwfilter `playground-isolate-<lab>` referenced from
+  every lab VM interface, enforced by libvirtd on the host (no sudo, no
+  host nftables) and persisted in the domain config, so it survives VM
+  and host reboots.
+- `destroy` / `reset` call `local_libvirt.remove_isolation_filter(lab)`
+  best-effort after a non-failed run; its warnings are surfaced by the
+  CLI and never fail the teardown.
+- TODO(lead): fill in the exact rule set, filter-refresh/UUID handling
+  and the binding verification from the libvirt slice.
+
+### Backend: cloud-digitalocean (isolation)
+
+- Mechanism: the lab Cloud Firewall's outbound rules switch from
+  `0.0.0.0/0, ::/0` to the lab VPC CIDR, driven by the tofu variable
+  `egress_isolated` (default false) so HCL and tofu state stay the single
+  source of truth. DO firewalls are stateful, so replies to inbound SSH
+  still flow.
+- **UNVERIFIED:** whether DO Cloud Firewalls filter the metadata service
+  (`169.254.169.254`). Do not claim the metadata service is blocked until
+  it has been tested live.
+- TODO(lead): fill in the VPC/inbound-rule details, the tfvars flip, the
+  API verification step and the pre-existing-lab upgrade note from the
+  DO networking slice.
+
 ## Cross-layer pitfalls (things future-you will hit)
 
 These are the gotchas we've already paid for. Each one cost
@@ -1169,6 +1278,8 @@ at the "fetch-vm-ips" step with a clear error. Always keep `outputs.tf`'s
 - A new step is added to `execute_apply` (write its contract here).
 - A new diagnostic ID prefix is introduced (link from the table
   in `docs/system_overview.md`).
+- A new verb mutates per-lab state outside a backend (the isolation
+  record is the model: dispatch owns it, backends do not).
 - A new third-party tool joins the pipeline (record its defaults
   and gotchas under the pitfalls section).
 - A bug surfaces that fits the recurring pattern but isn't on

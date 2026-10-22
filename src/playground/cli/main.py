@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import sys
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NamedTuple, NoReturn
@@ -19,7 +20,9 @@ from playground.backend.dispatch import (
     SUPPORTED_BACKENDS,
     estimate_cost,
     execute_apply,
+    execute_connect,
     execute_destroy,
+    execute_isolate,
     execute_reset,
     execute_resume,
     execute_suspend,
@@ -1795,9 +1798,14 @@ def destroy_command(
             _print_diagnostics(release_diagnostics, err=True)
 
     if output is OutputFormat.json:
-        _print_json(finished.model_dump(mode="json", exclude_none=True))
+        payload = finished.model_dump(mode="json", exclude_none=True)
+        if diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in diagnostics]
+        _print_json(payload)
         return
 
+    if diagnostics:
+        _print_diagnostics(diagnostics, err=True)
     typer.echo(f"destroyed lab {lab!r}")
     typer.echo(f"  run: {finished.run_id}")
     typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
@@ -2033,6 +2041,149 @@ def resume_command(
     typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
     for step in finished.steps:
         typer.echo(f"  {step.name}: exit {step.exit_code} (log {step.log_path})")
+
+
+@app.command("isolate")
+def isolate_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to isolate.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Cut ``lab``'s egress: lab VMs can reach only the lab's own networks.
+
+    Blocks TCP/UDP/ICMP from the lab VMs to anything outside the lab's
+    networks (internet, cloud metadata, outside DNS) while VM-to-VM traffic
+    and SSH from this machine keep working. Enforced outside the guests, so
+    it survives a reboot or DHCP renewal. Idempotent.
+
+    On local-libvirt the cut is a libvirt nwfilter that DROPS packets
+    (outside connections time out rather than fail fast) and also drops
+    guest DNS to the lab gateway, so lab-internal names stop resolving; use
+    IPs. On cloud-digitalocean the lab Cloud Firewall's outbound rules are
+    narrowed to the lab VPC CIDR. ``apply`` / ``resume`` refuse an isolated
+    lab; run ``playground connect`` first. ``local-vbox`` is not supported.
+    """
+    _run_isolation_verb(
+        "isolate", execute_isolate, lab, config_dir, tofu_dir, state_dir, output,
+    )
+
+
+@app.command("connect")
+def connect_command(
+    lab: Annotated[str, typer.Argument(help="Lab name to reconnect.")],
+    config_dir: Annotated[
+        Path,
+        typer.Option("--config-dir", "-c", help="Config directory to load."),
+    ] = Path("config"),
+    tofu_dir: Annotated[
+        Path,
+        typer.Option("--tofu-dir", help="OpenTofu working directory."),
+    ] = Path("tofu"),
+    state_dir: Annotated[
+        Path,
+        typer.Option(
+            "--state-dir",
+            help="Where generated state lives. Defaults to `.playground/`.",
+        ),
+    ] = Path(".playground"),
+    output: Annotated[
+        OutputFormat,
+        typer.Option("--output", "-o", help="Output format for status reporting."),
+    ] = OutputFormat.human,
+) -> None:
+    """Undo ``isolate``: restore ``lab``'s normal egress. Idempotent.
+
+    Succeeds on a lab that was never isolated. ``local-vbox`` is not
+    supported.
+    """
+    _run_isolation_verb(
+        "connect", execute_connect, lab, config_dir, tofu_dir, state_dir, output,
+    )
+
+
+def _run_isolation_verb(
+    verb: str,
+    runner: Callable[..., tuple[OperationRun | None, list[Diagnostic]]],
+    lab: str,
+    config_dir: Path,
+    tofu_dir: Path,
+    state_dir: Path,
+    output: OutputFormat,
+) -> None:
+    """Shared body of ``isolate`` / ``connect`` (modelled on ``suspend``)."""
+    loaded, diagnostics = _load_config_or_exit(config_dir, output)
+    if not _has_errors(diagnostics):
+        diagnostics.extend(validate_loaded_config(loaded, lab=lab))
+    _exit_on_errors(diagnostics, output, json_errors=False)
+    _print_warnings(diagnostics)
+
+    resolved = _resolve_lab_or_exit(loaded, lab, config_dir, output)
+    _exit_if_unsupported_backend(resolved, output)
+
+    bus = EventBus()
+    finished, diagnostics = runner(
+        resolved=resolved,
+        state_dir=state_dir,
+        tofu_dir=tofu_dir,
+        bus=bus,
+        config_dir=config_dir,
+    )
+
+    if finished is None:
+        # Backend does not support the verb (local-vbox): nothing ran.
+        if _has_errors(diagnostics):
+            _exit_on_errors(diagnostics, output, json_errors=False)
+        _print_warnings(diagnostics)
+        raise typer.Exit(code=1)
+
+    if finished.status == "failed":
+        _present_apply_failure(output, finished, diagnostics, state_dir)
+        raise typer.Exit(code=1)
+
+    if output is OutputFormat.json:
+        payload = finished.model_dump(mode="json", exclude_none=True)
+        if diagnostics:
+            payload["diagnostics"] = [_diagnostic_to_dict(d) for d in diagnostics]
+        _print_json(payload)
+        return
+
+    if diagnostics:
+        _print_diagnostics(diagnostics, err=True)
+    if verb == "isolate":
+        cidrs = ", ".join(n.cidr for n in resolved.networks) or "(none)"
+        typer.echo(f"isolated lab {lab!r}")
+        typer.echo(
+            f"  cut: egress from lab VMs to anything outside the lab "
+            f"network(s) {cidrs}"
+        )
+        typer.echo("  kept: VM-to-VM traffic and SSH from this machine")
+        if resolved.backend == "local-libvirt":
+            typer.echo(
+                "  note: outside connections are dropped, not rejected, so "
+                "they time out; guest DNS via the lab gateway is dropped too"
+            )
+        typer.echo(f"  undo: playground connect {lab}")
+    else:
+        typer.echo(f"connected lab {lab!r}: egress restored")
+    typer.echo(f"  run: {finished.run_id}")
+    typer.echo(f"  record: {state_dir / 'runs' / finished.run_id / 'run.json'}")
 
 
 def _present_apply_failure(

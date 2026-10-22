@@ -34,6 +34,13 @@ from playground.models.resolved import ResolvedDevice, ResolvedLab
 from playground.models.status import DeviceStatus, LabStatus
 from playground.planner.plan import CostEstimate
 from playground.runs import OperationRun
+from playground.state.isolation import (
+    IsolationRecord,
+    clear_isolation,
+    now_iso,
+    read_isolation,
+    write_isolation,
+)
 
 if TYPE_CHECKING:
     from playground.config.loader import LoadedConfig
@@ -64,12 +71,31 @@ def unsupported_backend_diagnostic(backend: str) -> Diagnostic:
     )
 
 
+_ISOLATION_VERBS = ("isolate", "connect")
+
+
 def verb_not_supported_diagnostic(verb: str, backend: str) -> Diagnostic:
     """Return an error diagnostic for a verb that is not supported by ``backend``.
 
-    Used by :func:`execute_suspend` and :func:`execute_resume` when called
-    with a local backend that has no concept of suspend/resume.
+    Used by :func:`execute_suspend` / :func:`execute_resume` when called with
+    a local backend that has no concept of suspend/resume, and by
+    :func:`execute_isolate` / :func:`execute_connect` for a backend with no
+    egress-isolation mechanism (``local-vbox``).
     """
+    if verb in _ISOLATION_VERBS:
+        return Diagnostic(
+            id="runtime.backend.verb_not_supported",
+            severity="error",
+            message=(
+                f"backend {backend!r} does not support {verb!r} "
+                "(no egress-isolation mechanism is implemented for it)"
+            ),
+            source=SourceLocation(path="config"),
+            suggestion=(
+                "egress isolation is available on local-libvirt and "
+                "cloud-digitalocean labs only"
+            ),
+        )
     return Diagnostic(
         id="runtime.backend.verb_not_supported",
         severity="error",
@@ -86,6 +112,33 @@ def verb_not_supported_diagnostic(verb: str, backend: str) -> Diagnostic:
     )
 
 
+def lab_isolated_diagnostic(verb: str, lab: str, record: IsolationRecord) -> Diagnostic:
+    """Error for a ``verb`` (apply / resume) refused on an isolated lab."""
+    return Diagnostic(
+        id="runtime.apply.lab_isolated",
+        severity="error",
+        message=(
+            f"lab {lab!r} is egress-isolated (since {record.isolated_at}); "
+            f"refusing to {verb}: provisioning needs internet access and a "
+            "re-render must not silently reopen egress"
+        ),
+        source=SourceLocation(path="config"),
+        suggestion=(
+            f"run `playground connect {lab}` first, then `playground {verb} "
+            f"{lab}`, then `playground isolate {lab}` again"
+        ),
+    )
+
+
+def _refuse_if_isolated(
+    verb: str, resolved: ResolvedLab, state_dir: Path,
+) -> list[Diagnostic] | None:
+    record = read_isolation(state_dir, resolved.lab_name)
+    if record is None:
+        return None
+    return [lab_isolated_diagnostic(verb, resolved.lab_name, record)]
+
+
 def execute_apply(
     *,
     resolved: ResolvedLab,
@@ -95,6 +148,9 @@ def execute_apply(
     config_dir: Path,
     bus: EventBus,
 ) -> tuple[OperationRun | None, list[Diagnostic]]:
+    refusal = _refuse_if_isolated("apply", resolved, state_dir)
+    if refusal is not None:
+        return None, refusal
     if resolved.backend == VBOX:
         return local_vbox.execute_apply(
             resolved=resolved, state_dir=state_dir,
@@ -122,18 +178,20 @@ def execute_destroy(
     config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     if resolved.backend == VBOX:
-        return local_vbox.execute_destroy(
+        run, diagnostics = local_vbox.execute_destroy(
             resolved=resolved, state_dir=state_dir, bus=bus,
         )
-    if resolved.backend == DIGITALOCEAN:
-        return cloud_digitalocean.execute_destroy(
+    elif resolved.backend == DIGITALOCEAN:
+        run, diagnostics = cloud_digitalocean.execute_destroy(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
             config_dir=config_dir,
         )
-    # CLI guards unsupported backends before here; libvirt is the default.
-    return local_libvirt.execute_destroy(
-        resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
-    )
+    else:
+        # CLI guards unsupported backends before here; libvirt is the default.
+        run, diagnostics = local_libvirt.execute_destroy(
+            resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
+        )
+    return run, _after_teardown(resolved, state_dir, run, diagnostics)
 
 
 def execute_reset(
@@ -145,17 +203,19 @@ def execute_reset(
     config_dir: Path | None = None,
 ) -> tuple[OperationRun, list[Diagnostic]]:
     if resolved.backend == VBOX:
-        return local_vbox.execute_reset(
+        run, diagnostics = local_vbox.execute_reset(
             resolved=resolved, state_dir=state_dir, bus=bus,
         )
-    if resolved.backend == DIGITALOCEAN:
-        return cloud_digitalocean.execute_reset(
+    elif resolved.backend == DIGITALOCEAN:
+        run, diagnostics = cloud_digitalocean.execute_reset(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
             config_dir=config_dir,
         )
-    return local_libvirt.execute_reset(
-        resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
-    )
+    else:
+        run, diagnostics = local_libvirt.execute_reset(
+            resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
+        )
+    return run, _after_teardown(resolved, state_dir, run, diagnostics)
 
 
 def execute_suspend(
@@ -172,10 +232,11 @@ def execute_suspend(
     ``diag.id`` will be ``"runtime.backend.verb_not_supported"``.
     """
     if resolved.backend == DIGITALOCEAN:
-        return cloud_digitalocean.execute_suspend(
+        run, diagnostics = cloud_digitalocean.execute_suspend(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir, bus=bus,
             config_dir=config_dir,
         )
+        return run, _after_teardown(resolved, state_dir, run, diagnostics)
     return None, [verb_not_supported_diagnostic("suspend", resolved.backend)]
 
 
@@ -194,11 +255,142 @@ def execute_resume(
     ``diag.id`` will be ``"runtime.backend.verb_not_supported"``.
     """
     if resolved.backend == DIGITALOCEAN:
+        refusal = _refuse_if_isolated("resume", resolved, state_dir)
+        if refusal is not None:
+            return None, refusal
         return cloud_digitalocean.execute_resume(
             resolved=resolved, state_dir=state_dir, tofu_dir=tofu_dir,
             ansible_dir=ansible_dir, config_dir=config_dir, bus=bus,
         )
     return None, [verb_not_supported_diagnostic("resume", resolved.backend)]
+
+
+def _after_teardown(
+    resolved: ResolvedLab,
+    state_dir: Path,
+    run: OperationRun | None,
+    diagnostics: list[Diagnostic],
+) -> list[Diagnostic]:
+    """Post-teardown bookkeeping shared by destroy / reset / suspend.
+
+    After a non-failed run the resources carrying the isolation are gone, so
+    the record is cleared. For local-libvirt the host-level nwfilter is also
+    removed best-effort; its warnings are appended, never fatal.
+    """
+    if run is None or run.status == "failed":
+        return diagnostics
+    clear_isolation(state_dir, resolved.lab_name)
+    if resolved.backend == LIBVIRT:
+        try:
+            diagnostics = [
+                *diagnostics,
+                *local_libvirt.remove_isolation_filter(resolved.lab_name),
+            ]
+        except Exception as exc:  # noqa: BLE001 -- best-effort, must not fail teardown
+            diagnostics = [
+                *diagnostics,
+                Diagnostic(
+                    id="runtime.destroy.isolation_filter_cleanup_failed",
+                    severity="warning",
+                    message=(
+                        f"could not remove the isolation nwfilter for lab "
+                        f"{resolved.lab_name!r}: {exc}"
+                    ),
+                    source=SourceLocation(path="config"),
+                    suggestion=(
+                        "inspect with `virsh nwfilter-list` and remove any "
+                        f"leftover `playground-isolate-{resolved.lab_name}` "
+                        "filter with `virsh nwfilter-undefine`"
+                    ),
+                ),
+            ]
+    return diagnostics
+
+
+def execute_isolate(
+    *,
+    resolved: ResolvedLab,
+    state_dir: Path,
+    bus: EventBus,
+    tofu_dir: Path | None = None,
+    config_dir: Path | None = None,
+) -> tuple[OperationRun | None, list[Diagnostic]]:
+    """Cut the lab's egress outside its own networks (post-provision).
+
+    ``tofu_dir`` / ``config_dir`` are accepted for a uniform signature with
+    the other dispatch verbs and are unused. Writes the isolation record
+    after a succeeded run. Returns ``(None, [diag])`` for ``local-vbox``
+    (``runtime.backend.verb_not_supported``).
+    """
+    if resolved.backend == LIBVIRT:
+        run, diagnostics = local_libvirt.execute_isolate(
+            resolved=resolved, state_dir=state_dir, bus=bus,
+        )
+    elif resolved.backend == DIGITALOCEAN:
+        run, diagnostics = cloud_digitalocean.execute_isolate(
+            resolved=resolved, state_dir=state_dir, bus=bus,
+        )
+    elif resolved.backend == VBOX:
+        return None, [verb_not_supported_diagnostic("isolate", resolved.backend)]
+    else:
+        return None, [unsupported_backend_diagnostic(resolved.backend)]
+
+    if run.status == "succeeded":
+        record = IsolationRecord(
+            lab=resolved.lab_name,
+            backend=resolved.backend,
+            isolated_at=now_iso(),
+            lab_cidrs=[n.cidr for n in resolved.networks],
+            run_id=run.run_id,
+        )
+        try:
+            write_isolation(state_dir, record)
+        except OSError as exc:
+            diagnostics = [
+                *diagnostics,
+                Diagnostic(
+                    id="runtime.isolate.record_write_failed",
+                    severity="warning",
+                    message=(
+                        f"lab {resolved.lab_name!r} is isolated but the "
+                        f"isolation record could not be written: {exc}"
+                    ),
+                    source=SourceLocation(path=str(state_dir / "isolation")),
+                    suggestion=(
+                        "apply will not be refused for this lab until the "
+                        "record exists; run `playground connect` before any "
+                        "apply"
+                    ),
+                ),
+            ]
+    return run, diagnostics
+
+
+def execute_connect(
+    *,
+    resolved: ResolvedLab,
+    state_dir: Path,
+    bus: EventBus,
+    tofu_dir: Path | None = None,
+    config_dir: Path | None = None,
+) -> tuple[OperationRun | None, list[Diagnostic]]:
+    """Undo :func:`execute_isolate`; clears the record after a succeeded run."""
+    if resolved.backend == LIBVIRT:
+        run, diagnostics = local_libvirt.execute_connect(
+            resolved=resolved, state_dir=state_dir, bus=bus,
+        )
+    elif resolved.backend == DIGITALOCEAN:
+        run, diagnostics = cloud_digitalocean.execute_connect(
+            resolved=resolved, state_dir=state_dir, bus=bus,
+        )
+    elif resolved.backend == VBOX:
+        return None, [verb_not_supported_diagnostic("connect", resolved.backend)]
+    else:
+        return None, [unsupported_backend_diagnostic(resolved.backend)]
+
+    if run.status == "succeeded":
+        clear_isolation(state_dir, resolved.lab_name)
+    return run, diagnostics
 
 
 def query_status(
@@ -412,11 +604,14 @@ __all__ = [
     "VBOX",
     "estimate_cost",
     "execute_apply",
+    "execute_connect",
     "execute_destroy",
+    "execute_isolate",
     "execute_reset",
     "execute_resume",
     "execute_suspend",
     "is_supported",
+    "lab_isolated_diagnostic",
     "plan_provider_summary",
     "query_status",
     "unsupported_backend_diagnostic",
