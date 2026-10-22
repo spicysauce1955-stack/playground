@@ -2082,7 +2082,8 @@ def isolate_command(
     IPs. On cloud-digitalocean the lab Cloud Firewall's outbound rules are
     narrowed to the lab's own droplets (the cloud metadata service
     169.254.169.254 stays reachable: Cloud Firewalls do not filter it).
-    ``apply`` / ``resume`` refuse an isolated lab; run ``playground connect`` first. ``local-vbox`` is not supported.
+    ``apply`` / ``resume`` refuse an isolated lab; run ``playground connect``
+    first. ``local-vbox`` is not supported.
     """
     _run_isolation_verb(
         "isolate", execute_isolate, lab, config_dir, tofu_dir, state_dir, output,
