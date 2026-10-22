@@ -85,6 +85,11 @@ class Fakes:
         self.api_ok = True
         self.var_at_apply: bool | None = None
         self.var_file: Path | None = None
+        self.droplets: list[dict[str, Any]] = [
+            {"id": 111, "name": f"{LAB}-node1", "tags": ["playground", f"lab:{LAB}"]},
+        ]
+        self.firewalls: list[dict[str, Any]] = []
+        self.listing_ok = True
 
 
 @pytest.fixture
@@ -111,6 +116,15 @@ def fakes(monkeypatch: pytest.MonkeyPatch) -> Fakes:
         # Mimic the real thing: the firewall reflects what apply just set.
         return _fw(bool(f.var_at_apply)) if f.api is None else f.api[0], [], True
 
+    def list_droplets(token, tag):
+        assert tag == f"lab:{LAB}"
+        return list(f.droplets), [], f.listing_ok
+
+    def list_fws(token):
+        return list(f.firewalls), [], f.listing_ok
+
+    monkeypatch.setattr(iso, "list_droplets_by_tag", list_droplets)
+    monkeypatch.setattr(iso, "list_firewalls", list_fws)
     monkeypatch.setattr(iso, "run_tofu_init", run_init)
     monkeypatch.setattr(iso, "run_tofu_apply", run_apply)
     monkeypatch.setattr(iso, "find_firewall", find_firewall)
@@ -335,3 +349,65 @@ def test_apply_uses_the_per_lab_var_file_as_an_absolute_path(
 ) -> None:
     _run(execute_isolate, resolved, state_dir)
     assert fakes.var_file is not None and fakes.var_file.is_absolute()
+
+
+# ---- foreign firewalls (DO unions allow rules across firewalls) -------------
+
+
+def _foreign(name: str = "sibling-fw", *, isolated: bool = False, **target: Any) -> dict[str, Any]:
+    fw = _fw(isolated)
+    fw.update({"name": name, "id": f"id-{name}", "droplet_ids": [], "tags": []})
+    fw.update(target)
+    return fw
+
+
+def test_sibling_lab_firewall_tagged_playground_defeats_isolate(resolved, state_dir, fakes) -> None:
+    fakes.firewalls = [_foreign("sibling-fw", tags=["playground"])]
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.isolate.foreign_firewall"]
+    assert "sibling-fw" in diags[0].message and "id-sibling-fw" in diags[0].message
+    assert diags[0].suggestion
+
+
+def test_foreign_firewall_attached_by_droplet_id_fails(resolved, state_dir, fakes) -> None:
+    fakes.firewalls = [_foreign("by-id", droplet_ids=[111])]
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert diags[0].id == "runtime.isolate.foreign_firewall"
+
+
+def test_unrelated_firewall_is_ignored(resolved, state_dir, fakes) -> None:
+    fakes.firewalls = [
+        _foreign("elsewhere", droplet_ids=[999], tags=["other-project"]),
+        _foreign("us", tags=["playground"]),  # own name is skipped below
+    ]
+    fakes.firewalls[1]["name"] = f"{LAB}-fw"
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "succeeded" and diags == []
+
+
+def test_foreign_firewall_that_is_also_vpc_only_is_fine(resolved, state_dir, fakes) -> None:
+    fakes.firewalls = [_foreign("narrow", isolated=True, tags=["playground"])]
+    run, _ = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "succeeded"
+
+
+def test_foreign_firewall_with_no_outbound_rules_is_fine(resolved, state_dir, fakes) -> None:
+    fakes.firewalls = [_foreign("deny", tags=["playground"], outbound_rules=[])]
+    run, _ = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "succeeded"
+
+
+def test_foreign_check_inconclusive_when_listing_fails(resolved, state_dir, fakes) -> None:
+    fakes.listing_ok = False
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert diags[0].id == "runtime.isolate.verify_failed"
+
+
+def test_connect_does_not_check_foreign_firewalls(resolved, state_dir, fakes) -> None:
+    fakes.firewalls = [_foreign("sibling-fw", tags=["playground"])]
+    fakes.listing_ok = False
+    run, _ = _run(execute_connect, resolved, state_dir)
+    assert run.status == "succeeded"

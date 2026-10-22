@@ -56,7 +56,11 @@ resource "digitalocean_droplet" "node" {
   })
 }
 
-# Single firewall shared by all Droplets in the lab, matched by tag.
+# Single firewall shared by all Droplets in the lab, attached by droplet_ids
+# ONLY. Do NOT set `tags` here: on DigitalOcean a firewall's tags SELECT the
+# Droplets it applies to, and var.tags carries the account-wide `playground`
+# tag, so it would apply this lab's rules to every other lab's Droplets (and
+# DO unions allow rules across firewalls, defeating egress isolation).
 # Inbound: SSH from local.ssh_inbound, plus all TCP/UDP/ICMP from the lab VPC
 # CIDR (VM-to-VM on any port). The VPC CIDR is used rather than source_tags
 # because it is exactly the set the isolated outbound rule can still reach.
@@ -64,7 +68,6 @@ resource "digitalocean_droplet" "node" {
 # apt/docker registries, or VPC-only while the lab is isolated).
 resource "digitalocean_firewall" "lab" {
   name = "${var.name_prefix}-fw"
-  tags = var.tags
 
   # Attach to every Droplet in this lab by ID so the firewall tracks new
   # Droplets created in subsequent applies.

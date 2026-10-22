@@ -41,7 +41,7 @@ variable "ssh_key_fingerprints" {
 }
 
 variable "tags" {
-  description = "Ownership tags applied to every Droplet and the firewall. Used by status / suspend / destroy to tag-sweep for orphaned, still-billing resources."
+  description = "Ownership tags applied to every Droplet (NOT the firewall: firewall tags select targets). Used by status / suspend / destroy to tag-sweep for orphaned, still-billing resources."
   type        = list(string)
   default     = []
 }

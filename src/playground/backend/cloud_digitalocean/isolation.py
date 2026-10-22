@@ -29,6 +29,8 @@ from typing import Any
 
 from playground.backend.cloud_digitalocean.do import (
     find_firewall,
+    list_droplets_by_tag,
+    list_firewalls,
     read_token,
     token_env_name,
 )
@@ -218,7 +220,7 @@ def _set_egress(
     started = _iso_now()
     verify_diags = _verify_firewall(
         operation=operation, isolated=isolated, token=token,
-        firewall_name=f"{lab}-fw", cidr=cidr, log_path=verify_log,
+        firewall_name=f"{lab}-fw", cidr=cidr, log_path=verify_log, lab=lab,
     )
     steps.append(_step("verify-firewall", exit_code=1 if verify_diags else 0,
                        log_path=verify_log, started=started))
@@ -376,6 +378,85 @@ def outbound_is_open(firewall: dict[str, Any]) -> bool:
     )
 
 
+def grants_egress_beyond(firewall: dict[str, Any], cidr: str) -> bool:
+    """True when any outbound rule allows a destination other than ``cidr``."""
+    for rule in firewall.get("outbound_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        dest = _destinations(rule)
+        if set(dest.get("addresses") or []) - {cidr}:
+            return True
+        for extra in ("droplet_ids", "tags", "load_balancer_uids", "kubernetes_ids"):
+            if dest.get(extra):
+                return True
+    return False
+
+
+def _check_foreign_firewalls(
+    *,
+    operation: str,
+    token: str,
+    lab: str,
+    own_name: str,
+    cidr: str,
+    log_path: Path,
+) -> list[Diagnostic]:
+    """Fail if ANY other firewall applying to a lab Droplet grants wider egress.
+
+    DigitalOcean unions allow rules across the firewalls attached to a
+    Droplet, so one foreign firewall with open egress silently defeats
+    isolation.  A firewall applies to a Droplet by ``droplet_ids`` or by a
+    ``tags`` overlap with the Droplet's tags.
+    """
+    droplets, _, d_ok = list_droplets_by_tag(token, f"lab:{lab}")
+    firewalls, _, f_ok = list_firewalls(token)
+    if not (d_ok and f_ok):
+        with log_path.open("a") as fh:
+            fh.write("INCONCLUSIVE: could not enumerate Droplets/firewalls\n")
+        return [Diagnostic(
+            id=f"runtime.{operation}.verify_failed",
+            severity="error",
+            message=(
+                "could not enumerate the account's firewalls and the lab's Droplets "
+                "to rule out another firewall granting outside egress; do not rely "
+                "on isolation"
+            ),
+            source=SourceLocation(path="DigitalOcean API"),
+            suggestion=f"re-run `playground {operation}` once the API is reachable",
+        )]
+    lab_ids = {str(d.get("id")) for d in droplets}
+    lab_tags = {t for d in droplets for t in (d.get("tags") or [])}
+    diags: list[Diagnostic] = []
+    for fw in firewalls:
+        if fw.get("name") == own_name:
+            continue
+        applies = bool(lab_ids & {str(i) for i in (fw.get("droplet_ids") or [])}) or bool(
+            lab_tags & set(fw.get("tags") or [])
+        )
+        if not applies or not grants_egress_beyond(fw, cidr):
+            continue
+        fw_name, fw_id = fw.get("name"), fw.get("id")
+        with log_path.open("a") as fh:
+            fh.write(f"FOREIGN firewall {fw_name!r} (id={fw_id}) grants wider egress\n")
+        diags.append(Diagnostic(
+            id=f"runtime.{operation}.foreign_firewall",
+            severity="error",
+            message=(
+                f"firewall {fw_name!r} (id={fw_id}) also applies to lab {lab!r} "
+                f"Droplets and allows outbound beyond {cidr}; DigitalOcean unions "
+                "allow rules, so the lab is NOT isolated"
+            ),
+            source=SourceLocation(path=f"firewall/{fw_id}"),
+            suggestion=(
+                "remove or narrow that firewall in "
+                "https://cloud.digitalocean.com/networking/firewalls, or re-apply "
+                "the lab that owns it with current code (older code tagged firewalls "
+                "with the account-wide `playground` tag)"
+            ),
+        ))
+    return diags
+
+
 def _verify_firewall(
     *,
     operation: str,
@@ -384,6 +465,7 @@ def _verify_firewall(
     firewall_name: str,
     cidr: str,
     log_path: Path,
+    lab: str,
 ) -> list[Diagnostic]:
     """Read the firewall back from the DO API; ``[]`` means the state holds."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -415,6 +497,11 @@ def _verify_firewall(
         f"firewall {firewall_name!r}: {wanted}: {'confirmed' if holds else 'NOT confirmed'}\n"
     )
     if holds:
+        if isolated:
+            return _check_foreign_firewalls(
+                operation=operation, token=token, lab=lab,
+                own_name=firewall_name, cidr=cidr, log_path=log_path,
+            )
         return []
     return [Diagnostic(
         id=f"runtime.{operation}.verify_failed",
@@ -434,6 +521,7 @@ def _verify_firewall(
 __all__ = [
     "execute_connect",
     "execute_isolate",
+    "grants_egress_beyond",
     "outbound_is_open",
     "outbound_is_vpc_only",
 ]

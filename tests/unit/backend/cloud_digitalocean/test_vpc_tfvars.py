@@ -83,3 +83,15 @@ def test_tofu_vm_ips_stays_public_and_private_ips_are_added() -> None:
     assert "digitalocean_droplet.node[idx].ipv4_address\n" in out
     assert 'output "vm_private_ips"' in out
     assert "ipv4_address_private" in out
+
+
+def test_tofu_firewall_targets_droplet_ids_only_not_tags() -> None:
+    """Firewall `tags` select targets; var.tags has the account-wide tag."""
+    import re
+
+    main = (TOFU_DIR / "main.tf").read_text()
+    block = re.search(r'resource "digitalocean_firewall" "lab" \{(.*?)\n\}\n', main, re.S)
+    assert block is not None
+    body = block.group(1)
+    assert "droplet_ids = digitalocean_droplet.node[*].id" in body
+    assert not re.search(r"^\s*tags\s*=", body, re.M)

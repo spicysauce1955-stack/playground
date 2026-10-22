@@ -241,6 +241,24 @@ def _api_error(what: str, suggestion: str) -> Diagnostic:
     )
 
 
+def list_firewalls(token: str) -> tuple[list[dict[str, Any]], list[Diagnostic], bool]:
+    """List every Cloud Firewall in the account (``GET /v2/firewalls``).
+
+    Returns ``(firewalls, diagnostics, ok)``; ``ok`` False means the list is
+    incomplete and must not be read as "no firewalls".
+    """
+    items, ok = _list_paged(token, "/v2/firewalls", "firewalls")
+    if not ok:
+        return [], [
+            _api_error(
+                "listing firewalls",
+                "check the token and retry; inspect "
+                "https://cloud.digitalocean.com/networking/firewalls",
+            )
+        ], False
+    return items, [], True
+
+
 def find_firewall(
     token: str, name: str,
 ) -> tuple[dict[str, Any] | None, list[Diagnostic], bool]:
@@ -574,6 +592,7 @@ __all__ = [
     "find_firewall",
     "find_vpc",
     "list_droplets_by_tag",
+    "list_firewalls",
     "read_token",
     "token_env_name",
     "token_present",
