@@ -68,3 +68,15 @@ def test_redhat_removes_docker_documented_conflicts() -> None:
     text = (ROLES / "docker" / "tasks" / "redhat.yml").read_text()
     for pkg in ("podman", "runc", "docker-engine", "docker-latest-logrotate"):
         assert pkg in text
+
+
+@pytest.mark.parametrize("role", ["common", "docker"])
+def test_redhat_paths_gate_on_major_version_8_or_9(role: str) -> None:
+    """EL10 / Fedora break the docker-ce repo path and the EL8 pip pin, so
+    the RedHat path refuses them up front instead of failing late."""
+    first = _load(role, "redhat.yml")[0]
+    assert "ansible.builtin.assert" in first
+    assert (
+        "ansible_distribution_major_version in ['8', '9']"
+        in first["ansible.builtin.assert"]["that"]
+    )

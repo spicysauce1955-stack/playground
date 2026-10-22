@@ -82,6 +82,15 @@ resource "digitalocean_droplet" "node" {
     lookup(var.vm_ssh_keys, var.vm_names[count.index], []),
   )
 
+  # ssh_keys only matters at creation, and a change forces replacement. A
+  # lab that predates vm_ssh_keys and already runs a non-ubuntu-* image
+  # (the lab-wide `image` always allowed one) would otherwise lose every
+  # Droplet's disk on its next apply just because the lab key is now
+  # attached. Key changes therefore never replace a running Droplet.
+  lifecycle {
+    ignore_changes = [ssh_keys]
+  }
+
   tags = var.tags
 
   # Private network for VM-to-VM traffic. Changing vpc_uuid on an existing

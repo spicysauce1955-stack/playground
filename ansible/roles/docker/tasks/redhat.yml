@@ -17,6 +17,17 @@
 #     at it for the rest of the run (set_fact is host-scoped, so the
 #     later workload plays pick it up).
 
+- name: Assert a supported RedHat-family release (8 or 9)
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution_major_version in ['8', '9']
+    fail_msg: >-
+      The docker role supports RedHat-family 8 and 9 (Rocky, Alma, RHEL),
+      but VM {{ inventory_hostname }} is {{ ansible_distribution }}
+      {{ ansible_distribution_version }}. EL10 and Fedora are not supported
+      yet (the docker-ce repo path and the EL8 pip pin do not fit them).
+    quiet: true
+
 - name: Remove conflicting distro container packages
   ansible.builtin.dnf:
     name:
@@ -76,10 +87,13 @@
 - name: Install the Docker SDK (and current requests/urllib3) into the venv
   ansible.builtin.pip:
     name:
-      # Lower bounds beat the older distro copies the venv inherits.
-      - docker>=5.0.3
-      - requests>=2.27
-      - urllib3>=1.26
+      # Lower bounds beat the older distro copies the venv inherits; upper
+      # bounds keep a fresh converge from picking up a future major release.
+      # (Pulled from PyPI: the RedHat path's one internet dependency beyond
+      # download.docker.com and the distro repos.)
+      - docker>=5.0.3,<8
+      - requests>=2.27,<3
+      - urllib3>=1.26,<3
     virtualenv: "{{ docker_python_venv }}"
 
 - name: Run later modules with the venv interpreter

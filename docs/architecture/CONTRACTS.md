@@ -209,7 +209,9 @@ subprocess.
   and `lab_scheduler` are apt / Ubuntu-kernel only and start with an
   `assert` that names the role, the VM, its distro and the VmRole
   opt-in. RedHat specifics (verified live on Rocky 8.8 and 8.10; EL9 not
-  yet run): `common` uses dnf and `chronyd` (no `systemd-timesyncd`);
+  yet run; both `redhat.yml` files first assert major version 8 or 9,
+  because EL10 / Fedora break the docker-ce repo path and the EL8 pip
+  pin): `common` uses dnf and `chronyd` (no `systemd-timesyncd`);
   `docker` removes Docker's documented conflicts (podman, runc, ...),
   adds `download.docker.com/linux/rhel/$releasever`, installs
   docker-ce + buildx + compose plugins, and **starts + enables
@@ -219,10 +221,15 @@ subprocess.
   `python3-docker` does not help), so the role builds a venv at
   `docker_python_venv` (`/opt/playground/docker-venv`, system
   site-packages inherited so dnf / selinux bindings still import) with
-  current `docker` / `requests` / `urllib3` from PyPI, and `set_fact`s
+  `docker` / `requests` / `urllib3` from PyPI (lower-bounded above the
+  distro copies, upper-bounded below the next major; PyPI is the RedHat
+  path's one internet dependency beyond download.docker.com and the
+  distro repos, which matters for air-gap prep), and `set_fact`s
   `ansible_python_interpreter` to it for the rest of the run. The
   controller's ansible-core 2.16 still supports 3.6 targets; 2.17+ would
   not, and Rocky 8 would then need a newer Python installed first.
+  Nothing enforces the controller version today (it is the system
+  `ansible`, not a pyproject dependency).
 
 ### 8. verify-lab (post-Move 3)
 
@@ -560,7 +567,11 @@ exactly as before these maps existed (`var.image`,
 only the `package_upgrade` token in `cloud_init.cfg` became a template
 variable), so existing all-Ubuntu labs re-apply with no Droplet changes
 (pinned by tests, and checked with an offline `tofu plan` of the old
-and new roots). Every byte of `cloud_init.cfg`, comments included, is
+and new roots). The Droplet also has `lifecycle { ignore_changes =
+[ssh_keys] }`: keys only matter at creation, and without it a lab that
+already ran a non-`ubuntu-*` lab-wide `image` before this change would
+have every Droplet replaced the first time the lab key joined its
+`ssh_keys`. Every byte of `cloud_init.cfg`, comments included, is
 `user_data`: editing that file replaces every Droplet, so template notes
 live in `main.tf`.
 

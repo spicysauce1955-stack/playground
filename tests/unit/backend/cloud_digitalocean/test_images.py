@@ -361,6 +361,15 @@ def test_droplet_ssh_keys_expression_has_no_distinct() -> None:
     assert "distinct(" not in main
 
 
+def test_droplet_ignores_ssh_keys_drift() -> None:
+    """ssh_keys forces replacement; an existing non-ubuntu-* lab gaining the
+    lab key in vm_ssh_keys must not have its Droplets rebuilt."""
+    main = _squash(_main_tf())
+    start = main.index('resource "digitalocean_droplet" "node"')
+    block = main[start:main.index('resource "digitalocean_firewall"')]
+    assert "lifecycle { ignore_changes = [ssh_keys] }" in block
+
+
 def test_custom_image_ignores_distribution_drift() -> None:
     """DO stores "Unknown" as "Unknown OS" (seen live); without this every
     apply plans an image update and `isolate` (firewall-only plans) refuses."""
