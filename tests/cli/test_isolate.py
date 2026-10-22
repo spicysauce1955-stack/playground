@@ -88,8 +88,8 @@ def test_isolate_failed_run_exits_1(
 
 
 def test_isolate_help_does_not_claim_metadata_blocked() -> None:
-    out = CliRunner().invoke(app, ["isolate", "--help"]).output
-    assert "NOT" in out and "metadata" in out
+    out = " ".join(CliRunner().invoke(app, ["isolate", "--help"]).output.split())
+    assert "metadata" in out and "stays reachable" in out
     assert "cloud metadata," not in out
 
 
