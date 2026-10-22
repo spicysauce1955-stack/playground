@@ -4,6 +4,7 @@ See :mod:`playground.runs.operation` for the public surface.
 """
 
 from playground.runs.operation import (
+    Operation,
     OperationRun,
     RunStatus,
     StepResult,
@@ -13,6 +14,7 @@ from playground.runs.operation import (
 )
 
 __all__ = [
+    "Operation",
     "OperationRun",
     "RunStatus",
     "StepResult",
