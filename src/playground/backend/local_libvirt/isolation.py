@@ -33,6 +33,27 @@ connections other than SSH (e.g. curling a VM port directly from the
 host) do not work while isolated; use an SSH tunnel. Exec, cp, ansible
 and adb-over-ssh all ride sshd and keep working.
 
+Scope: the subnet used in the rules is the one libvirt actually runs
+(``net-dumpxml``); if it differs from the lab config the run fails with
+``network_drift``. EVERY domain with an interface on a lab network is
+isolated, declared in the lab or not (undeclared ones get a warning), and
+the run fails (``non_lab_interface``) if such a domain also has an
+interface elsewhere (another network, bridge, direct, ...): that would be
+an unfiltered egress path. Subnet network/broadcast addresses are dropped
+so a directed broadcast cannot reach host sockets bound to 0.0.0.0.
+
+Threat model: a NON-ADVERSARIAL guest. The filter keeps well-behaved
+software (and mistakes) off the internet and the host's services; it is
+not a sandbox for a hostile root user. In particular the gateway accept on
+tcp source port 22 is stateless, so a root guest could abuse it (e.g.
+SNAT outbound traffic to source port 22 towards the gateway). Do not rely
+on it to contain malicious code.
+
+A pre-existing, non-playground ``<filterref>`` on a lab interface is
+replaced (with a ``filter_replaced`` warning) because an interface takes
+one filterref, and ``connect`` does NOT restore it. Lab VMs created by
+tofu never carry one.
+
 Every function returns instead of raising.
 """
 
@@ -53,9 +74,11 @@ from playground.backend.local_libvirt.isolation_xml import (
     filter_name,
     filter_uuid,
     filters_equivalent,
+    foreign_attachments,
     interface_xml_with_filter,
     interface_xml_without_filter,
     interfaces_on,
+    network_cidr_ipv4,
     network_gateway_ipv4,
     network_interfaces,
     parse_ipv4_network,
@@ -311,21 +334,27 @@ def _isolate(ctx: _Ctx) -> str:
 
 
 def _inspect(ctx: _Ctx, *, require_all: bool) -> bool:
-    """Read-only discovery: which domains exist / run, lab gateways and CIDRs."""
+    """Read-only discovery: domains in scope, plus lab gateways and CIDRs.
+
+    isolate: scope is EVERY libvirt domain with an interface on a lab
+    network (declared in the lab or not); rules use the subnet libvirt
+    actually runs. connect: scope is every defined domain, because the
+    detach step only touches interfaces carrying our filter.
+    """
     with _step(ctx, "inspect-lab") as st:
         listed = _list_domains(ctx, st)
         if listed is None:
             return False
         existing, running = listed
         wanted = [vm.name for vm in ctx.resolved.vms]
-        ctx.present = [n for n in wanted if n in existing]
-        ctx.running = {n for n in ctx.present if n in running}
         missing = [n for n in wanted if n not in existing]
-        st.log(f"domains present: {ctx.present}; running: {sorted(ctx.running)}")
+        ctx.running = set(running)
 
         if not require_all:
+            ctx.present = _wanted_first(wanted, existing)
+            st.log(f"domains in scope: {ctx.present}; running: {sorted(ctx.running)}")
             if missing:
-                st.log(f"domains not defined in libvirt (skipped): {missing}")
+                st.log(f"lab domains not defined in libvirt (skipped): {missing}")
             return True
 
         failed = False
@@ -348,7 +377,7 @@ def _inspect(ctx: _Ctx, *, require_all: bool) -> bool:
         missing_nets: list[str] = []
         for net in ctx.resolved.networks:
             try:
-                cidrs.append(str(parse_ipv4_network(net.cidr)))
+                configured = parse_ipv4_network(net.cidr)
             except ValueError as exc:
                 st.fail()
                 failed = True
@@ -367,18 +396,31 @@ def _inspect(ctx: _Ctx, *, require_all: bool) -> bool:
                     failed = True
                 continue
             gw = network_gateway_ipv4(result.stdout)
-            if gw is None:
+            actual = network_cidr_ipv4(result.stdout)
+            if gw is None or actual is None:
                 st.fail()
                 failed = True
                 ctx.error(
                     "network_gateway_missing",
-                    f"libvirt network {net.name!r} has no IPv4 <ip address=...>; cannot "
-                    "tell which address to cut DNS to",
+                    f"libvirt network {net.name!r} has no usable IPv4 <ip address=... "
+                    "prefix=.../>; cannot tell its subnet or gateway",
                     f"inspect `virsh -c {VIRSH_URI} net-dumpxml {net.name}`",
                 )
                 continue
+            if actual != configured:
+                st.fail()
+                failed = True
+                ctx.error(
+                    "network_drift",
+                    f"libvirt network {net.name!r} runs {actual} but the lab config says "
+                    f"{configured}; refusing to isolate against a stale config",
+                    f"re-apply the lab (`playground apply {ctx.lab}`) so libvirt matches the "
+                    "config, then isolate again",
+                )
+                continue
             gateways.append(gw)
-            st.log(f"network {net.name}: cidr {net.cidr}, gateway {gw}")
+            cidrs.append(str(actual))
+            st.log(f"network {net.name}: cidr {actual} (from libvirt), gateway {gw}")
         if missing_nets:
             st.fail()
             failed = True
@@ -389,7 +431,67 @@ def _inspect(ctx: _Ctx, *, require_all: bool) -> bool:
                 f"run `playground apply {ctx.lab}` first",
             )
         ctx.cidrs, ctx.gateways = cidrs, gateways
+        if not _scan_scope(ctx, st, _wanted_first(wanted, existing)):
+            failed = True
         return not failed
+
+
+def _wanted_first(wanted: list[str], existing: set[str]) -> list[str]:
+    """Declared lab VMs that exist, then the other domains (sorted)."""
+    return [n for n in wanted if n in existing] + sorted(existing - set(wanted))
+
+
+def _scan_scope(ctx: _Ctx, st: _Step, candidates: list[str]) -> bool:
+    """Pick every domain with a lab-network interface; reject unfiltered paths."""
+    ok = True
+    declared = {vm.name for vm in ctx.resolved.vms}
+    nets = ctx.net_names
+    scope: list[str] = []
+    for vm in candidates:
+        on_lab = False
+        foreign: list[str] = []
+        modes = ([False] if vm in ctx.running else []) + [True]
+        for inactive in modes:
+            args = ["dumpxml", *(["--inactive"] if inactive else []), vm]
+            result = st.virsh(args)
+            if result.returncode != 0:
+                if _has(result, _DOMAIN_NOT_FOUND):
+                    st.log(f"{vm}: vanished while scanning; skipped")
+                    break
+                _virsh_failed(ctx, st, result, " ".join(args))
+                ok = False
+                break
+            if interfaces_on(result.stdout, nets):
+                on_lab = True
+            foreign.extend(foreign_attachments(result.stdout, nets))
+        if not on_lab:
+            continue
+        scope.append(vm)
+        if vm not in declared:
+            st.log(f"{vm}: NOT declared in lab {ctx.lab!r} but attached to a lab network")
+            ctx.warn(
+                "undeclared_domain",
+                f"domain {vm!r} is attached to a lab network but is not declared in lab "
+                f"{ctx.lab!r}; it will be isolated too",
+            )
+        if foreign:
+            st.fail()
+            ok = False
+            ctx.error(
+                "non_lab_interface",
+                f"domain {vm!r} also has interface(s) outside the lab network(s) "
+                f"{sorted(nets)}: {', '.join(sorted(set(foreign)))}; that is an unfiltered "
+                "egress path",
+                "detach the extra interface(s) (or re-apply the lab), then isolate again",
+            )
+    # Declared VMs that exist but sit on no lab network stay in scope so
+    # attach-filter reports no_lab_interface for them.
+    for vm in candidates:
+        if vm in declared and vm not in scope:
+            scope.append(vm)
+    ctx.present = scope
+    st.log(f"domains in scope: {scope}; running: {sorted(ctx.running & set(scope))}")
+    return ok
 
 
 def _list_domains(ctx: _Ctx, st: _Step) -> tuple[set[str], set[str]] | None:
@@ -456,6 +558,7 @@ def _modes(ctx: _Ctx, vm: str) -> list[tuple[str, bool]]:
 def _attach(ctx: _Ctx) -> bool:
     name = ctx.filter
     ok = True
+    declared = {vm.name for vm in ctx.resolved.vms}
     with _step(ctx, "attach-filter") as st:
         for vm in ctx.present:
             for flag, inactive in _modes(ctx, vm):
@@ -464,6 +567,9 @@ def _attach(ctx: _Ctx) -> bool:
                     ok = False
                     continue
                 targets = interfaces_on(xml, ctx.net_names)
+                if not targets and vm not in declared:
+                    st.log(f"{vm} {flag}: no lab-network interface in this XML; skip")
+                    continue
                 if not targets:
                     st.fail()
                     ok = False
@@ -507,6 +613,13 @@ def _verify_isolated(ctx: _Ctx) -> bool:
     name = ctx.filter
     ok = True
     with _step(ctx, "verify-isolation") as st:
+        # Re-list: a domain started after attach must show a live binding.
+        fresh = st.virsh(["list", "--name"])
+        if fresh.returncode != 0:
+            _virsh_failed(ctx, st, fresh, "list --name")
+            return False
+        ctx.running = _names(fresh.stdout)
+        st.log(f"running now: {sorted(ctx.running & set(ctx.present))}")
         for vm in ctx.present:
             for flag, inactive in _modes(ctx, vm):
                 xml = _dump(ctx, st, vm, inactive=inactive)

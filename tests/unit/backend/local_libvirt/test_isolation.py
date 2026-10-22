@@ -54,6 +54,19 @@ class FakeLibvirt:
         self.filters: dict[str, str] = {}  # name -> xml (with uuid)
         self.calls: list[list[str]] = []
         self.fail: dict[str, subprocess.CompletedProcess[str]] = {}
+        self.prefixes: dict[str, str] = {}
+        self.running_list_calls = 0
+        self.running_list_hooks: dict[int, object] = {}
+
+    def start(self, vm: str, *, strip_filter: bool = False) -> None:
+        """Start a defined domain (as if it booted after `isolate` attached)."""
+        self.running.add(vm)
+        clones = [self._clone(e) for e in self.cfg[vm]]
+        if strip_filter:
+            for e in clones:
+                for ref in e.findall("filterref"):
+                    e.remove(ref)
+        self.live[vm] = clones
 
     @staticmethod
     def _clone(e: ET.Element) -> ET.Element:
@@ -80,6 +93,11 @@ class FakeLibvirt:
                 return result
         cmd = args[0]
         if cmd == "list":
+            if "--all" not in args:
+                self.running_list_calls += 1
+                hook = self.running_list_hooks.get(self.running_list_calls)
+                if callable(hook):
+                    hook()
             names = list(self.cfg) if "--all" in args else sorted(self.running & set(self.cfg))
             return _cp(out="\n".join(names) + "\n\n")
         if cmd == "net-dumpxml":
@@ -89,7 +107,8 @@ class FakeLibvirt:
             return _cp(
                 out=(
                     f"<network><name>{net}</name>"
-                    f"<ip address='{self.nets[net]}' prefix='24'/></network>"
+                    f"<ip address='{self.nets[net]}' "
+                    f"prefix='{self.prefixes.get(net, '24')}'/></network>"
                 )
             )
         if cmd == "dumpxml":
@@ -318,6 +337,27 @@ def test_gateway_is_restricted_before_cidr_accept() -> None:
     assert _verdict(xml, dst="255.255.255.255", proto="udp", sport=68, dport=67) == "accept"
 
 
+def test_network_and_broadcast_addresses_are_dropped_before_cidr_accept() -> None:
+    xml = render_filter_xml("f", cidrs=["10.0.1.0/24", "10.0.2.0/25"], gateways=["10.0.1.1"])
+    root = ET.fromstring(xml)
+    drops = {r[0].get("dstipaddr") for r in root.findall("rule") if r.get("priority") == "160"}
+    assert drops == {"10.0.1.0", "10.0.1.255", "10.0.2.0", "10.0.2.127"}
+    assert _verdict(xml, dst="10.0.1.255", proto="udp", dport=5000) == "drop"
+    assert _verdict(xml, dst="10.0.1.0", proto="tcp", dport=22) == "drop"
+    assert _verdict(xml, dst="10.0.2.127", proto="udp", dport=5000) == "drop"
+    assert _verdict(xml, dst="10.0.1.7", proto="udp", dport=5000) == "accept"
+    assert _verdict(xml, dst="255.255.255.255", proto="udp", sport=68, dport=67) == "accept"
+
+
+def test_network_cidr_ipv4_prefix_and_netmask() -> None:
+    from playground.backend.local_libvirt.isolation_xml import network_cidr_ipv4
+
+    p = network_cidr_ipv4("<network><ip address='10.1.2.1' prefix='24'/></network>")
+    n = network_cidr_ipv4("<network><ip address='10.1.2.1' netmask='255.255.255.0'/></network>")
+    assert str(p) == str(n) == "10.1.2.0/24"
+    assert network_cidr_ipv4("<network><ip address='10.1.2.1'/></network>") is None
+
+
 def test_render_rejects_ipv6_cidr() -> None:
     with pytest.raises(ValueError):
         render_filter_xml("f", cidrs=["fd00::/64"], gateways=[])
@@ -428,15 +468,120 @@ def test_isolate_unchanged_filter_skips_define(resolved, tmp_path) -> None:
     assert not any(c[0] == "nwfilter-define" for c in fake.calls)
 
 
-def test_isolate_multi_network_only_touches_lab_interfaces(resolved, tmp_path) -> None:
+def test_isolate_extra_interface_on_other_network_fails(resolved, tmp_path) -> None:
     fake = FakeLibvirt(resolved, running=ALL_RUNNING)
-    # Give router1 an extra interface on a non-lab network.
     extra = FakeLibvirt._iface("router1", 9, "default")
     fake.cfg["router1"].append(extra)
     fake.live["router1"].append(FakeLibvirt._clone(extra))
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.isolate.non_lab_interface"]
+    assert "router1" in diags[0].message and "default" in diags[0].message
+    assert fake.mutating_calls() == []  # nothing changed before the failure
+
+
+@pytest.mark.parametrize("kind", ["bridge", "direct", "user"])
+def test_isolate_non_network_interface_type_fails(resolved, tmp_path, kind) -> None:
+    fake = FakeLibvirt(resolved, running=set())
+    src = {"bridge": "<source bridge='br0'/>", "direct": "<source dev='eth0'/>", "user": ""}[kind]
+    fake.cfg["node1"].append(
+        ET.fromstring(
+            f"<interface type='{kind}'><mac address='52:54:00:aa:bb:cc'/>{src}</interface>"
+        )
+    )
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "failed"
+    assert diags[0].id == "runtime.isolate.non_lab_interface"
+    assert f"type={kind}" in diags[0].message
+    assert fake.mutating_calls() == []
+
+
+def test_isolate_undeclared_domain_on_lab_network_is_isolated_with_warning(
+    resolved, tmp_path
+) -> None:
+    fake = FakeLibvirt(resolved, running={"stowaway"} | ALL_RUNNING)
+    ghost = FakeLibvirt._iface("stowaway", 0, "edge")
+    fake.cfg["stowaway"] = [ghost]
+    fake.live["stowaway"] = [FakeLibvirt._clone(ghost)]
+    # An unrelated domain on a non-lab network must be left alone.
+    other = FakeLibvirt._iface("bystander", 0, "default")
+    fake.cfg["bystander"] = [other]
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "succeeded", diags
+    assert [(d.id, d.severity) for d in diags] == [("runtime.isolate.undeclared_domain", "warning")]
+    assert fake.filter_refs("stowaway", live=True) == [FILTER]
+    assert fake.filter_refs("stowaway", live=False) == [FILTER]
+    assert fake.filter_refs("bystander", live=False) == [None]
+    assert not any(c[0] == "update-device" and c[1] == "bystander" for c in fake.calls)
+    log = Path(run.steps[0].log_path).read_text()
+    assert "stowaway" in log and "NOT declared" in log
+
+
+def test_isolate_undeclared_domain_with_foreign_interface_fails(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=set())
+    fake.cfg["stowaway"] = [
+        FakeLibvirt._iface("stowaway", 0, "edge"),
+        FakeLibvirt._iface("stowaway", 1, "default"),
+    ]
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "failed"
+    assert any(
+        d.id == "runtime.isolate.non_lab_interface" and "stowaway" in d.message for d in diags
+    )
+
+
+def test_connect_detaches_undeclared_domains_too(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running={"stowaway"})
+    fake.cfg["stowaway"] = [FakeLibvirt._iface("stowaway", 0, "edge")]
+    fake.live["stowaway"] = [FakeLibvirt._clone(fake.cfg["stowaway"][0])]
+    assert _isolate(resolved, fake, tmp_path)[0].status == "succeeded"
+    assert fake.filter_refs("stowaway", live=True) == [FILTER]
+    run, diags = _connect(resolved, fake, tmp_path)
+    assert run.status == "succeeded", diags
+    assert fake.filter_refs("stowaway", live=True) == [None]
+    assert fake.filter_refs("stowaway", live=False) == [None]
+    assert FILTER not in fake.filters
+
+
+def test_isolate_network_drift_fails_and_names_reapply(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=ALL_RUNNING)
+    fake.prefixes["edge"] = "16"  # libvirt runs 10.20.10.0/16, config says /24
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.isolate.network_drift"]
+    assert "re-apply" in (diags[0].suggestion or "")
+    assert fake.mutating_calls() == []
+
+
+def test_isolate_rules_use_libvirt_cidr(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=ALL_RUNNING)
     run, _ = _isolate(resolved, fake, tmp_path)
     assert run.status == "succeeded"
-    assert fake.filter_refs("router1", live=False) == [FILTER, FILTER, FILTER, None]
+    root = ET.fromstring(fake.filters[FILTER])
+    accepts = {
+        (r[0].get("dstipaddr"), r[0].get("dstipmask"))
+        for r in root.findall("rule")
+        if r.get("priority") == "200"
+    }
+    assert accepts == {("10.20.10.0", "24"), ("10.20.20.0", "24"), ("10.20.30.0", "24")}
+
+
+def test_verify_relists_running_domains(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=set())
+    fake.running_list_hooks[2] = lambda: fake.start("node1")  # starts after attach
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "succeeded", diags
+    log = Path(run.steps[-1].log_path).read_text()
+    assert "node1 live" in log and f"bound to {FILTER}" in log
+
+
+def test_verify_fails_when_late_started_domain_has_no_binding(resolved, tmp_path) -> None:
+    fake = FakeLibvirt(resolved, running=set())
+    fake.running_list_hooks[2] = lambda: fake.start("node1", strip_filter=True)
+    run, diags = _isolate(resolved, fake, tmp_path)
+    assert run.status == "failed"
+    assert {d.id for d in diags} == {"runtime.isolate.verify_failed"}
+    assert "node1" in diags[0].message
 
 
 def test_isolate_replaces_foreign_filter_with_warning(resolved, tmp_path) -> None:

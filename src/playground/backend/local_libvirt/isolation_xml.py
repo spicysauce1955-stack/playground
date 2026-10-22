@@ -38,6 +38,7 @@ PRIO_GW_DHCP = 110
 PRIO_GW_SSH_REPLY = 120
 PRIO_GW_ICMP = 130
 PRIO_GW_DROP = 150
+PRIO_NET_BCAST_DROP = 160
 PRIO_LAB_ACCEPT = 200
 PRIO_DHCP_ACCEPT = 210
 PRIO_DROP_REST = 900
@@ -84,6 +85,7 @@ def render_filter_xml(
       with the gateway drop, kept for readability), prio 110 accept udp
       dport 67 (unicast DHCP renew), prio 120 accept tcp sport 22 (replies
       to host-initiated SSH), prio 130 accept icmp, prio 150 drop all else;
+    * prio 160: drop the network and broadcast address of each lab CIDR;
     * prio 200: accept IPv4 to each lab CIDR;
     * prio 210: accept the DHCP broadcast (discover / rebind);
     * prio 900: drop every other IPv4 and all IPv6.
@@ -133,8 +135,15 @@ def render_filter_xml(
         rule("accept", PRIO_GW_ICMP, "ip", {"protocol": "icmp", "dstipaddr": gw})
     for gw in gws:
         rule("drop", PRIO_GW_DROP, "ip", {"dstipaddr": gw})
-    for cidr in _dedupe([str(parse_ipv4_network(c)) for c in cidrs]):
-        net = ipaddress.IPv4Network(cidr)
+    nets = [ipaddress.IPv4Network(c) for c in _dedupe([str(parse_ipv4_network(c)) for c in cidrs])]
+    # Subnet-directed broadcast / network address would otherwise be
+    # accepted by the CIDR rule below and reach host UDP sockets bound to
+    # 0.0.0.0, skipping the gateway drop. (/31 and /32 have no such pair.)
+    for net in nets:
+        if net.prefixlen < 31:
+            for addr in (net.network_address, net.broadcast_address):
+                rule("drop", PRIO_NET_BCAST_DROP, "ip", {"dstipaddr": str(addr)})
+    for net in nets:
         rule(
             "accept",
             PRIO_LAB_ACCEPT,
@@ -183,6 +192,23 @@ def _canonical_filter(filter_xml: str) -> tuple[tuple[tuple[str, str], ...], lis
 def filters_equivalent(a: str, b: str) -> bool:
     """True when two filter XMLs define the same rules (UUID and order ignored)."""
     return _canonical_filter(a) == _canonical_filter(b)
+
+
+def network_cidr_ipv4(network_xml: str) -> ipaddress.IPv4Network | None:
+    """The IPv4 subnet libvirt actually runs (``<ip address= prefix=|netmask=>``)."""
+    root = ET.fromstring(network_xml)
+    for ip in root.findall("ip"):
+        addr = ip.get("address")
+        if ip.get("family", "ipv4") != "ipv4" or not addr:
+            continue
+        mask = ip.get("prefix") or ip.get("netmask")
+        if not mask:
+            return None
+        try:
+            return ipaddress.IPv4Network(f"{addr}/{mask}", strict=False)
+        except ValueError:
+            return None
+    return None
 
 
 def network_gateway_ipv4(network_xml: str) -> str | None:
@@ -260,3 +286,26 @@ def binding_filter(binding_xml: str) -> str | None:
     """The filter name in an ``nwfilter-binding-dumpxml`` result."""
     ref = ET.fromstring(binding_xml).find("filterref")
     return ref.get("filter") if ref is not None else None
+
+
+def foreign_attachments(domain_xml: str, networks: set[str]) -> list[str]:
+    """Interfaces NOT attached to one of *networks* (each is an unfiltered path).
+
+    Covers other libvirt networks and every non-``network`` type
+    (bridge, direct, user, ethernet, ...), as short human labels.
+    """
+    root = ET.fromstring(domain_xml)
+    out: list[str] = []
+    for iface in root.findall("./devices/interface"):
+        kind = iface.get("type", "?")
+        source = iface.find("source")
+        if kind == "network" and source is not None and source.get("network") in networks:
+            continue
+        where = ""
+        if source is not None:
+            attrs = source.attrib
+            where = next((attrs[k] for k in ("network", "bridge", "dev", "path") if k in attrs), "")
+        mac = iface.find("mac")
+        mac_s = mac.get("address", "?") if mac is not None else "?"
+        out.append(f"{mac_s} (type={kind}{', source=' + where if where else ''})")
+    return out
