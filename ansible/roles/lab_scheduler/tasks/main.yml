@@ -3,6 +3,20 @@
 # `playground apply` on a converged host reports changed=0 except the
 # repo-update task when upstream moved).
 
+# Debian-family only (apt). Fails fast with a message that names the
+# opt-in rather than dying later on a missing apt module.
+- name: Assert the host is Debian-family (this role is apt-based)
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family == 'Debian'
+    fail_msg: >-
+      Role lab_scheduler supports only Debian-family hosts (it installs packages with apt),
+      but VM {{ inventory_hostname }} is {{ ansible_distribution }}
+      {{ ansible_distribution_version }} ({{ ansible_os_family }}). The
+      VM's VmRole opts into the lab_scheduler provisioner; remove it from that
+      role's provisioners or run the VM on an Ubuntu image.
+    success_msg: "{{ ansible_distribution }} is supported by lab_scheduler"
+
 # The defaults are lazy lookups re-evaluated at every reference; freeze
 # them once so each controller-side file is read a single time per run.
 - name: Resolve controller-side secrets once (values never logged)

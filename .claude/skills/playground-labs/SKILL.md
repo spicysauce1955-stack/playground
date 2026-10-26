@@ -68,7 +68,7 @@ playground destroy generic-infra
 | `playground destroy <lab>` | `tofu destroy` the lab. | Clean teardown when apply state is consistent. |
 | `playground suspend <lab>` | (cloud backends only) Destroy Droplets to stop billing; config preserved. | Pausing a cloud lab to cut costs; disk state is NOT preserved. |
 | `playground resume <lab>` | (cloud backends only) Rebuild Droplets from config after a suspend. | Resuming a suspended cloud lab. |
-| `playground isolate <lab>` | (local-libvirt, cloud-digitalocean) Cut lab VM egress to anything outside the lab's own networks; VM-to-VM and SSH from this machine keep working. Idempotent. | Air-gap tests after provisioning. libvirt drops (outside connections time out), drops guest DNS via the lab gateway (use IPs), and blocks host→VM traffic other than SSH (use `playground adb` / SSH tunnels). DigitalOcean leaves the metadata service (169.254.169.254) reachable. Flush the guest resolver cache before asserting DNS fails. `apply`/`resume` refuse an isolated lab. |
+| `playground isolate <lab>` | (local-libvirt, cloud-digitalocean) Cut lab VM egress to anything outside the lab's own networks; VM-to-VM and SSH from this machine keep working. Idempotent. | Air-gap tests after provisioning. libvirt drops (outside connections time out), drops guest DNS via the lab gateway (use IPs), and blocks host→VM traffic other than SSH (use `playground adb` / SSH tunnels). DigitalOcean leaves the metadata service (169.254.169.254) and DHCP (udp/67 to 169.254.169.253 / 255.255.255.255) reachable, so RHEL-style custom-image guests keep their leases and survive reboots; a lab applied before that needs `connect` + `apply` before `isolate`. Flush the guest resolver cache before asserting DNS fails. `apply`/`resume` refuse an isolated lab. |
 | `playground connect <lab>` | Undo `isolate`. Idempotent; fine on a never-isolated lab. | Before re-running `apply`; then `isolate` again. |
 | `playground reset <lab>` | Scrub-by-name (works even when tofu state is corrupted). | When `destroy` fails or state is wedged. |
 | `playground runs list` | Past `apply` / `destroy` runs. | After a failed run, to find the run id. |
@@ -170,6 +170,21 @@ local-vbox reports `127.0.0.1` with a per-VM NAT-forwarded port (its
 On cloud-digitalocean `ip` is the Droplet's **private** VPC address
 (use it for VM-to-VM traffic and in app config) and `public_ip` is the
 public one; `ssh_host` is the public address.
+A DigitalOcean VM can run a different OS from the rest of its lab:
+
+```yaml
+    - name: central
+      role: docker-host
+      networks: [lab-net]
+      provider_overrides:
+        cloud-digitalocean:
+          image: rockylinux-8-x64        # stock slug (latest 8.x) or an image ID
+          # image_url: https://.../Rocky-8-GenericCloud-Base-8.8-...qcow2  # exact point release (15+ min import)
+          # package_upgrade: false       # keep a pinned release from upgrading on first boot
+```
+
+Rocky/Alma get `common` + `docker`; `redroid`, `capture` and
+`lab_scheduler` are Ubuntu-only. The SSH user is `ubuntu` everywhere.
 
 States to handle:
 - `provisioned` / `running` — VM exists, SSH should work.

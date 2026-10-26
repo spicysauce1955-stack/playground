@@ -156,10 +156,23 @@ every VM passes both phases.
 - **Phase 1** — TCP :22 reachable via `socket.create_connection`
   with exponential backoff up to `DEFAULT_SSH_TIMEOUT_SECONDS`
   (300s). Cheap signal of "sshd listening."
-- **Phase 2** — `ssh user@ip "cloud-init status --wait"` with
-  subprocess timeout `DEFAULT_CLOUD_INIT_TIMEOUT_SECONDS` (600s).
-  Blocks on the VM side until every cloud-init stage is done
-  (incl. `package_upgrade`).
+- **Phase 2** — `ssh user@ip "<CLOUD_INIT_WAIT_COMMAND>"` with
+  subprocess timeout `DEFAULT_CLOUD_INIT_TIMEOUT_SECONDS` (1800s).
+  The command is `cloud-init status --wait` run under `sudo -n` when
+  passwordless sudo works (every playground cloud-init grants it), with
+  the plain form as the fallback, and a crash of the `status` command
+  itself (a non-zero exit with a Python traceback on stderr) is retried
+  every 10 s, up to 30 times, rather than taken as cloud-init's verdict. Blocks on the VM side
+  until every cloud-init stage is done (incl. `package_upgrade`). Three
+  facts drive this (verified live on DigitalOcean): Rocky 8's cloud-init
+  23.4 crashes with exit 1 when `status` runs as a non-root user
+  (PermissionError on `/run/cloud-init/cloud.cfg`); a stock Rocky 8.10
+  first-boot `dnf upgrade` re-executes systemd, and `status --wait` (even
+  under sudo) then dies on the D-Bus disconnect while cloud-init is still
+  running, which on DigitalOcean's advisory gate let Ansible race the
+  upgrade (its Docker GPG-key import failed); and that upgrade takes
+  12-13 minutes on a 1-vCPU Droplet, past the old 600 s budget. The
+  timeout is a ceiling; a ready VM returns at once.
 - VMs probed in parallel via `ThreadPoolExecutor`. Total wall
   time ≈ max(per-VM time), not sum.
 - SSH invoked with `BatchMode=yes`, `StrictHostKeyChecking=accept-new`,
@@ -187,6 +200,36 @@ subprocess.
 - Idempotent: re-running apply on a healthy lab should report
   `changed=0` across all tasks. (Move 4 will make this an
   enforceable assertion.)
+- **OS families.** `common` and `docker` dispatch on
+  `ansible_os_family` to `debian.yml` (the original apt tasks, unchanged)
+  or `redhat.yml` (Rocky / Alma / RHEL 8 and 9); any other family fails
+  with a clear message. Facts come from the first play (`extra_hosts`)
+  and stay cached for the later `gather_facts: no` plays, including for a
+  host that play ended early with `meta: end_host`. `redroid`, `capture`
+  and `lab_scheduler` are apt / Ubuntu-kernel only and start with an
+  `assert` that names the role, the VM, its distro and the VmRole
+  opt-in. RedHat specifics (verified live on Rocky 8.8 and 8.10; EL9 not
+  yet run; both `redhat.yml` files first assert major version 8 or 9,
+  because EL10 / Fedora break the docker-ce repo path and the EL8 pip
+  pin): `common` uses dnf and `chronyd` (no `systemd-timesyncd`);
+  `docker` removes Docker's documented conflicts (podman, runc, ...),
+  adds `download.docker.com/linux/rhel/$releasever`, installs
+  docker-ce + buildx + compose plugins, and **starts + enables
+  `docker`** (the RPMs do not, unlike the deb). EL8's Python is 3.6 with
+  requests 2.20 / urllib3 1.24, which community.docker 3.x cannot talk to
+  the daemon with (`'http+docker'`, `key "ApiVersion" is missing`; EPEL
+  `python3-docker` does not help), so the role builds a venv at
+  `docker_python_venv` (`/opt/playground/docker-venv`, system
+  site-packages inherited so dnf / selinux bindings still import) with
+  `docker` / `requests` / `urllib3` from PyPI (lower-bounded above the
+  distro copies, upper-bounded below the next major; PyPI is the RedHat
+  path's one internet dependency beyond download.docker.com and the
+  distro repos, which matters for air-gap prep), and `set_fact`s
+  `ansible_python_interpreter` to it for the rest of the run. The
+  controller's ansible-core 2.16 still supports 3.6 targets; 2.17+ would
+  not, and Rocky 8 would then need a newer Python installed first.
+  Nothing enforces the controller version today (it is the system
+  `ansible`, not a pyproject dependency).
 
 ### 8. verify-lab (post-Move 3)
 
@@ -198,7 +241,12 @@ finishes `status=succeeded`.
 
 **Contract**:
 - For each VM: `ssh <user>@<ip> systemctl is-system-running` must
-  return `running` or `degraded`, not `failed`.
+  return `running` or `degraded`, not `failed`. `initializing` /
+  `starting` (boot jobs still queued) are re-polled every 10 s for up to
+  300 s first: a stock Rocky 8 Droplet reported `starting` for minutes
+  after cloud-init finished, and EL8's systemd 239 has no
+  `is-system-running --wait`. Rocky's `kdump.service` fails on small
+  Droplets, so `degraded` is normal there.
 - For each VM in `[needs_docker]`: `ssh <user>@<ip> docker ps`
   must exit 0.
 - For each `lab.spec.commands.enabled` with `target: any`: run
@@ -319,7 +367,9 @@ ResolvedLab (backend=cloud-digitalocean)
 |                  fetch), VPC name/range conflict
 |                  (runtime.cloud.vpc_conflict), pre-VPC lab
 |                  (runtime.apply.pre_vpc_lab), default-VPC warning
-|                  (runtime.cloud.vpc_would_be_default) -- all before any
+|                  (runtime.cloud.vpc_would_be_default), and last,
+|                  only when a VM needs it, the DO-registered SSH key
+|                  (runtime.apply.do_ssh_key_failed) -- all before any
 |                  tofu run. Before the run starts at all: a per-lab
 |                  tfvars with egress_isolated=true is refused
 |                  (runtime.apply.lab_isolated, "run playground connect")
@@ -339,9 +389,10 @@ ResolvedLab (backend=cloud-digitalocean)
 destroy / suspend:
   tofu-destroy  → tag-sweep (list+delete by tag lab:<lab>, re-list survivors)
                 → vpc-sweep (best-effort: delete an orphaned <lab>-vpc; warnings only)
+                → image-sweep (best-effort: delete orphaned custom images; warnings only)
 
 reset:
-  tofu-destroy  → tag-sweep → vpc-sweep → clean-state-files
+  tofu-destroy  → tag-sweep → vpc-sweep → image-sweep → clean-state-files
   (clean-state-files removes per-lab dir + inventory; run logs are kept)
 ```
 
@@ -442,11 +493,113 @@ string), `config.backend.do_size_below_resources` (warning: a parseable
 `s-<n>vcpu-<m>gb` slug provides fewer vCPUs / less memory than the VM's
 declared resources).
 
+**Per-VM image**: `spec.vms[].provider_overrides.cloud-digitalocean.image`
+> `spec.providers.cloud-digitalocean.image` > `DEFAULT_IMAGE`
+(`ubuntu-24-04-x64`). A slug (`rockylinux-8-x64`) or a positive image ID
+(YAML int or numeric string, e.g. a custom image imported once with
+`doctl compute image create`); normalised to `str` in `DoPlan.vm_images`,
+rendered as the `vm_images` tfvar, consumed as
+`lookup(var.vm_images, <vm>, var.image)`. The plan shows
+`ubuntu-24-04-x64 x5, rockylinux-8-x64 x1` when images differ. The
+`VmRole.image` (`ubuntu-noble`, a libvirt artifact name) is not used on
+this backend. DigitalOcean's stock `rockylinux-8-x64` is the latest 8.x
+(8.10 as of 2026-10); an exact point release needs a custom image.
+
+**Custom image from a URL**: per VM only,
+`provider_overrides.cloud-digitalocean.image_url` (https) plus optional
+`image_distribution` (default `Unknown`); `image_url` and `image` are
+mutually exclusive on one VM. Each distinct URL becomes one
+`digitalocean_custom_image.lab` keyed `img-<sha256(url)[:10]>` (named
+`<lab>-img-...`, `regions = [region]`, tagged like the Droplets, create
+timeout 60m), and the Droplet takes its `image_id`. The distribution
+label is cosmetic, but the OpenTofu provider only accepts Arch Linux,
+CentOS, CoreOS, Debian, Fedora, Fedora Atomic, FreeBSD, Gentoo, openSUSE,
+RancherOS, Ubuntu, Unknown and Unknown OS (the API itself also accepts
+"Rocky Linux"; tofu does not), so the validator rejects anything else.
+DigitalOcean also normalises what it stores ("Unknown" comes back as
+"Unknown OS"), so the resource has `ignore_changes = [distribution]`:
+without it every apply planned an in-place image update and `isolate`
+(firewall-only plans) refused the lab.
+Measured live: importing the Rocky 8.8 GenericCloud qcow2 (1.8 GB
+download, 3.06 GB image) took about 17 minutes, and tofu creates the
+Droplets only after every image is available, so a fresh apply or a
+resume of such a lab pays that wait each time. `tofu destroy` (so also
+`suspend`) deletes the image; `image-sweep` deletes leftovers (custom
+images named `<lab>-img-<10 hex>` or tagged `lab:<lab>` only, never
+snapshots or backups; skipped when Droplets survive the tag sweep;
+warnings `runtime.<op>.orphaned_image` /
+`runtime.<op>.image_sweep_inconclusive`). For a lab you re-create often,
+import once and reference the numeric ID via `image` instead. Verified
+live: the Rocky 8.8 GenericCloud image boots on DigitalOcean with this
+backend's cloud-init (ConfigDrive datasource), creates the `ubuntu` user
+with the key, and grows the root disk to the Droplet size.
+
+**DO-registered SSH key**: DigitalOcean refuses to create a Droplet from
+a custom image or from `rockylinux-8-x64` without `ssh_keys` (HTTP 422
+"The image for this droplet does not use root passwords, please use an
+SSH key"; verified live). A VM needs a DO key when its image is custom or
+is anything but a slug starting `ubuntu-` (numeric IDs included). Only
+then does the apply/resume preflight (never `plan`) fingerprint the lab's
+public key (MD5, as `ssh-keygen -E md5`), reuse any account key with that
+fingerprint whatever its name, or else upload it as
+`playground-<first 8 hex of the fingerprint>` (one re-list on a 422
+race). It goes into the `vm_ssh_keys` tfvar for those VMs only, and the
+Droplet takes `concat(var.ssh_key_fingerprints, lookup(var.vm_ssh_keys,
+<vm>, []))`. Destroy never deletes the key: it is shared by every lab,
+public and free. Failures: `runtime.apply.do_ssh_key_failed` (also for
+resume); the token never appears.
+
+**`package_upgrade`**: `provider_overrides.cloud-digitalocean.package_upgrade`
+> `spec.providers.cloud-digitalocean.package_upgrade` > `true`, rendered
+per VM into `cloud_init.cfg` (`vm_package_upgrade` tfvar). Set it to
+`false` on a VM pinned to a point release: Rocky 8.8's repos track the
+latest 8.x, so the default first-boot `dnf upgrade` turns it into 8.10
+(verified live: with `false` the Droplet stays at 8.8). Ansible later
+installs packages (Docker, chrony) from the current 8.x repos, so some
+libraries do move forward; `/etc/rocky-release` stays 8.8. With the
+default `true`, a stock Rocky 8 Droplet's first boot took 12-13 minutes
+(the wait gate's budget is 1800 s for this reason).
+
+**ForceNew stability**: `image`, `ssh_keys` and `user_data` force
+Droplet replacement. For a VM with no per-VM entries they evaluate
+exactly as before these maps existed (`var.image`,
+`var.ssh_key_fingerprints`, and byte-identical rendered cloud-config:
+only the `package_upgrade` token in `cloud_init.cfg` became a template
+variable), so existing all-Ubuntu labs re-apply with no Droplet changes
+(pinned by tests, and checked with an offline `tofu plan` of the old
+and new roots). The Droplet also has `lifecycle { ignore_changes =
+[ssh_keys] }`: keys only matter at creation, and without it a lab that
+already ran a non-`ubuntu-*` lab-wide `image` before this change would
+have every Droplet replaced the first time the lab key joined its
+`ssh_keys`. Every byte of `cloud_init.cfg`, comments included, is
+`user_data`: editing that file replaces every Droplet, so template notes
+live in `main.tf`.
+
+**Verified live (2026-10-22)**, one lab with a Rocky 8.8 VM imported
+from `image_url`, a Rocky 8.8 VM from a pre-imported image ID, a stock
+`rockylinux-8-x64` (8.10) VM and an Ubuntu 24.04 VM (all `docker-host`):
+apply registered the key and imported the image; each VM reports its
+own release (`package_upgrade: false` kept 8.8); Docker 29.9.2 runs
+containers on all four; a re-apply plans no changes and Ansible reports
+`changed=0` everywhere; `isolate` cut outside DNS / TCP / ICMP from the
+Rocky and Ubuntu VMs while VM-to-VM ICMP, SSH and :8787 kept working;
+`connect` restored egress; `destroy` left no Droplet, VPC, firewall or
+custom image (the registered key stays by design).
+
+**RedHat-family guests**: a Rocky / Alma VM can be any role whose
+provisioners are `common` + `docker` (+ workloads), e.g. `docker-host`;
+see "7. ansible-playbook" for what those roles do on RedHat. `redroid`,
+`capture` and `lab_scheduler` assert an Ubuntu host. The SSH user stays
+`ubuntu` on every image (cloud-init creates it, and the missing `admin`
+group). Seen live on Rocky 8: SELinux enforcing, firewalld inactive,
+`kdump.service` failed (systemd `degraded`, accepted by verify-lab).
+
 **Upgrade note**: labs provisioned before the VPC change have no VPC, and
 `vpc_uuid` forces Droplet replacement, so `apply` / `resume` refuse them
 (`runtime.apply.pre_vpc_lab`): run `playground destroy <lab>` then
 `playground apply <lab>` deliberately. The new validator errors
-(`do_single_network`, `do_vpc_cidr_invalid`, `do_vm_size_invalid`) are
+(`do_single_network`, `do_vpc_cidr_invalid`, `do_vm_size_invalid`, and
+later `do_vm_image_invalid`, `do_package_upgrade_invalid`) are
 errors only for commands that provision or render (`validate`, `plan`,
 `apply`, `resume`, `tofu render`, `inventory render`); every other command
 (status, exec, cp, adb, app, capture, isolate, connect, destroy, reset,
@@ -952,6 +1105,9 @@ and `cloud-digitalocean`; `local-vbox` is unsupported.
   networks: the internet and DNS forwarded to outside resolvers. The
   cloud metadata service is NOT blocked on DigitalOcean (see below). A lookup of an outside
   name from a VM must fail.
+- **Kept, so the guest's network survives:** DHCP to the platform's DHCP
+  server (libvirt: the lab gateway; DigitalOcean: 169.254.169.253, see
+  below), both unicast renewals and broadcast discover / rebind.
 - **Kept:** all VM-to-VM traffic on any port, and SSH from this machine to
   every VM (`exec` / `cp` / SSH tunnels / `adb`).
 
@@ -1098,9 +1254,10 @@ connections therefore time out instead of failing fast. The CLI says so.
 - Mechanism: the lab Cloud Firewall, driven by the tofu variable
   `egress_isolated` (default false) so HCL and tofu state stay the single
   source of truth. Open: outbound tcp/udp/icmp to `0.0.0.0/0, ::/0`.
-  Isolated: outbound only to `destination_droplet_ids` = the lab's own
-  Droplets, with no addresses. DO firewalls are stateful, so replies to
-  inbound SSH still flow.
+  Isolated: outbound tcp/udp/icmp only to `destination_droplet_ids` = the
+  lab's own Droplets, with no addresses, plus ONE udp port 67 rule to
+  `local.isolated_dhcp_destinations` (below). DO firewalls are stateful,
+  so replies to inbound SSH still flow.
 - **Not the VPC CIDR.** In a custom VPC, DigitalOcean gives droplets a
   resolver at an address *inside* the VPC range (`10.97.0.254` for
   `10.97.0.0/24`; `resolvectl dns` shows it) that forwards outside
@@ -1111,6 +1268,28 @@ connections therefore time out instead of failing fast. The CLI says so.
   `169.254.169.254` is link-local, answered by the hypervisor, and outside
   Cloud Firewall's reach. It is not a path to the internet; if a test
   needs it unreachable, block it in-guest.
+- **DHCP stays open: udp/67 to `169.254.169.253/32` and
+  `255.255.255.255/32`, nothing else** (S19, verified live). Droplets
+  from custom images (RHEL, Rocky, ...) get BOTH NICs' addresses by DHCP
+  from `169.254.169.253` with 24 h leases (cloud-init writes
+  `BOOTPROTO=dhcp`; DO documents that such Droplets behind a Cloud
+  Firewall need outbound udp/67). Unlike the metadata service, Cloud
+  Firewall DOES filter it: before this rule an isolated RHEL 8.8 guest's
+  DISCOVER / INIT-REBOOT REQUEST broadcasts went unanswered, so a reboot
+  never came back (`dhcp4 ... no lease`, 45 s retries) and a lease could
+  not be renewed before it expired. Stock Ubuntu images get a static
+  netplan from cloud-init and never ask. Both destinations are needed:
+  the public NIC renews by unicast to `.253` (routed via its gateway) at
+  T1, but `.253` does not answer ARP on the VPC NIC (seen live, isolated
+  or not), so that NIC only renews by broadcast REBIND at T2, and boot /
+  `nmcli con up` use broadcast too. DHCP replies were never filtered.
+  Measured with the rule: isolated RHEL 8.8 reboot back in 31-33 s with
+  both NICs leased, broadcast and unicast renewals ACKed, while outside
+  TCP / ICMP / DNS (including the VPC resolver) stay blocked. The
+  destinations live in `local.isolated_dhcp_destinations` (main.tf) and
+  `ISOLATED_DHCP_DESTINATIONS` (isolation.py); a unit test keeps them
+  equal. The rule exists only while isolated (open egress covers DHCP),
+  so connect's open state is unchanged.
 - **The firewall targets Droplets by `droplet_ids` only, never `tags`.** A
   DO firewall's `tags` *select the Droplets it applies to*, the ownership
   tags include the account-wide `playground`, and DO unions allow rules
@@ -1144,10 +1323,12 @@ connections therefore time out instead of failing fast. The CLI says so.
   - isolate requires: the lab set (state Droplet ids ∪ Droplets tagged
     `lab:<lab>`) is attached to our firewall (`uncovered_droplet`
     otherwise; an empty or short tag listing fails); every outbound rule
-    targets exactly that set and nothing else; every OTHER firewall that
+    targets exactly that set and nothing else, except exactly one DHCP
+    allowance (udp, ports `67`, addresses exactly the two above, any
+    `/32` spelling); every OTHER firewall that
     applies to a lab Droplet (by `droplet_ids` or tag overlap, same name
-    or not) allows no other outbound destination
-    (`runtime.isolate.foreign_firewall`, naming it). connect requires our
+    or not) allows no other outbound destination, that exact DHCP
+    allowance aside (`runtime.isolate.foreign_firewall`, naming it). connect requires our
     firewall open again.
   - API unreachable or not settled in time → the run fails; it never
     claims isolation it could not confirm.
@@ -1155,7 +1336,12 @@ connections therefore time out instead of failing fast. The CLI says so.
   leaves tfvars behind) → `runtime.isolate.not_provisioned`; a per-lab
   `variables.tf` without `egress_isolated` (lab provisioned before this
   feature) → `runtime.isolate.needs_reapply`. `connect` on such a lab is a
-  no-op success ("nothing to restore").
+  no-op success ("nothing to restore"). A per-lab `main.tf` without
+  `local.isolated_dhcp_destinations` (applied before the DHCP rule) →
+  `isolate` refuses with `runtime.isolate.needs_reapply` before anything
+  changes, since it would cut DHCP again; `connect` still works on it. To
+  adopt: `connect` (if isolated), `apply` (copies the current root; with
+  an unchanged config tofu reports no changes), `isolate`.
 
 ### Checking isolation from inside a guest
 
@@ -1476,6 +1662,29 @@ accrue charges silently.
 `vm_ips`) `fetch_vm_ips` will return `({}, [diagnostic])`, and apply will fail
 at the "fetch-vm-ips" step with a clear error. Always keep `outputs.tf`'s
 `vm_ips` shape in sync with `fetch_vm_ips`.
+
+### cloud-digitalocean: no test may reach the real API
+
+Until 2026-10, three tests that set no token (`status` with no lab, and
+the tolerant-validation verb test) called the real
+`GET /v2/droplets?tag_name=...` with whatever `DIGITALOCEAN_TOKEN` the
+developer's shell exported, and the teardown tests sent unstubbed
+`DELETE /v2/droplets/<id>` calls with a fake token. `tests/conftest.py`
+now removes the token from every test's environment and replaces
+`cloud_digitalocean.do._request` (the one HTTP seam): an unstubbed call
+answers like a transport failure and then fails the test, naming the
+request. A test that needs the API monkeypatches `_request` or a wrapper
+above it; one that needs a token sets a fake one.
+
+### cloud-digitalocean: `cloud_init.cfg` bytes are `user_data`, and `user_data` replaces Droplets
+
+`user_data`, `image` and `ssh_keys` are ForceNew on `digitalocean_droplet`,
+and every byte of the rendered `cloud_init.cfg` (comments included) is
+`user_data`. Editing that file, or changing what a VM's `image` /
+`ssh_keys` expression evaluates to, replaces every affected Droplet on
+the next apply. New per-VM knobs must evaluate exactly as before for a VM
+that does not use them (see "ForceNew stability"), and template notes go
+in `main.tf`, not the template.
 
 ## When to update this doc
 

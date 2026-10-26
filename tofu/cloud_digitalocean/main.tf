@@ -8,6 +8,17 @@ locals {
   # internet. Doctor (Slice 5) emits a warning for this case; it is valid for
   # scratch / smoke labs where the exact client IP is unknown.
   ssh_inbound = length(var.firewall_ssh_cidrs) > 0 ? var.firewall_ssh_cidrs : ["0.0.0.0/0", "::/0"]
+
+  # Where an isolated lab may still send udp/67: DigitalOcean's DHCP server
+  # (169.254.169.253) and the limited broadcast that DISCOVER, INIT-REBOOT
+  # and REBIND requests go to. Droplets from custom images (RHEL, Rocky, ...)
+  # lease both NICs' addresses over DHCP with 24 h leases, so without this
+  # an isolated guest loses its network on reboot or at lease expiry.
+  # Neither is a path out: .253 is the hypervisor's DHCP server and the
+  # limited broadcast is never routed (it reaches only udp/67 listeners on
+  # the same segment). Must equal ISOLATED_DHCP_DESTINATIONS in
+  # isolation.py, which verifies the result.
+  isolated_dhcp_destinations = ["169.254.169.253/32", "255.255.255.255/32"]
 }
 
 # One VPC per lab, sized by the lab network's CIDR. Droplets get a private
@@ -20,19 +31,76 @@ resource "digitalocean_vpc" "lab" {
   description = "playground lab ${var.name_prefix}"
 }
 
+# Custom images imported from a URL, one per distinct URL (keyed
+# img-<sha256(url)[:10]>). tofu destroy -- and so suspend -- deletes them;
+# resume re-imports, which takes minutes. The teardown image-sweep catches
+# any left behind.
+resource "digitalocean_custom_image" "lab" {
+  for_each = var.custom_images
+
+  name         = "${var.name_prefix}-${each.key}"
+  url          = each.value.url
+  regions      = [var.region]
+  distribution = each.value.distribution
+  description  = "playground lab ${var.name_prefix}"
+  # Image tags are labels only (the image-sweep matches lab:<lab>); unlike a
+  # firewall's tags they select nothing.
+  tags = var.tags
+
+  # Measured live: importing the Rocky 8.8 GenericCloud qcow2 (1.8 GB
+  # download, 3.06 GB image) took ~17 minutes (NEW -> pending -> available).
+  # Explicit so the wait never depends on the provider's default.
+  timeouts {
+    create = "60m"
+  }
+
+  # DigitalOcean normalises the label it stores (seen live: "Unknown" comes
+  # back as "Unknown OS"), which would plan an in-place update on every
+  # apply -- and make `playground isolate` (firewall-only plans) refuse the
+  # lab. The label is cosmetic, so drift on it is ignored.
+  lifecycle {
+    ignore_changes = [distribution]
+  }
+}
+
 # One Droplet per entry in var.vm_names. The Droplet name is prefixed so
 # resources from multiple concurrent labs are distinct in the DO console.
+#
+# image, ssh_keys and user_data all force replacement: for a VM with no
+# per-VM entries they must evaluate exactly as before those maps existed
+# (var.image, var.ssh_key_fingerprints, and the same rendered cloud-config).
 resource "digitalocean_droplet" "node" {
   count = length(var.vm_names)
 
   name   = "${var.name_prefix}-${var.vm_names[count.index]}"
   region = var.region
   size   = lookup(var.vm_sizes, var.vm_names[count.index], var.size)
-  image  = var.image
+  # The condition only reads input variables, so it is known at plan time
+  # and a VM without a custom image never waits on an unknown image_id.
+  image = (
+    contains(keys(var.vm_custom_images), var.vm_names[count.index])
+    ? tostring(digitalocean_custom_image.lab[var.vm_custom_images[var.vm_names[count.index]]].image_id)
+    : lookup(var.vm_images, var.vm_names[count.index], var.image)
+  )
 
-  # DO-registered keys attached at creation time (optional belt-and-braces;
-  # the cloud-init ssh_authorized_keys injection below is the primary path).
-  ssh_keys = var.ssh_key_fingerprints
+  # DO-registered keys attached at creation time. The cloud-init
+  # ssh_authorized_keys injection below is the primary SSH path; DO itself
+  # requires a key for custom and non-Ubuntu images, which var.vm_ssh_keys
+  # adds per VM (the preflight registers the lab key in the account and
+  # never deletes it: it is shared by every lab, public, and free).
+  ssh_keys = concat(
+    var.ssh_key_fingerprints,
+    lookup(var.vm_ssh_keys, var.vm_names[count.index], []),
+  )
+
+  # ssh_keys only matters at creation, and a change forces replacement. A
+  # lab that predates vm_ssh_keys and already runs a non-ubuntu-* image
+  # (the lab-wide `image` always allowed one) would otherwise lose every
+  # Droplet's disk on its next apply just because the lab key is now
+  # attached. Key changes therefore never replace a running Droplet.
+  lifecycle {
+    ignore_changes = [ssh_keys]
+  }
 
   tags = var.tags
 
@@ -43,10 +111,16 @@ resource "digitalocean_droplet" "node" {
   # Portable cloud-config consumed by cloud-init on first boot. Injects the
   # ubuntu user, SSH key, and hostname/fqdn — identical template variables to
   # the libvirt cloud_init.cfg so the same Ansible roles apply unchanged.
+  # package_upgrade defaults to true; false keeps a pinned point release
+  # (e.g. Rocky 8.8) from being upgraded to the latest minor on first boot.
+  # Every byte of cloud_init.cfg -- comments included -- is part of the
+  # rendered user_data, so editing that file replaces every Droplet;
+  # explain template inputs here instead.
   user_data = templatefile("${path.module}/cloud_init.cfg", {
-    vm_name        = var.vm_names[count.index]
-    dns_domain     = var.dns_domain
-    ssh_public_key = var.ssh_public_key
+    vm_name         = var.vm_names[count.index]
+    dns_domain      = var.dns_domain
+    ssh_public_key  = var.ssh_public_key
+    package_upgrade = lookup(var.vm_package_upgrade, var.vm_names[count.index], true)
   })
 }
 
@@ -64,7 +138,9 @@ resource "digitalocean_droplet" "node" {
 # outside lookups, so allowing the CIDR would still let outside names resolve.
 # Droplet-id destinations cover VM-to-VM on any port but not that resolver.
 # Cloud Firewalls do NOT filter the link-local metadata service
-# (169.254.169.254; verified live) - it stays reachable while isolated.
+# (169.254.169.254; verified live) - it stays reachable while isolated. They
+# DO filter DHCP to 169.254.169.253 (verified live), so while isolated one
+# more rule allows udp/67 to local.isolated_dhcp_destinations only.
 resource "digitalocean_firewall" "lab" {
   name = "${var.name_prefix}-fw"
 
@@ -113,5 +189,15 @@ resource "digitalocean_firewall" "lab" {
     protocol                = "icmp"
     destination_addresses   = var.egress_isolated ? [] : ["0.0.0.0/0", "::/0"]
     destination_droplet_ids = var.egress_isolated ? digitalocean_droplet.node[*].id : []
+  }
+
+  # DHCP while isolated; open egress already covers it.
+  dynamic "outbound_rule" {
+    for_each = var.egress_isolated ? [1] : []
+    content {
+      protocol              = "udp"
+      port_range            = "67"
+      destination_addresses = local.isolated_dhcp_destinations
+    }
   }
 }

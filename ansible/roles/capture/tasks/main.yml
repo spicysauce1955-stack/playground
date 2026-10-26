@@ -38,6 +38,20 @@
 # no-op against the guest that only clears the stale local record) then
 # `capture start`.
 
+# Debian-family only (apt). Fails fast with a message that names the
+# opt-in rather than dying later on a missing apt module.
+- name: Assert the host is Debian-family (this role is apt-based)
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family == 'Debian'
+    fail_msg: >-
+      Role capture supports only Debian-family hosts (it installs tcpdump with apt),
+      but VM {{ inventory_hostname }} is {{ ansible_distribution }}
+      {{ ansible_distribution_version }} ({{ ansible_os_family }}). The
+      VM's VmRole opts into the capture provisioner; remove it from that
+      role's provisioners or run the VM on an Ubuntu image.
+    success_msg: "{{ ansible_distribution }} is supported by capture"
+
 - name: Parse pg_capture JSON payload
   ansible.builtin.set_fact:
     # May arrive as a JSON STRING, or as an already-decoded DICT when

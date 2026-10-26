@@ -1,0 +1,101 @@
+---
+# Rocky/Alma/RHEL 8 and 9. Mirrors debian.yml, following Docker's RHEL
+# install docs. Notes that differ from the deb path:
+#   * the RPMs do NOT start the service (the deb postinst does), so the
+#     role starts + enables docker explicitly;
+#   * podman/runc ship by default on some images and conflict with
+#     docker-ce / containerd.io, hence the removal list;
+#   * community.docker modules run inside the Python Ansible picks on
+#     the VM. On Rocky/Alma 8 that is 3.6 (platform-python; controller
+#     ansible-core 2.16 still supports it, 2.17+ would not) with
+#     requests 2.20 / urllib3 1.24, which community.docker 3.x cannot
+#     talk to the daemon with (measured live: "'http+docker'" /
+#     "key ApiVersion is missing"). The distro python3-docker (EPEL,
+#     5.0.0) does not help. So the role builds a venv that inherits the
+#     system site-packages (dnf/selinux bindings stay importable) plus
+#     current requests/docker wheels, and points ansible_python_interpreter
+#     at it for the rest of the run (set_fact is host-scoped, so the
+#     later workload plays pick it up).
+
+- name: Assert a supported RedHat-family release (8 or 9)
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution_major_version in ['8', '9']
+    fail_msg: >-
+      The docker role supports RedHat-family 8 and 9 (Rocky, Alma, RHEL),
+      but VM {{ inventory_hostname }} is {{ ansible_distribution }}
+      {{ ansible_distribution_version }}. EL10 and Fedora are not supported
+      yet (the docker-ce repo path and the EL8 pip pin do not fit them).
+    quiet: true
+
+- name: Remove conflicting distro container packages
+  ansible.builtin.dnf:
+    name:
+      - docker
+      - docker-client
+      - docker-client-latest
+      - docker-common
+      - docker-latest
+      - docker-latest-logrotate
+      - docker-logrotate
+      - docker-engine
+      - podman
+      - runc
+    state: absent
+
+- name: Add the Docker CE yum repository
+  ansible.builtin.yum_repository:
+    name: docker-ce-stable
+    description: Docker CE Stable - $basearch
+    baseurl: https://download.docker.com/linux/rhel/$releasever/$basearch/stable
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/rhel/gpg
+    enabled: yes
+
+- name: Install Docker CE
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+      - python3-pip
+    state: present
+
+- name: Ensure docker is running and enabled at boot
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Add primary user to docker group
+  ansible.builtin.user:
+    name: "{{ docker_admin_user }}"
+    groups: docker
+    append: yes
+
+# pip 9 (EL8) ignores python_requires and would pick wheels that do not
+# support 3.6, so bring pip itself up to date inside the venv first.
+- name: Create the Python venv for community.docker modules
+  ansible.builtin.pip:
+    name: "pip>=21,<22"
+    virtualenv: "{{ docker_python_venv }}"
+    virtualenv_command: /usr/bin/python3 -m venv
+    virtualenv_site_packages: yes
+
+- name: Install the Docker SDK (and current requests/urllib3) into the venv
+  ansible.builtin.pip:
+    name:
+      # Lower bounds beat the older distro copies the venv inherits; upper
+      # bounds keep a fresh converge from picking up a future major release.
+      # (Pulled from PyPI: the RedHat path's one internet dependency beyond
+      # download.docker.com and the distro repos.)
+      - docker>=5.0.3,<8
+      - requests>=2.27,<3
+      - urllib3>=1.26,<3
+    virtualenv: "{{ docker_python_venv }}"
+
+- name: Run later modules with the venv interpreter
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: "{{ docker_python_venv }}/bin/python"

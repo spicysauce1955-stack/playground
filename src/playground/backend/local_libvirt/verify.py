@@ -42,6 +42,7 @@ from __future__ import annotations
 import concurrent.futures
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -247,6 +248,16 @@ def _commands_targeting_any(resolved: ResolvedLab) -> list[ResolvedCommand]:
 # Per-VM verification
 # ---------------------------------------------------------------------------
 
+# `systemctl is-system-running` states that mean "boot jobs still queued",
+# not a verdict. Seen live on a stock Rocky 8 Droplet: `starting` for
+# several minutes after cloud-init reported done. Systemd 239 (EL8) has no
+# `is-system-running --wait`, so poll for a bounded time instead.
+_SYSTEMD_SETTLING_STATES = ("initializing", "starting")
+SYSTEMD_SETTLE_TIMEOUT_SECONDS = 300.0
+SYSTEMD_SETTLE_POLL_SECONDS = 10.0
+_sleep = time.sleep
+_monotonic = time.monotonic
+
 
 def _verify_one(
     *,
@@ -269,6 +280,13 @@ def _verify_one(
         target, "systemctl is-system-running", timeout=timeout
     )
     sysd_state = sysd.stdout.strip() or "<unknown>"
+    deadline = _monotonic() + SYSTEMD_SETTLE_TIMEOUT_SECONDS
+    while sysd_state in _SYSTEMD_SETTLING_STATES and _monotonic() < deadline:
+        _sleep(SYSTEMD_SETTLE_POLL_SECONDS)
+        sysd = _ssh(
+            target, "systemctl is-system-running", timeout=timeout
+        )
+        sysd_state = sysd.stdout.strip() or "<unknown>"
     if sysd.returncode != 0 and sysd_state not in ("running", "degraded"):
         outcome.log_lines.append(
             f"{target.name}: systemd state={sysd_state!r} (exit {sysd.returncode})"

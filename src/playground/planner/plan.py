@@ -90,6 +90,7 @@ def render_plan(
     *,
     warnings: list[Diagnostic] | None = None,
     cost_estimate: CostEstimate | None = None,
+    vm_images: dict[str, str] | None = None,
 ) -> Plan:
     """Produce a :class:`Plan` for ``resolved``.
 
@@ -101,11 +102,15 @@ def render_plan(
     the caller (typically a backend-specific adapter). This function is
     pure — it stores whatever is passed; it never computes prices itself.
 
+    ``vm_images`` optionally maps VM name to the image the backend will
+    really boot (cloud-digitalocean's per-VM slug / ID / custom-image key);
+    VMs it omits show their ``ResolvedVm.image``.
+
     Pure function: no I/O, no subprocess.
     """
     actions: list[PlanAction] = [
         *_network_actions(resolved),
-        *_vm_actions(resolved),
+        *_vm_actions(resolved, vm_images or {}),
         *_workload_actions(resolved),
     ]
     return Plan(
@@ -142,19 +147,21 @@ def _network_actions(resolved: ResolvedLab) -> list[PlanAction]:
     ]
 
 
-def _vm_actions(resolved: ResolvedLab) -> list[PlanAction]:
+def _vm_actions(
+    resolved: ResolvedLab, vm_images: dict[str, str],
+) -> list[PlanAction]:
     return [
         PlanAction(
             verb="create",
             resource_type="vm",
             name=vm.name,
             summary=(
-                f"{vm.role} on {vm.image} "
+                f"{vm.role} on {vm_images.get(vm.name, vm.image)} "
                 f"({vm.vcpu} vCPU / {vm.memory_mb} MiB / {vm.disk_gb} GiB)"
             ),
             details={
                 "role": vm.role,
-                "image": vm.image,
+                "image": vm_images.get(vm.name, vm.image),
                 "vcpu": vm.vcpu,
                 "memory_mb": vm.memory_mb,
                 "disk_gb": vm.disk_gb,

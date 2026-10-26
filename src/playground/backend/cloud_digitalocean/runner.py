@@ -7,10 +7,17 @@ Apply/resume steps:
   ``tofu-init`` → ``tofu-apply`` → ``fetch-vm-ips`` → ``render-inventory`` →
   ``wait-for-vms-ready`` → ``ansible-playbook`` → ``verify-lab`` (warning-only).
 
-Destroy/suspend steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep``.
+Destroy/suspend steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep`` →
+``image-sweep``.
 
 Reset steps: ``tofu-destroy`` → ``tag-sweep`` → ``vpc-sweep`` →
-``clean-state-files``.  ``vpc-sweep`` is best-effort (warnings only).
+``image-sweep`` → ``clean-state-files``.  ``vpc-sweep`` and ``image-sweep``
+are best-effort (warnings only).
+
+When a VM boots a custom or non-Ubuntu image, the ``cloud-preflight`` step
+also makes sure the lab's SSH public key is registered in the account
+(DigitalOcean refuses such a Droplet without ``ssh_keys``); the key is
+reused across labs and never deleted.
 
 Droplets have routable public IPs so the configure half uses ``ssh_port=22``
 (no NAT port-forward); same backend-neutral code the libvirt/vbox adapters use.
@@ -23,6 +30,7 @@ tfvars file, or Diagnostic message.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from datetime import UTC, datetime
@@ -36,17 +44,29 @@ from playground.backend.cloud_digitalocean.do import (
     check_vpc_conflicts,
     check_vpc_would_be_default,
     delete_droplet,
+    delete_image,
     delete_vpc,
     droplet_summary,
+    ensure_ssh_key,
     find_vpc,
     list_droplets_by_tag,
+    list_private_images,
     list_vpcs,
     read_token,
     token_env_name,
     verify_token,
 )
-from playground.backend.cloud_digitalocean.plan import DoPlan, build_do_plan
+from playground.backend.cloud_digitalocean.plan import (
+    CUSTOM_IMAGE_KEY_PREFIX,
+    DoPlan,
+    build_do_plan,
+)
 from playground.backend.cloud_digitalocean.settings import merge_provider_settings
+from playground.backend.cloud_digitalocean.ssh_keys import (
+    do_key_name,
+    key_for_upload,
+    md5_fingerprint,
+)
 from playground.backend.cloud_digitalocean.tfvars import render_do_tfvars
 from playground.backend.local_libvirt.apply import (
     run_ansible_playbook,
@@ -263,6 +283,19 @@ def execute_reset(
     )
     all_diagnostics.extend(vpc_diags)
 
+    # ---- Step 2c: image-sweep (best-effort; warnings only) ----
+    bus.publish(run.run_id, "step_started", {"step": "image-sweep"})
+    image_step, image_diags = _image_sweep(
+        operation="reset", resolved=resolved,
+        log_path=logs_dir / "image-sweep.log",
+    )
+    steps.append(image_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "image-sweep", "exit_code": image_step.exit_code},
+    )
+    all_diagnostics.extend(image_diags)
+
     # ---- Step 3: clean-state-files (only when teardown is confirmed clean) ----
     inventory_path = state_dir / "state" / "inventory" / f"{lab}.ini"
     workload_dir = state_dir / "state" / "workloads" / lab
@@ -330,6 +363,12 @@ def _provision(
 
     provider_settings = _provider_settings(config_dir, resolved)
     plan = build_do_plan(resolved, provider_settings=provider_settings)
+
+    # Custom / non-Ubuntu images need the key registered in DigitalOcean,
+    # which identifies it by fingerprint: refuse a key we cannot fingerprint
+    # before any run starts (like a missing key file).
+    if plan.vms_needing_do_ssh_key and md5_fingerprint(ssh_key or "") is None:
+        return None, [_unparseable_key_diagnostic(resolved, plan, operation)]
 
     per_lab_dir = state_dir / "state" / "cloud-digitalocean" / lab
     source_root = tofu_dir / "cloud_digitalocean"
@@ -602,8 +641,47 @@ def _provision(
                     f"{net_errors[0].id}",
                 )
 
+            # Last preflight check because it may WRITE to the account
+            # (register the key): only once everything else passed.
+            key_lines: list[str] = []
+            if plan.vms_needing_do_ssh_key:
+                key_lines, key_errors = _ensure_do_ssh_key(
+                    preflight_token,
+                    plan=plan,
+                    ssh_public_key=ssh_key or "",
+                    operation=operation,
+                )
+                for line in key_lines:
+                    bus.publish(
+                        run.run_id, "log_line",
+                        {"step": "cloud-preflight", "line": line},
+                    )
+                if key_errors:
+                    preflight_log.write_text(
+                        f"# cloud-preflight: status={preflight_status}\n"
+                        + "\n".join(f"# {line}" for line in key_lines)
+                        + "\n"
+                        + "\n".join(f"# {d.message}" for d in key_errors)
+                        + "\n"
+                    )
+                    preflight_step = _step(
+                        "cloud-preflight", exit_code=1, log_path=preflight_log,
+                        started=_iso_now(),
+                    )
+                    steps.append(preflight_step)
+                    bus.publish(
+                        run.run_id, "step_finished",
+                        {"step": "cloud-preflight", "exit_code": 1},
+                    )
+                    return _finalize_failure(
+                        run, run_dir, steps, bus, key_errors,
+                        f"SSH key preflight failed for lab {lab!r}: "
+                        f"{key_errors[0].id}",
+                    )
+
             preflight_log.write_text(
                 f"# cloud-preflight: status={preflight_status}\n"
+                + "".join(f"# {line}\n" for line in key_lines)
             )
             preflight_step = _step(
                 "cloud-preflight", exit_code=0, log_path=preflight_log,
@@ -918,6 +996,19 @@ def _teardown(
         {"step": "vpc-sweep", "exit_code": vpc_step.exit_code},
     )
     all_diagnostics.extend(vpc_diags)
+
+    # ---- Step 4: image-sweep (best-effort; warnings only, never fails) ----
+    bus.publish(run.run_id, "step_started", {"step": "image-sweep"})
+    image_step, image_diags = _image_sweep(
+        operation=operation, resolved=resolved,
+        log_path=logs_dir / "image-sweep.log",
+    )
+    steps.append(image_step)
+    bus.publish(
+        run.run_id, "step_finished",
+        {"step": "image-sweep", "exit_code": image_step.exit_code},
+    )
+    all_diagnostics.extend(image_diags)
 
     finished = finish_run(
         run, run_dir, status="succeeded", steps=steps,
@@ -1250,6 +1341,203 @@ def _vpc_sweep(
             suggestion="delete it at https://cloud.digitalocean.com/networking/vpc",
         )
     )
+    return done()
+
+
+def _ensure_do_ssh_key(
+    token: str,
+    *,
+    plan: DoPlan,
+    ssh_public_key: str,
+    operation: str,
+) -> tuple[list[str], list[Diagnostic]]:
+    """Make sure the lab's SSH key is registered in the DigitalOcean account.
+
+    Needed only when :attr:`DoPlan.vms_needing_do_ssh_key` is non-empty:
+    DigitalOcean refuses to create a Droplet from a custom or non-Ubuntu
+    image without ``ssh_keys``.  Reuses a key with the same fingerprint
+    (whatever its name), else registers it as ``playground-<fp8>``.  The
+    key is deliberately NOT deleted on destroy: it is shared by every lab
+    using the same public key, it is public, and it is free.
+
+    Returns ``(log_lines, error_diagnostics)``.  Nothing returned carries
+    the token; the fingerprint and key name are not secret.
+    """
+    lab = plan.lab_name
+    fingerprint = md5_fingerprint(ssh_public_key)
+    upload = key_for_upload(ssh_public_key)
+    vms = ", ".join(plan.vms_needing_do_ssh_key)
+    if fingerprint is None or upload is None:  # pre-run guard makes this rare
+        return [], [_do_key_failed(operation, lab, vms, "the SSH public key could not be parsed")]
+    name = do_key_name(fingerprint)
+    key, created, problem = ensure_ssh_key(
+        token, name=name, public_key=upload, fingerprint=fingerprint,
+    )
+    if key is None:
+        return [], [_do_key_failed(operation, lab, vms, problem)]
+    verb = "registered" if created else "reusing"
+    return [
+        f"{verb} DigitalOcean SSH key {key.get('name', name)!r} "
+        f"(fingerprint {fingerprint}) for {vms}; it is kept on destroy"
+    ], []
+
+
+def _do_key_failed(operation: str, lab: str, vms: str, problem: str) -> Diagnostic:
+    """``runtime.apply.do_ssh_key_failed`` (also for resume, like pre_vpc_lab)."""
+    return Diagnostic(
+        id="runtime.apply.do_ssh_key_failed",
+        severity="error",
+        message=(
+            f"lab {lab!r}: {operation} needs the lab's SSH public key registered "
+            f"in the DigitalOcean account because {vms} boot(s) a custom or "
+            f"non-Ubuntu image, which DigitalOcean refuses to create without "
+            f"ssh_keys; {problem}"
+        ),
+        source=SourceLocation(path="DigitalOcean API"),
+        suggestion=(
+            "check the token has write access to SSH keys and retry, or add the "
+            "key at https://cloud.digitalocean.com/account/security and list its "
+            "fingerprint in spec.providers.cloud-digitalocean.ssh_key_fingerprints"
+        ),
+    )
+
+
+def _unparseable_key_diagnostic(
+    resolved: ResolvedLab, plan: DoPlan, operation: str,
+) -> Diagnostic:
+    provider = resolved.providers.get(resolved.backend, {})
+    path = Path(str(provider.get("ssh_public_key_path") or DEFAULT_SSH_KEY)).expanduser()
+    return _do_key_failed(
+        operation,
+        plan.lab_name,
+        ", ".join(plan.vms_needing_do_ssh_key),
+        f"the SSH public key at {path} is not a parseable OpenSSH public key, "
+        "so its DigitalOcean fingerprint cannot be computed",
+    ).model_copy(
+        update={
+            "source": SourceLocation(path=str(path)),
+            "suggestion": (
+                "point spec.providers.cloud-digitalocean.ssh_public_key_path at a "
+                "valid `ssh-keygen` .pub file"
+            ),
+        }
+    )
+
+
+_IMAGE_DELETE_ATTEMPTS = 3
+_IMAGE_RETRY_SECONDS = 5.0
+
+
+def _lab_image_matcher(lab: str) -> re.Pattern[str]:
+    """Exact ``<lab>-img-<10 hex>`` name (never another lab's prefix match)."""
+    return re.compile(
+        rf"{re.escape(lab)}-{re.escape(CUSTOM_IMAGE_KEY_PREFIX)}[0-9a-f]{{10}}"
+    )
+
+
+def _image_sweep(
+    *,
+    operation: str,
+    resolved: ResolvedLab,
+    log_path: Path,
+) -> tuple[StepResult, list[Diagnostic]]:
+    """Best-effort delete of this lab's leftover custom images.
+
+    Mirrors :func:`_vpc_sweep`.  ``tofu destroy`` normally removes the
+    ``digitalocean_custom_image`` resources and this only confirms none is
+    left; an orphan appears when destroy failed or state was lost, and it
+    keeps billing for storage.  A private image is the lab's when it is a
+    custom image (never a snapshot/backup) whose name is exactly
+    ``<lab>-img-<10 hex>`` or that carries the ``lab:<lab>`` tag.
+    Never fails the teardown: every problem is a warning and the exit code
+    is always 0.  Each delete is retried a few times.
+    """
+    lab = resolved.lab_name
+    tag = f"lab:{lab}"
+    matcher = _lab_image_matcher(lab)
+    started = _iso_now()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# image-sweep for lab {lab!r} (name={lab}-img-*, tag={tag!r})"]
+    diagnostics: list[Diagnostic] = []
+
+    def done() -> tuple[StepResult, list[Diagnostic]]:
+        log_path.write_text("\n".join(lines) + "\n")
+        return (
+            _step("image-sweep", exit_code=0, log_path=log_path, started=started),
+            diagnostics,
+        )
+
+    token = read_token(resolved)
+    if not token:
+        lines.append("token absent -- image-sweep skipped")
+        return done()
+
+    images, list_diags, ok = list_private_images(token)
+    if not ok:
+        lines.append("could not list images -- image-sweep inconclusive")
+        diagnostics.extend(list_diags)
+        diagnostics.append(
+            Diagnostic(
+                id=f"runtime.{operation}.image_sweep_inconclusive",
+                severity="warning",
+                message=(
+                    f"could not check whether lab {lab!r}'s custom images were "
+                    "removed (API/transport error)"
+                ),
+                source=SourceLocation(path="DigitalOcean API"),
+                suggestion=(
+                    "check https://cloud.digitalocean.com/images/custom_images "
+                    f"for images named {lab}-img-* and delete any left"
+                ),
+            )
+        )
+        return done()
+
+    # Only custom images: a snapshot or backup the operator tagged by hand
+    # is never ours to delete.
+    mine = [
+        img for img in images
+        if img.get("type", "custom") == "custom"
+        and (
+            (isinstance(img.get("name"), str) and matcher.fullmatch(img["name"]))
+            or tag in (img.get("tags") or [])
+        )
+    ]
+    if not mine:
+        lines.append("no custom image present")
+        return done()
+
+    for img in mine:
+        image_id = str(img.get("id"))
+        name = img.get("name")
+        last: list[Diagnostic] = []
+        for attempt in range(1, _IMAGE_DELETE_ATTEMPTS + 1):
+            last = delete_image(token, image_id)
+            lines.append(
+                f"delete image {name!r} (id={image_id}) attempt {attempt}: "
+                f"{'ok' if not last else 'refused'}"
+            )
+            if not last:
+                break
+            if attempt < _IMAGE_DELETE_ATTEMPTS:
+                time.sleep(_IMAGE_RETRY_SECONDS)
+        if not last:
+            continue
+        diagnostics.extend(last)
+        diagnostics.append(
+            Diagnostic(
+                id=f"runtime.{operation}.orphaned_image",
+                severity="warning",
+                message=(
+                    f"custom image {name!r} (id={image_id}) could not be "
+                    "deleted; it keeps billing for storage"
+                ),
+                source=SourceLocation(path=f"image/{image_id}"),
+                suggestion=(
+                    "delete it at https://cloud.digitalocean.com/images/custom_images"
+                ),
+            )
+        )
     return done()
 
 

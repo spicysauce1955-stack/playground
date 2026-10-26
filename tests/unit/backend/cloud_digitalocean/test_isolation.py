@@ -11,10 +11,11 @@ import pytest
 
 from playground.backend.cloud_digitalocean import isolation as iso
 from playground.backend.cloud_digitalocean.isolation import (
+    ISOLATED_DHCP_DESTINATIONS,
     execute_connect,
     execute_isolate,
     grants_egress_beyond,
-    outbound_is_droplets_only,
+    outbound_is_isolated,
     outbound_is_open,
 )
 from playground.config.loader import load_config
@@ -22,7 +23,9 @@ from playground.config.resolver import resolve_lab
 from playground.events import EventBus
 from playground.runs import StepResult
 
-CONFIG_DIR = Path(__file__).resolve().parents[4] / "config"
+REPO_ROOT = Path(__file__).resolve().parents[4]
+CONFIG_DIR = REPO_ROOT / "config"
+MAIN_TF = REPO_ROOT / "tofu" / "cloud_digitalocean" / "main.tf"
 FAKE_TOKEN = "dop_v1_faketoken0000000000000000000000000000"
 CIDR = "10.60.0.0/24"
 LAB = "cloud-smoke"
@@ -32,8 +35,15 @@ LAB_IDS = {"111"}
 FW_ID = "fw-own-1"
 
 
+def _dhcp_rule() -> dict[str, Any]:
+    """The isolated firewall's DHCP allowance as the DO API returned it live."""
+    return {"protocol": "udp", "ports": "67",
+            "destinations": {"addresses": ["169.254.169.253/32", "255.255.255.255/32"]}}
+
+
 def _fw(isolated: bool) -> dict[str, Any]:
-    """Our firewall as the DO API returns it: droplet-id destinations when isolated."""
+    """Our firewall as the DO API returns it: droplet-id destinations (plus
+    the DHCP allowance) when isolated."""
     dest: dict[str, Any] = (
         {"droplet_ids": [111]} if isolated else {"addresses": ["0.0.0.0/0", "::/0"]}
     )
@@ -47,7 +57,7 @@ def _fw(isolated: bool) -> dict[str, Any]:
             {"protocol": p, "ports": "0" if p == "icmp" else "all",
              "destinations": dict(dest)}
             for p in ("tcp", "udp", "icmp")
-        ],
+        ] + ([_dhcp_rule()] if isolated else []),
     }
 
 
@@ -73,6 +83,7 @@ def state_dir(tmp_path: Path) -> Path:
     per_lab = d / "state" / "cloud-digitalocean" / LAB
     (per_lab / ".terraform").mkdir(parents=True)
     (per_lab / "variables.tf").write_text('variable "egress_isolated" {}\n')
+    (per_lab / "main.tf").write_text(MAIN_TF.read_text())
     (per_lab / f"{LAB}.tfvars.json").write_text(json.dumps({
         "name_prefix": LAB, "vpc_cidr": CIDR, "egress_isolated": False,
     }))
@@ -184,8 +195,8 @@ def _run(fn, resolved, state_dir):
 
 
 def test_predicates_on_open_and_isolated_firewalls() -> None:
-    assert outbound_is_droplets_only(_fw(True), LAB_IDS)
-    assert not outbound_is_droplets_only(_fw(False), LAB_IDS)
+    assert outbound_is_isolated(_fw(True), LAB_IDS)
+    assert not outbound_is_isolated(_fw(False), LAB_IDS)
     assert outbound_is_open(_fw(False))
     assert not outbound_is_open(_fw(True))
 
@@ -197,36 +208,36 @@ def test_predicates_on_open_and_isolated_firewalls() -> None:
     {"load_balancer_uids": ["lb"]},
     {"kubernetes_ids": ["k8s"]},
 ])
-def test_droplets_only_rejects_any_extra_destination(extra: dict[str, Any]) -> None:
+def test_isolated_rejects_any_extra_destination(extra: dict[str, Any]) -> None:
     fw = _fw(True)
     fw["outbound_rules"][1]["destinations"].update(extra)
-    assert not outbound_is_droplets_only(fw, LAB_IDS)
+    assert not outbound_is_isolated(fw, LAB_IDS)
 
 
-def test_droplets_only_rejects_cidr_shape() -> None:
+def test_isolated_rejects_cidr_shape() -> None:
     fw = _fw(True)
     for rule in fw["outbound_rules"]:
         rule["destinations"] = {"addresses": [CIDR]}
-    assert not outbound_is_droplets_only(fw, LAB_IDS)
+    assert not outbound_is_isolated(fw, LAB_IDS)
 
 
-def test_droplets_only_requires_all_three_protocols() -> None:
+def test_isolated_requires_all_three_protocols() -> None:
     fw = _fw(True)
-    fw["outbound_rules"].pop()
-    assert not outbound_is_droplets_only(fw, LAB_IDS)
-    assert not outbound_is_droplets_only({"outbound_rules": []}, LAB_IDS)
+    fw["outbound_rules"].pop(2)  # icmp
+    assert not outbound_is_isolated(fw, LAB_IDS)
+    assert not outbound_is_isolated({"outbound_rules": []}, LAB_IDS)
 
 
-def test_droplets_only_requires_the_exact_lab_droplet_set() -> None:
-    assert not outbound_is_droplets_only(_fw(True), {"111", "222"})
-    assert not outbound_is_droplets_only(_fw(True), {"999"})
-    assert not outbound_is_droplets_only(_fw(True), set())
+def test_isolated_requires_the_exact_lab_droplet_set() -> None:
+    assert not outbound_is_isolated(_fw(True), {"111", "222"})
+    assert not outbound_is_isolated(_fw(True), {"999"})
+    assert not outbound_is_isolated(_fw(True), set())
     fw = _fw(True)
     fw["outbound_rules"][0]["destinations"]["droplet_ids"] = [111, 222]
-    assert not outbound_is_droplets_only(fw, LAB_IDS)
+    assert not outbound_is_isolated(fw, LAB_IDS)
     fw = _fw(True)
     fw["droplet_ids"] = [111, 222]  # attached to a droplet outside the lab
-    assert not outbound_is_droplets_only(fw, LAB_IDS)
+    assert not outbound_is_isolated(fw, LAB_IDS)
 
 
 def test_grants_egress_beyond_counts_vpc_cidr_addresses() -> None:
@@ -235,6 +246,94 @@ def test_grants_egress_beyond_counts_vpc_cidr_addresses() -> None:
         rule["destinations"] = {"addresses": [CIDR]}
     assert grants_egress_beyond(fw, LAB_IDS)
     assert not grants_egress_beyond(_fw(True), LAB_IDS)
+
+
+# ---- the DHCP allowance (S19: custom-image guests lease their addresses) ------
+
+
+def test_isolated_rule_set_is_lab_droplets_plus_dhcp_only() -> None:
+    """The whole outbound rule set an isolated lab firewall gets."""
+    rules = _fw(True)["outbound_rules"]
+    assert outbound_is_isolated(_fw(True), LAB_IDS)
+    assert [(r["protocol"], r["ports"]) for r in rules] == [
+        ("tcp", "all"), ("udp", "all"), ("icmp", "0"), ("udp", "67"),
+    ]
+    assert all(r["destinations"] == {"droplet_ids": [111]} for r in rules[:3])
+    assert rules[3]["destinations"] == {
+        "addresses": ["169.254.169.253/32", "255.255.255.255/32"],
+    }
+
+
+def test_dhcp_destinations_are_the_do_dhcp_server_and_limited_broadcast() -> None:
+    assert ISOLATED_DHCP_DESTINATIONS == ("169.254.169.253/32", "255.255.255.255/32")
+
+
+def test_dhcp_allowance_accepts_the_bare_address_spelling_too() -> None:
+    fw = _fw(True)
+    fw["outbound_rules"][3]["destinations"]["addresses"] = [
+        "255.255.255.255", "169.254.169.253",
+    ]
+    assert outbound_is_isolated(fw, LAB_IDS)
+
+
+def test_isolated_requires_the_dhcp_allowance() -> None:
+    """A firewall without it is the pre-fix shape that cut RHEL guests' DHCP."""
+    fw = _fw(True)
+    fw["outbound_rules"].pop()
+    assert not outbound_is_isolated(fw, LAB_IDS)
+
+
+def test_isolated_rejects_a_duplicated_dhcp_allowance() -> None:
+    fw = _fw(True)
+    fw["outbound_rules"].append(_dhcp_rule())
+    assert not outbound_is_isolated(fw, LAB_IDS)
+
+
+@pytest.mark.parametrize("mutate", [
+    pytest.param(lambda r: r.update(ports="all"), id="all-ports"),
+    pytest.param(lambda r: r.update(ports="67-68"), id="port-range"),
+    pytest.param(lambda r: r.update(ports="53"), id="dns-port"),
+    pytest.param(lambda r: r.update(protocol="tcp"), id="tcp"),
+    pytest.param(lambda r: r["destinations"]["addresses"].append("0.0.0.0/0"), id="internet"),
+    pytest.param(lambda r: r["destinations"]["addresses"].append("::/0"), id="internet-v6"),
+    pytest.param(lambda r: r["destinations"]["addresses"].append("10.60.0.254"),
+                 id="vpc-resolver"),
+    pytest.param(lambda r: r["destinations"]["addresses"].append("169.254.169.254"),
+                 id="metadata"),
+    pytest.param(lambda r: r["destinations"].update(addresses=["169.254.0.0/16"]),
+                 id="link-local-range"),
+    pytest.param(lambda r: r["destinations"].update(addresses=["169.254.169.253/32"]),
+                 id="missing-broadcast"),
+    pytest.param(lambda r: r["destinations"].update(addresses=["255.255.255.255/32"]),
+                 id="missing-server"),
+    pytest.param(lambda r: r["destinations"].update(addresses=[]), id="no-address"),
+    pytest.param(lambda r: r["destinations"].update(addresses=["not-an-ip"]), id="garbage"),
+    pytest.param(lambda r: r["destinations"].update(droplet_ids=[999]), id="droplet"),
+    pytest.param(lambda r: r["destinations"].update(tags=["x"]), id="tag"),
+])
+def test_isolated_rejects_any_widened_dhcp_allowance(mutate) -> None:
+    fw = _fw(True)
+    mutate(fw["outbound_rules"][3])
+    assert not outbound_is_isolated(fw, LAB_IDS)
+
+
+def test_dhcp_allowance_is_not_foreign_egress() -> None:
+    """A sibling lab's isolated firewall (DHCP allowance included) widens nothing."""
+    assert not grants_egress_beyond(_foreign("sibling", isolated=True), LAB_IDS)
+
+
+def test_widened_dhcp_rule_on_a_foreign_firewall_is_egress() -> None:
+    fw = _foreign("udp67-anywhere", isolated=True)
+    fw["outbound_rules"][3]["destinations"]["addresses"] = ["0.0.0.0/0"]
+    assert grants_egress_beyond(fw, LAB_IDS)
+
+
+def test_open_firewall_has_no_separate_dhcp_rule() -> None:
+    """Open egress already covers DHCP; connect's open state is unchanged."""
+    assert [r["protocol"] for r in _fw(False)["outbound_rules"]] == ["tcp", "udp", "icmp"]
+    fw = _fw(False)
+    fw["outbound_rules"].append(_dhcp_rule())
+    assert not outbound_is_open(fw)
 
 
 # ---- isolate ---------------------------------------------------------------
@@ -334,6 +433,46 @@ def test_stale_per_lab_root_asks_for_reapply(resolved, state_dir, fakes) -> None
     assert [d.id for d in diags] == ["runtime.isolate.needs_reapply"]
     assert "apply" in diags[0].suggestion
     assert fakes.calls == []
+    assert _tfvars(state_dir)["egress_isolated"] is False
+
+
+def test_isolate_refuses_a_root_whose_firewall_would_cut_dhcp(
+    resolved, state_dir, fakes,
+) -> None:
+    """A lab applied before the DHCP allowance carries the old main.tf; isolating
+    it would cut DHCP again (S19), so isolate refuses and asks for a re-apply."""
+    per_lab = state_dir / "state" / "cloud-digitalocean" / LAB
+    old_root = "\n".join(
+        line for line in MAIN_TF.read_text().splitlines()
+        if "isolated_dhcp_destinations" not in line
+    )
+    (per_lab / "main.tf").write_text(old_root)
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.isolate.needs_reapply"]
+    assert "DHCP" in diags[0].message
+    assert f"playground apply {LAB}" in (diags[0].suggestion or "")
+    assert fakes.calls == []
+    assert _tfvars(state_dir)["egress_isolated"] is False
+
+
+def test_isolate_refuses_a_root_without_main_tf(resolved, state_dir, fakes) -> None:
+    (state_dir / "state" / "cloud-digitalocean" / LAB / "main.tf").unlink()
+    _, diags = _run(execute_isolate, resolved, state_dir)
+    assert [d.id for d in diags] == ["runtime.isolate.needs_reapply"]
+    assert fakes.calls == []
+
+
+def test_connect_still_reopens_a_root_that_predates_the_dhcp_allowance(
+    resolved, state_dir, fakes,
+) -> None:
+    """An isolated old-root lab must stay reachable through connect."""
+    per_lab = state_dir / "state" / "cloud-digitalocean" / LAB
+    (per_lab / "main.tf").write_text("# old root\n")
+    _set_isolated_tfvars(state_dir)
+    run, diags = _run(execute_connect, resolved, state_dir)
+    assert run.status == "succeeded" and diags == []
+    assert "apply" in fakes.calls
     assert _tfvars(state_dir)["egress_isolated"] is False
 
 
@@ -519,6 +658,19 @@ def test_own_firewall_outbound_with_different_droplet_set_fails_verify(
     assert diags[0].id == "runtime.isolate.verify_failed"
 
 
+def test_isolate_fails_verify_when_the_firewall_lacks_the_dhcp_allowance(
+    resolved, state_dir, fakes,
+) -> None:
+    """End to end: apply "succeeded" but DO shows the pre-S19 rule set."""
+    pre_fix = _fw(True)
+    pre_fix["outbound_rules"] = pre_fix["outbound_rules"][:3]
+    fakes.api = [pre_fix]
+    run, diags = _run(execute_isolate, resolved, state_dir)
+    assert run.status == "failed"
+    assert [d.id for d in diags] == ["runtime.isolate.verify_failed"]
+    assert "plus DHCP" in diags[0].message
+
+
 def test_verify_inconclusive_when_lab_droplets_cannot_be_listed(resolved, state_dir, fakes) -> None:
     fakes.listing_ok = False
     run, diags = _run(execute_isolate, resolved, state_dir)
@@ -611,7 +763,7 @@ def test_string_and_int_droplet_ids_compare_equal(resolved, state_dir, fakes) ->
     """tfstate ids are strings, tag-listing and firewall ids may be ints."""
     fw = _fw(True)
     fw["droplet_ids"] = ["111"]
-    for rule in fw["outbound_rules"]:
+    for rule in fw["outbound_rules"][:3]:  # not the DHCP allowance
         rule["destinations"] = {"droplet_ids": ["111"]}
     fakes.api = [fw]
     fakes.droplets = [{"id": "111", "name": "n", "tags": [f"lab:{LAB}"]}]

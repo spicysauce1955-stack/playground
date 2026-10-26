@@ -1,9 +1,10 @@
 """Tolerant validation for commands that do not provision or render.
 
 Some validator errors only guard NEW provisioning (for example the
-DigitalOcean single-network / VPC CIDR / VM size rules). A lab provisioned
-before those rules existed must stay reachable and tear-down-able, so every
-verb that only reads, connects, or tears down downgrades them to warnings.
+DigitalOcean single-network / VPC CIDR / VM size / image / package_upgrade
+rules). A lab provisioned before those rules existed must stay reachable and
+tear-down-able, so every verb that only reads, connects, or tears down
+downgrades them to warnings.
 Provisioning and rendering verbs (validate, plan, apply, resume, tofu render,
 inventory render) keep calling the strict ``playground.validation.validate``.
 """
@@ -19,6 +20,8 @@ _DOWNGRADED_IDS = frozenset(
         "config.network.do_single_network",
         "config.network.do_vpc_cidr_invalid",
         "config.backend.do_vm_size_invalid",
+        "config.backend.do_vm_image_invalid",
+        "config.backend.do_package_upgrade_invalid",
     }
 )
 

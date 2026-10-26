@@ -1,55 +1,20 @@
 ---
-- name: Remove conflicting distro docker packages
-  ansible.builtin.apt:
-    name:
-      - docker.io
-      - docker-doc
-      - docker-compose
-      - docker-compose-v2
-      - podman-docker
-      - containerd
-      - runc
-    state: absent
+# Per-OS-family install. Debian/Ubuntu is the original path (debian.yml);
+# RedHat covers Rocky/Alma 8 and 9 (redhat.yml). Facts come from the
+# first play in site.yml (every later play runs gather_facts: no).
+- name: Install Docker on the Debian family
+  ansible.builtin.include_tasks: debian.yml
+  when: ansible_os_family == 'Debian'
 
-- name: Install prerequisite packages
-  ansible.builtin.apt:
-    name:
-      - ca-certificates
-      - curl
-    state: present
-    update_cache: yes
+- name: Install Docker on the RedHat family
+  ansible.builtin.include_tasks: redhat.yml
+  when: ansible_os_family == 'RedHat'
 
-- name: Ensure apt keyrings directory exists
-  ansible.builtin.file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
-
-- name: Add Docker GPG key
-  ansible.builtin.get_url:
-    url: https://download.docker.com/linux/ubuntu/gpg
-    dest: /etc/apt/keyrings/docker.asc
-    mode: '0644'
-
-- name: Add Docker apt repository (signed-by, modern apt layout)
-  ansible.builtin.apt_repository:
-    repo: "deb [arch={{ docker_apt_arch }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-    state: present
-    filename: docker
-    update_cache: yes
-
-- name: Install Docker CE
-  ansible.builtin.apt:
-    name:
-      - docker-ce
-      - docker-ce-cli
-      - containerd.io
-      - python3-docker
-    state: present
-    update_cache: yes
-
-- name: Add primary user to docker group
-  ansible.builtin.user:
-    name: "{{ docker_admin_user }}"
-    groups: docker
-    append: yes
+- name: Fail on an unsupported OS family
+  ansible.builtin.fail:
+    msg: >-
+      The docker role supports the Debian and RedHat families; VM
+      {{ inventory_hostname }} reports ansible_os_family
+      {{ ansible_os_family }} ({{ ansible_distribution }}
+      {{ ansible_distribution_version }}).
+  when: ansible_os_family not in ['Debian', 'RedHat']

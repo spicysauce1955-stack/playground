@@ -252,6 +252,12 @@ def _install_shims(
     monkeypatch.setattr(f"{MOD}.list_droplets_by_tag", fake_list_droplets_by_tag)
     # Teardown's best-effort vpc-sweep: no VPC left behind, and no real HTTP.
     monkeypatch.setattr(f"{MOD}.find_vpc", lambda token, name: (None, [], True))
+    # Tag-sweep deletes and the image-sweep: no real HTTP either.
+    monkeypatch.setattr(f"{MOD}.delete_droplet", lambda token, droplet_id: [])
+    monkeypatch.setattr(f"{MOD}.list_private_images", lambda token: ([], [], True))
+    monkeypatch.setattr(
+        f"{MOD}.delete_image", lambda token, image_id: pytest.fail("no image to delete"),
+    )
     # Preflight VPC conflict listing: empty account, and no real HTTP.
     monkeypatch.setattr(f"{MOD}.list_vpcs", lambda token: ([], [], True))
     monkeypatch.setattr(f"{MOD}.schedule_workloads", fake_schedule_workloads)

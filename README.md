@@ -160,6 +160,13 @@ playground resume cloud-smoke                     # rebuild from config (disk ch
 playground destroy cloud-smoke                    # remove all lab-owned DO resources
 ```
 
+Per-VM images: set `spec.vms[].provider_overrides.cloud-digitalocean.image`
+to a slug (e.g. `rockylinux-8-x64`) or an image ID, or `image_url` to import a
+custom image (e.g. an exact Rocky 8.8 GenericCloud qcow2; the import takes
+15+ minutes per apply/resume). Pair a pinned point release with
+`package_upgrade: false`. The `common` and `docker` roles support Rocky/Alma
+8-9 as well as Ubuntu.
+
 Notes: cost figures in `plan` are advisory; `suspend`/`resume` are cloud-only
 (local backends reject them); the token is read from `$DIGITALOCEAN_TOKEN`
 (the platform does not auto-load `.env`). Redroid/nested-virt is not supported
