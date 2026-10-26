@@ -3,11 +3,11 @@
 Enforcement is the lab's Cloud Firewall (``<lab>-fw``): its outbound rules
 switch from ``0.0.0.0/0, ::/0`` to the lab's own Droplets BY ID (not the
 VPC CIDR), so Droplets can still reach each other on any port but nothing
-else.  The CIDR is deliberately not used: DigitalOcean gives VPC Droplets a
-resolver at an address inside the VPC range (e.g. ``10.97.0.254``) that
-forwards outside lookups, and droplet-id destinations do not cover it.  The
-firewall lives
-outside the guests, so a VM cannot undo it, and it persists across reboots.
+else beyond DHCP (below).  The CIDR is deliberately not used: DigitalOcean
+gives VPC Droplets a resolver at an address inside the VPC range (e.g.
+``10.97.0.254``) that forwards outside lookups, and droplet-id destinations
+do not cover it.  The firewall lives outside the guests, so a VM cannot
+undo it, and it persists across reboots.
 DigitalOcean Cloud Firewalls are stateful, so replies to inbound SSH from
 the operator still flow while isolated.
 
@@ -29,9 +29,24 @@ reopened, waits for it to settle, verifies it, and warns the operator to run
 Opening is the safe direction; ``isolate`` still refuses on drift and egress
 is never closed outside tofu.
 
-NOT blocked (verified live): the link-local metadata service
-(169.254.169.254) is served by the hypervisor, outside Cloud Firewall's
-reach, so it stays reachable while isolated.
+Link-local services that stay reachable while isolated (both verified live):
+
+- the metadata service (169.254.169.254) is served by the hypervisor,
+  outside Cloud Firewall's reach, so no rule is needed for it;
+- DHCP IS filtered by Cloud Firewall, so the isolated firewall keeps ONE
+  extra outbound rule: udp port 67 to :data:`ISOLATED_DHCP_DESTINATIONS`
+  (DigitalOcean's DHCP server 169.254.169.253 and the 255.255.255.255
+  broadcast that DISCOVER / INIT-REBOOT / REBIND use).  Droplets from
+  custom images (RHEL, Rocky, ...) lease both NICs' addresses from it with
+  24 h leases; without the rule they come up without addresses after a
+  reboot and drop off the network when the lease runs out.  Stock Ubuntu
+  images get a static config from cloud-init and never ask.  Neither is a
+  path out: .253 is the hypervisor's DHCP server, and the limited broadcast
+  is never routed, so it reaches only udp/67 listeners on the same segment.
+  Nothing else on udp/67 (nor the VPC resolver, nor outside DNS) is
+  allowed.  ``isolate`` verifies the rule is present and exactly that, and
+  refuses a per-lab root applied before it existed (``needs_reapply``)
+  rather than cut DHCP again.
 
 The API token is read from the environment only; it never appears in a
 file, argv, log line, or Diagnostic.
@@ -39,6 +54,7 @@ file, argv, log line, or Diagnostic.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import subprocess
 import time
@@ -68,6 +84,14 @@ from playground.runs import OperationRun, StepResult, finish_run, start_run
 
 _OPEN_DESTINATIONS = ("0.0.0.0/0", "::/0")
 _OUTBOUND_PROTOCOLS = frozenset({"tcp", "udp", "icmp"})
+
+ISOLATED_DHCP_DESTINATIONS = ("169.254.169.253/32", "255.255.255.255/32")
+"""Where an isolated lab may still send udp/67: DO's DHCP server and the
+limited broadcast.  Must equal ``local.isolated_dhcp_destinations`` in
+tofu/cloud_digitalocean/main.tf (a unit test compares them)."""
+_DHCP_PORT = "67"
+_DHCP_ROOT_MARKER = "local.isolated_dhcp_destinations"
+"""Present in a per-lab main.tf whose isolated firewall keeps DHCP open."""
 
 _SETTLE_TIMEOUT = 60.0
 """Seconds to wait for DigitalOcean to finish applying firewall changes."""
@@ -362,7 +386,7 @@ def _set_egress(
         return fail(verify_diags, f"{operation} lab {lab!r}: firewall verification failed")
 
     summary = (
-        f"isolated lab {lab!r}: outbound limited to the lab's own Droplets"
+        f"isolated lab {lab!r}: outbound limited to the lab's own Droplets plus DHCP"
         if isolated
         else f"connected lab {lab!r}: outbound open to the internet"
     )
@@ -441,6 +465,26 @@ def _preflight(
             ),
         )]
 
+    # connect must keep working on an isolated lab with such a root, so only
+    # isolate refuses it.
+    if operation == "isolate" and not _root_keeps_dhcp(per_lab_dir / "main.tf"):
+        return None, [Diagnostic(
+            id="runtime.isolate.needs_reapply",
+            severity="error",
+            message=(
+                f"lab {lab!r} was provisioned before isolation kept DHCP open: its "
+                "OpenTofu root's isolated firewall blocks DigitalOcean's DHCP server, "
+                "so custom-image guests (RHEL, Rocky, ...) would lose their addresses "
+                "on reboot or when their lease runs out"
+            ),
+            source=SourceLocation(path=str(per_lab_dir / "main.tf")),
+            suggestion=(
+                f"run `playground apply {lab}` (after `playground connect {lab}` "
+                f"if it is isolated) to adopt the current root, then "
+                f"`playground isolate {lab}`"
+            ),
+        )]
+
     if not read_token(resolved):
         env_name = token_env_name(resolved)
         return None, [Diagnostic(
@@ -451,6 +495,14 @@ def _preflight(
             suggestion=f"export {env_name}=<your-token>",
         )]
     return loaded, []
+
+
+def _root_keeps_dhcp(main_tf: Path) -> bool:
+    """True when the per-lab ``main.tf`` has the isolated DHCP rule."""
+    try:
+        return _DHCP_ROOT_MARKER in main_tf.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
 
 
 def _state_has_firewall(state_path: Path) -> bool:
@@ -605,19 +657,46 @@ def _destinations(rule: dict[str, Any]) -> dict[str, Any]:
     return dest if isinstance(dest, dict) else {}
 
 
-def outbound_is_droplets_only(firewall: dict[str, Any], droplet_ids: set[str]) -> bool:
-    """True when every outbound rule's only destination is exactly ``droplet_ids``.
+def _networks(addresses: list[Any]) -> set[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """``addresses`` as networks (DO drops a ``/32``); empty if any is malformed."""
+    try:
+        return {ipaddress.ip_network(str(a), strict=False) for a in addresses}
+    except ValueError:
+        return set()
 
-    All three protocols must be present; no rule may carry an address, tag,
-    load balancer or Kubernetes destination (an address inside the VPC would
-    reach the VPC resolver, which forwards outside lookups).  The firewall
-    itself must also be attached to exactly those Droplets.
+
+def _is_dhcp_allowance(rule: dict[str, Any]) -> bool:
+    """True for exactly the isolated DHCP rule: udp port 67 to
+    :data:`ISOLATED_DHCP_DESTINATIONS` and nothing else."""
+    if str(rule.get("protocol")) != "udp" or str(rule.get("ports")) != _DHCP_PORT:
+        return False
+    dest = _destinations(rule)
+    for other in ("droplet_ids", "tags", "load_balancer_uids", "kubernetes_ids"):
+        if dest.get(other):
+            return False
+    return _networks(dest.get("addresses") or []) == _networks(
+        list(ISOLATED_DHCP_DESTINATIONS)
+    )
+
+
+def outbound_is_isolated(firewall: dict[str, Any], droplet_ids: set[str]) -> bool:
+    """True when the outbound rules are exactly the isolated set.
+
+    That is one DHCP allowance (:func:`_is_dhcp_allowance`) plus rules for
+    all three protocols whose only destination is exactly ``droplet_ids``:
+    none may carry an address, tag, load balancer or Kubernetes destination
+    (an address inside the VPC would reach the VPC resolver, which forwards
+    outside lookups).  The firewall itself must also be attached to exactly
+    those Droplets.
     """
     if not droplet_ids:
         return False
     if {str(i) for i in (firewall.get("droplet_ids") or [])} != droplet_ids:
         return False
-    rules = [r for r in (firewall.get("outbound_rules") or []) if isinstance(r, dict)]
+    all_rules = [r for r in (firewall.get("outbound_rules") or []) if isinstance(r, dict)]
+    rules = [r for r in all_rules if not _is_dhcp_allowance(r)]
+    if len(all_rules) - len(rules) != 1:
+        return False
     if {str(r.get("protocol")) for r in rules} != _OUTBOUND_PROTOCOLS:
         return False
     for rule in rules:
@@ -646,10 +725,11 @@ def grants_egress_beyond(firewall: dict[str, Any], droplet_ids: set[str]) -> boo
 
     ANY address (even inside the VPC CIDR, which reaches the VPC resolver),
     tag, load balancer or Kubernetes destination counts, as does a Droplet id
-    outside the lab.
+    outside the lab.  The exact isolated DHCP allowance does not: it reaches
+    only the hypervisor.
     """
     for rule in firewall.get("outbound_rules") or []:
-        if not isinstance(rule, dict):
+        if not isinstance(rule, dict) or _is_dhcp_allowance(rule):
             continue
         dest = _destinations(rule)
         for extra in ("addresses", "tags", "load_balancer_uids", "kubernetes_ids"):
@@ -790,8 +870,8 @@ def _verify_firewall(
     Always waits for the firewall to settle first.  Connect then needs only
     "open again".  Isolate additionally requires the lab Droplet set (tofu
     state union the Droplets tagged ``lab:<lab>``) to be fully covered by our
-    firewall, the outbound rules to name exactly that set, and no foreign
-    firewall to widen egress.
+    firewall, the outbound rules to name exactly that set plus the DHCP
+    allowance, and no foreign firewall to widen egress.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fw, diags = _wait_settled(
@@ -869,16 +949,16 @@ def _verify_firewall(
             for i in uncovered
         ]
 
-    holds = outbound_is_droplets_only(fw, lab_ids)
+    holds = outbound_is_isolated(fw, lab_ids)
     log_path.write_text(
-        f"firewall id={firewall_id}: outbound limited to the lab's own Droplets: "
-        f"{'confirmed' if holds else 'NOT confirmed'}\n"
+        f"firewall id={firewall_id}: outbound limited to the lab's own Droplets "
+        f"plus DHCP: {'confirmed' if holds else 'NOT confirmed'}\n"
     )
     if not holds:
         return [_verify_failed(
             operation,
             f"firewall id={firewall_id} does not have outbound limited to the lab's "
-            "own Droplets after tofu apply",
+            "own Droplets plus DHCP after tofu apply",
             f"inspect https://cloud.digitalocean.com/networking/firewalls and re-run "
             f"`playground {operation}`",
         )]
@@ -889,9 +969,10 @@ def _verify_firewall(
 
 
 __all__ = [
+    "ISOLATED_DHCP_DESTINATIONS",
     "execute_connect",
     "execute_isolate",
     "grants_egress_beyond",
+    "outbound_is_isolated",
     "outbound_is_open",
-    "outbound_is_droplets_only",
 ]

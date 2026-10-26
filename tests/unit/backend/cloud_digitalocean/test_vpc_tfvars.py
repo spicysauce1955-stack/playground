@@ -105,3 +105,37 @@ def test_tofu_exports_the_firewall_id() -> None:
     out = (TOFU_DIR / "outputs.tf").read_text()
     assert "output \"firewall_id\"" in out
     assert "digitalocean_firewall.lab.id" in out
+
+
+def _firewall_block() -> str:
+    import re
+
+    main = (TOFU_DIR / "main.tf").read_text()
+    block = re.search(r'resource "digitalocean_firewall" "lab" \{(.*?)\n\}\n', main, re.S)
+    assert block is not None
+    return re.sub(r"\s+", " ", block.group(1))
+
+
+def test_tofu_isolated_firewall_keeps_dhcp_to_the_do_dhcp_server_only() -> None:
+    """S19: custom-image Droplets (RHEL, Rocky) lease their addresses from
+    169.254.169.253 over udp/67; without this rule an isolated guest loses
+    its network on reboot or lease expiry. Only udp/67, only while isolated,
+    only to the DHCP server and the limited broadcast."""
+    body = _firewall_block()
+    assert (
+        'dynamic "outbound_rule" { for_each = var.egress_isolated ? [1] : [] '
+        'content { protocol = "udp" port_range = "67" '
+        "destination_addresses = local.isolated_dhcp_destinations } }"
+    ) in body
+
+
+def test_tofu_dhcp_destinations_match_the_verifier() -> None:
+    """main.tf and isolation.py must agree, or isolate fails its own verify."""
+    import re
+
+    from playground.backend.cloud_digitalocean.isolation import ISOLATED_DHCP_DESTINATIONS
+
+    main = (TOFU_DIR / "main.tf").read_text()
+    m = re.search(r"isolated_dhcp_destinations\s*=\s*\[([^\]]*)\]", main)
+    assert m is not None
+    assert tuple(re.findall(r'"([^"]+)"', m.group(1))) == ISOLATED_DHCP_DESTINATIONS

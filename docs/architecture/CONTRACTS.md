@@ -1105,6 +1105,9 @@ and `cloud-digitalocean`; `local-vbox` is unsupported.
   networks: the internet and DNS forwarded to outside resolvers. The
   cloud metadata service is NOT blocked on DigitalOcean (see below). A lookup of an outside
   name from a VM must fail.
+- **Kept, so the guest's network survives:** DHCP to the platform's DHCP
+  server (libvirt: the lab gateway; DigitalOcean: 169.254.169.253, see
+  below), both unicast renewals and broadcast discover / rebind.
 - **Kept:** all VM-to-VM traffic on any port, and SSH from this machine to
   every VM (`exec` / `cp` / SSH tunnels / `adb`).
 
@@ -1251,9 +1254,10 @@ connections therefore time out instead of failing fast. The CLI says so.
 - Mechanism: the lab Cloud Firewall, driven by the tofu variable
   `egress_isolated` (default false) so HCL and tofu state stay the single
   source of truth. Open: outbound tcp/udp/icmp to `0.0.0.0/0, ::/0`.
-  Isolated: outbound only to `destination_droplet_ids` = the lab's own
-  Droplets, with no addresses. DO firewalls are stateful, so replies to
-  inbound SSH still flow.
+  Isolated: outbound tcp/udp/icmp only to `destination_droplet_ids` = the
+  lab's own Droplets, with no addresses, plus ONE udp port 67 rule to
+  `local.isolated_dhcp_destinations` (below). DO firewalls are stateful,
+  so replies to inbound SSH still flow.
 - **Not the VPC CIDR.** In a custom VPC, DigitalOcean gives droplets a
   resolver at an address *inside* the VPC range (`10.97.0.254` for
   `10.97.0.0/24`; `resolvectl dns` shows it) that forwards outside
@@ -1264,6 +1268,28 @@ connections therefore time out instead of failing fast. The CLI says so.
   `169.254.169.254` is link-local, answered by the hypervisor, and outside
   Cloud Firewall's reach. It is not a path to the internet; if a test
   needs it unreachable, block it in-guest.
+- **DHCP stays open: udp/67 to `169.254.169.253/32` and
+  `255.255.255.255/32`, nothing else** (S19, verified live). Droplets
+  from custom images (RHEL, Rocky, ...) get BOTH NICs' addresses by DHCP
+  from `169.254.169.253` with 24 h leases (cloud-init writes
+  `BOOTPROTO=dhcp`; DO documents that such Droplets behind a Cloud
+  Firewall need outbound udp/67). Unlike the metadata service, Cloud
+  Firewall DOES filter it: before this rule an isolated RHEL 8.8 guest's
+  DISCOVER / INIT-REBOOT REQUEST broadcasts went unanswered, so a reboot
+  never came back (`dhcp4 ... no lease`, 45 s retries) and a lease could
+  not be renewed before it expired. Stock Ubuntu images get a static
+  netplan from cloud-init and never ask. Both destinations are needed:
+  the public NIC renews by unicast to `.253` (routed via its gateway) at
+  T1, but `.253` does not answer ARP on the VPC NIC (seen live, isolated
+  or not), so that NIC only renews by broadcast REBIND at T2, and boot /
+  `nmcli con up` use broadcast too. DHCP replies were never filtered.
+  Measured with the rule: isolated RHEL 8.8 reboot back in 31-33 s with
+  both NICs leased, broadcast and unicast renewals ACKed, while outside
+  TCP / ICMP / DNS (including the VPC resolver) stay blocked. The
+  destinations live in `local.isolated_dhcp_destinations` (main.tf) and
+  `ISOLATED_DHCP_DESTINATIONS` (isolation.py); a unit test keeps them
+  equal. The rule exists only while isolated (open egress covers DHCP),
+  so connect's open state is unchanged.
 - **The firewall targets Droplets by `droplet_ids` only, never `tags`.** A
   DO firewall's `tags` *select the Droplets it applies to*, the ownership
   tags include the account-wide `playground`, and DO unions allow rules
@@ -1297,10 +1323,12 @@ connections therefore time out instead of failing fast. The CLI says so.
   - isolate requires: the lab set (state Droplet ids ∪ Droplets tagged
     `lab:<lab>`) is attached to our firewall (`uncovered_droplet`
     otherwise; an empty or short tag listing fails); every outbound rule
-    targets exactly that set and nothing else; every OTHER firewall that
+    targets exactly that set and nothing else, except exactly one DHCP
+    allowance (udp, ports `67`, addresses exactly the two above, any
+    `/32` spelling); every OTHER firewall that
     applies to a lab Droplet (by `droplet_ids` or tag overlap, same name
-    or not) allows no other outbound destination
-    (`runtime.isolate.foreign_firewall`, naming it). connect requires our
+    or not) allows no other outbound destination, that exact DHCP
+    allowance aside (`runtime.isolate.foreign_firewall`, naming it). connect requires our
     firewall open again.
   - API unreachable or not settled in time → the run fails; it never
     claims isolation it could not confirm.
@@ -1308,7 +1336,12 @@ connections therefore time out instead of failing fast. The CLI says so.
   leaves tfvars behind) → `runtime.isolate.not_provisioned`; a per-lab
   `variables.tf` without `egress_isolated` (lab provisioned before this
   feature) → `runtime.isolate.needs_reapply`. `connect` on such a lab is a
-  no-op success ("nothing to restore").
+  no-op success ("nothing to restore"). A per-lab `main.tf` without
+  `local.isolated_dhcp_destinations` (applied before the DHCP rule) →
+  `isolate` refuses with `runtime.isolate.needs_reapply` before anything
+  changes, since it would cut DHCP again; `connect` still works on it. To
+  adopt: `connect` (if isolated), `apply` (copies the current root; with
+  an unchanged config tofu reports no changes), `isolate`.
 
 ### Checking isolation from inside a guest
 

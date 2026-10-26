@@ -2091,10 +2091,13 @@ def isolate_command(
     (outside connections time out rather than fail fast) and also drops
     guest DNS to the lab gateway, so lab-internal names stop resolving; use
     IPs. On cloud-digitalocean the lab Cloud Firewall's outbound rules are
-    narrowed to the lab's own droplets (the cloud metadata service
-    169.254.169.254 stays reachable: Cloud Firewalls do not filter it).
-    ``apply`` / ``resume`` refuse an isolated lab; run ``playground connect``
-    first. ``local-vbox`` is not supported.
+    narrowed to the lab's own droplets plus udp/67 to DigitalOcean's DHCP
+    server (169.254.169.253, and the 255.255.255.255 broadcast) so
+    custom-image guests such as RHEL keep their addresses; the metadata
+    service 169.254.169.254 also stays reachable (Cloud Firewalls do not
+    filter it). A lab applied before DHCP was kept open must be re-applied
+    before it can be isolated. ``apply`` / ``resume`` refuse an isolated
+    lab; run ``playground connect`` first. ``local-vbox`` is not supported.
     """
     _run_isolation_verb(
         "isolate", execute_isolate, lab, config_dir, tofu_dir, state_dir, output,

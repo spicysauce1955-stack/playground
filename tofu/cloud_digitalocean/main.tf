@@ -8,6 +8,17 @@ locals {
   # internet. Doctor (Slice 5) emits a warning for this case; it is valid for
   # scratch / smoke labs where the exact client IP is unknown.
   ssh_inbound = length(var.firewall_ssh_cidrs) > 0 ? var.firewall_ssh_cidrs : ["0.0.0.0/0", "::/0"]
+
+  # Where an isolated lab may still send udp/67: DigitalOcean's DHCP server
+  # (169.254.169.253) and the limited broadcast that DISCOVER, INIT-REBOOT
+  # and REBIND requests go to. Droplets from custom images (RHEL, Rocky, ...)
+  # lease both NICs' addresses over DHCP with 24 h leases, so without this
+  # an isolated guest loses its network on reboot or at lease expiry.
+  # Neither is a path out: .253 is the hypervisor's DHCP server and the
+  # limited broadcast is never routed (it reaches only udp/67 listeners on
+  # the same segment). Must equal ISOLATED_DHCP_DESTINATIONS in
+  # isolation.py, which verifies the result.
+  isolated_dhcp_destinations = ["169.254.169.253/32", "255.255.255.255/32"]
 }
 
 # One VPC per lab, sized by the lab network's CIDR. Droplets get a private
@@ -127,7 +138,9 @@ resource "digitalocean_droplet" "node" {
 # outside lookups, so allowing the CIDR would still let outside names resolve.
 # Droplet-id destinations cover VM-to-VM on any port but not that resolver.
 # Cloud Firewalls do NOT filter the link-local metadata service
-# (169.254.169.254; verified live) - it stays reachable while isolated.
+# (169.254.169.254; verified live) - it stays reachable while isolated. They
+# DO filter DHCP to 169.254.169.253 (verified live), so while isolated one
+# more rule allows udp/67 to local.isolated_dhcp_destinations only.
 resource "digitalocean_firewall" "lab" {
   name = "${var.name_prefix}-fw"
 
@@ -176,5 +189,15 @@ resource "digitalocean_firewall" "lab" {
     protocol                = "icmp"
     destination_addresses   = var.egress_isolated ? [] : ["0.0.0.0/0", "::/0"]
     destination_droplet_ids = var.egress_isolated ? digitalocean_droplet.node[*].id : []
+  }
+
+  # DHCP while isolated; open egress already covers it.
+  dynamic "outbound_rule" {
+    for_each = var.egress_isolated ? [1] : []
+    content {
+      protocol              = "udp"
+      port_range            = "67"
+      destination_addresses = local.isolated_dhcp_destinations
+    }
   }
 }
